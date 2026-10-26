@@ -194,6 +194,123 @@ impl DaemonClient {
         }
         self.post_json("/v1/projects", &Value::Object(body))
     }
+
+    fn environment_path(project: &str, environment: &str) -> String {
+        format!(
+            "/v1/projects/{}/environments/{}",
+            encode_segment(project),
+            encode_segment(environment)
+        )
+    }
+
+    /// `POST .../environments/{env}/start`. Blocks until the Environment is up,
+    /// or until the daemon answers `504` with an operation id.
+    pub fn start_environment(
+        &self,
+        project: &str,
+        environment: &str,
+    ) -> Result<Value, ClientError> {
+        let path = format!("{}/start", Self::environment_path(project, environment));
+        self.post_json(&path, &Value::Object(serde_json::Map::new()))
+    }
+
+    /// `POST .../environments/{env}/stop`.
+    pub fn stop_environment(
+        &self,
+        project: &str,
+        environment: &str,
+    ) -> Result<Value, ClientError> {
+        let path = format!("{}/stop", Self::environment_path(project, environment));
+        self.post_json(&path, &Value::Object(serde_json::Map::new()))
+    }
+
+    /// `GET .../environments/{env}/status`.
+    pub fn environment_status(
+        &self,
+        project: &str,
+        environment: &str,
+    ) -> Result<Value, ClientError> {
+        self.get_json(&format!("{}/status", Self::environment_path(project, environment)))
+    }
+
+    /// `POST .../environments/{env}/resources/{resource}/exec`.
+    pub fn exec(
+        &self,
+        project: &str,
+        environment: &str,
+        resource: &str,
+        command: &[String],
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, ClientError> {
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "command".to_string(),
+            Value::Array(command.iter().cloned().map(Value::String).collect()),
+        );
+        if let Some(timeout_ms) = timeout_ms {
+            body.insert("timeoutMs".to_string(), Value::from(timeout_ms));
+        }
+        let path = format!(
+            "{}/resources/{}/exec",
+            Self::environment_path(project, environment),
+            encode_segment(resource)
+        );
+        self.post_json(&path, &Value::Object(body))
+    }
+
+    /// `GET .../environments/{env}/logs`: a bounded tail, optionally filtered.
+    pub fn logs(
+        &self,
+        project: &str,
+        environment: &str,
+        resource: Option<&str>,
+        tail: Option<usize>,
+        since: Option<&str>,
+    ) -> Result<Value, ClientError> {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(tail) = tail {
+            query.push(format!("tail={tail}"));
+        }
+        if let Some(since) = since {
+            query.push(format!("since={}", encode_segment(since)));
+        }
+        if let Some(resource) = resource {
+            query.push(format!("resource={}", encode_segment(resource)));
+        }
+        let path = format!(
+            "{}/logs{}",
+            Self::environment_path(project, environment),
+            if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", query.join("&"))
+            }
+        );
+        self.get_json(&path)
+    }
+
+    /// `GET .../environments/{env}/stats`.
+    pub fn stats(&self, project: &str, environment: &str) -> Result<Value, ClientError> {
+        self.get_json(&format!("{}/stats", Self::environment_path(project, environment)))
+    }
+
+    /// `GET /v1/operations/{id}`.
+    pub fn operation(&self, id: &str) -> Result<Value, ClientError> {
+        self.get_json(&format!("/v1/operations/{}", encode_segment(id)))
+    }
+
+    /// `GET /v1/operations/{id}/wait`.
+    pub fn wait_for_operation(
+        &self,
+        id: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, ClientError> {
+        let mut path = format!("/v1/operations/{}/wait", encode_segment(id));
+        if let Some(timeout_ms) = timeout_ms {
+            path.push_str(&format!("?timeoutMs={timeout_ms}"));
+        }
+        self.get_json(&path)
+    }
 }
 
 fn parse(response: Result<ureq::Response, ureq::Error>, url: &str) -> Result<Value, ClientError> {
