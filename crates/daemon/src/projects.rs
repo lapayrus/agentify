@@ -1,0 +1,331 @@
+//! Creating and reading Projects.
+//!
+//! A Project is a Manifest plus its one `dev` Environment. Creating one is the
+//! whole of this module's write path: the daemon parses the Manifest strictly,
+//! mints every daemon-owned name (Project id, Environment id, Resource ids,
+//! workspace path), copies the source into a workspace it owns, and records the
+//! normalized spec in one transaction. Nothing starts.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use agentify_proto::{
+    Cost, CreateProjectRequest, EnvironmentView, Project, ProjectSource, ResourceView, RouteView,
+    DEV_ENVIRONMENT, STATE_STOPPED,
+};
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+use crate::clock;
+use crate::fixtures;
+use crate::state::{NewProject, ProjectRecord, State};
+
+/// Directory, inside the data root, holding one directory per Project.
+pub const PROJECTS_DIR: &str = "projects";
+
+/// Directory, inside a Project's directory, that holds its source. The daemon
+/// owns it; a Manifest never names a host path.
+pub const WORKSPACE_DIR: &str = "workspace";
+
+/// Why a Project could not be created.
+#[derive(Debug)]
+pub enum CreateError {
+    /// The request or the Manifest is wrong. `path` names the field, so an
+    /// Agent can fix the right line.
+    Validation { path: String, detail: String },
+    /// The source the Manifest needs is not available on this machine.
+    SourceMissing(String),
+    /// A Project with this name already exists.
+    AlreadyExists(String),
+    /// The state database failed.
+    Store(anyhow::Error),
+}
+
+impl CreateError {
+    fn validation(path: impl Into<String>, detail: impl Into<String>) -> Self {
+        CreateError::Validation {
+            path: path.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Create a Project from exactly one of a bundled fixture or an inline
+/// Manifest, copy its source into a daemon-owned workspace, and persist it with
+/// its `dev` Environment and Resources.
+pub fn create(
+    state: &State,
+    data_root: &Path,
+    request: CreateProjectRequest,
+) -> std::result::Result<Project, CreateError> {
+    let (source, source_name, manifest_text, fixture) = match (
+        request.fixture.as_deref(),
+        request.manifest.as_deref(),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(CreateError::validation(
+                "manifest",
+                "create a Project from exactly one of `fixture` or `manifest`, not both",
+            ))
+        }
+        (None, None) => {
+            return Err(CreateError::validation(
+                "manifest",
+                "create a Project from exactly one of `fixture` or `manifest`",
+            ))
+        }
+        (Some(name), None) => {
+            let fixture = fixtures::get(name).ok_or_else(|| {
+                CreateError::SourceMissing(format!(
+                    "no bundled fixture named {name:?}; available fixtures: {}",
+                    fixtures::names().join(", ")
+                ))
+            })?;
+            (
+                ProjectSource::Fixture,
+                Some(fixture.name.to_string()),
+                fixture.manifest,
+                Some(fixture),
+            )
+        }
+        (None, Some(text)) => (ProjectSource::Manifest, None, text, None),
+    };
+
+    let manifest = agentify_manifest::parse(manifest_text)
+        .map_err(|err| CreateError::validation(err.path, err.message))?;
+
+    // v0 has no host mounts and no source sync: a `build` Resource needs the
+    // fixture's embedded source. Ticket 09 makes the fixture real.
+    if fixture.is_none() {
+        let builds: Vec<&str> = manifest
+            .resources
+            .values()
+            .filter(|resource| match &resource.kind {
+                agentify_manifest::ResourceKind::App(app) => app.build.is_some(),
+                agentify_manifest::ResourceKind::Database(_) => false,
+            })
+            .map(|resource| resource.name.as_str())
+            .collect();
+        if !builds.is_empty() {
+            return Err(CreateError::SourceMissing(format!(
+                "Resource(s) {} use `build`, but an inline Manifest brings no source; \
+                 create build Resources from a bundled fixture instead",
+                builds.join(", ")
+            )));
+        }
+    }
+
+    if let Some(existing) = state
+        .find_project(&manifest.project)
+        .map_err(CreateError::Store)?
+    {
+        let _ = existing;
+        return Err(CreateError::AlreadyExists(format!(
+            "a Project named {:?} already exists",
+            manifest.project
+        )));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let project_dir = data_root.join(PROJECTS_DIR).join(&id);
+    let workspace = project_dir.join(WORKSPACE_DIR);
+    std::fs::create_dir_all(&workspace)
+        .with_context(|| format!("creating the workspace {}", workspace.display()))
+        .map_err(CreateError::Store)?;
+
+    let written = match fixture {
+        Some(fixture) => write_fixture(fixture, &workspace).map_err(CreateError::Store),
+        None => Ok(()),
+    };
+    if let Err(err) = written {
+        discard(&project_dir);
+        return Err(err);
+    }
+
+    let created_at = clock::now_rfc3339();
+    let resources: Vec<(String, String, String)> = manifest
+        .resources
+        .values()
+        .map(|resource| {
+            (
+                uuid::Uuid::new_v4().to_string(),
+                resource.name.clone(),
+                resource.kind_label().to_string(),
+            )
+        })
+        .collect();
+
+    let record = NewProject {
+        id: id.clone(),
+        name: manifest.project.clone(),
+        source_kind: source.as_str().to_string(),
+        source_name,
+        spec_json: manifest.to_spec().to_string(),
+        workspace_path: workspace.display().to_string(),
+        created_at,
+        environment_id: uuid::Uuid::new_v4().to_string(),
+        environment_name: DEV_ENVIRONMENT.to_string(),
+        resources,
+    };
+
+    match state.create_project(record) {
+        Ok(true) => {}
+        Ok(false) => {
+            discard(&project_dir);
+            return Err(CreateError::AlreadyExists(format!(
+                "a Project named {:?} already exists",
+                manifest.project
+            )));
+        }
+        Err(err) => {
+            discard(&project_dir);
+            return Err(CreateError::Store(err));
+        }
+    }
+
+    let stored = state
+        .find_project(&id)
+        .map_err(CreateError::Store)?
+        .ok_or_else(|| {
+            CreateError::Store(anyhow::anyhow!(
+                "the Project was written but could not be read back"
+            ))
+        })?;
+    view(&stored).map_err(CreateError::Store)
+}
+
+/// Every Project, oldest first.
+pub fn list(state: &State) -> Result<Vec<Project>> {
+    state
+        .list_projects()?
+        .iter()
+        .map(view)
+        .collect::<Result<Vec<_>>>()
+}
+
+/// A Project by name or id.
+pub fn get(state: &State, reference: &str) -> Result<Option<Project>> {
+    match state.find_project(reference)? {
+        Some(record) => Ok(Some(view(&record)?)),
+        None => Ok(None),
+    }
+}
+
+/// The directory the daemon owns for one Project's source.
+pub fn workspace_path(data_root: &Path, id: &str) -> PathBuf {
+    data_root.join(PROJECTS_DIR).join(id).join(WORKSPACE_DIR)
+}
+
+fn write_fixture(fixture: &fixtures::Fixture, workspace: &Path) -> Result<()> {
+    for (relative, contents) in fixture.files {
+        let target = workspace.join(relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(&target, contents)
+            .with_context(|| format!("writing {}", target.display()))?;
+    }
+    Ok(())
+}
+
+fn discard(project_dir: &Path) {
+    let _ = std::fs::remove_dir_all(project_dir);
+}
+
+/// Build the wire view from the stored rows and the normalized spec.
+fn view(record: &ProjectRecord) -> Result<Project> {
+    let spec: StoredSpec = serde_json::from_str(&record.spec_json).with_context(|| {
+        format!(
+            "reading the stored spec of Project {:?} ({})",
+            record.name, record.id
+        )
+    })?;
+
+    let source = ProjectSource::parse(&record.source_kind).unwrap_or(ProjectSource::Manifest);
+    let resources = record
+        .resources
+        .iter()
+        .map(|resource| {
+            let stored = spec.resources.get(&resource.name).cloned().unwrap_or_default();
+            stored.into_view(resource.id.clone(), resource.name.clone(), resource.kind.clone())
+        })
+        .collect();
+
+    Ok(Project {
+        id: record.id.clone(),
+        name: record.name.clone(),
+        source,
+        source_name: record.source_name.clone(),
+        created_at: record.created_at.clone(),
+        workspace: record.workspace_path.clone(),
+        environment: EnvironmentView {
+            id: record.environment.id.clone(),
+            name: record.environment.name.clone(),
+            state: STATE_STOPPED.to_string(),
+            cost: Cost::default(),
+        },
+        resources,
+        routes: spec.routes,
+    })
+}
+
+/// The normalized spec as it comes back out of the database.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct StoredSpec {
+    resources: BTreeMap<String, StoredResource>,
+    routes: Vec<RouteView>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct StoredResource {
+    kind: String,
+    image: Option<String>,
+    build: Option<agentify_proto::BuildView>,
+    command: Vec<String>,
+    env: BTreeMap<String, String>,
+    ports: Vec<agentify_proto::PortView>,
+    #[serde(rename = "dependsOn")]
+    depends_on: Vec<String>,
+    healthcheck: Option<agentify_proto::HealthcheckView>,
+    engine: Option<String>,
+    version: Option<String>,
+    volume: Option<String>,
+    credentials: Option<StoredCredentials>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct StoredCredentials {
+    username: Option<String>,
+}
+
+impl StoredResource {
+    fn into_view(&self, id: String, name: String, kind: String) -> ResourceView {
+        let kind = if self.kind.is_empty() { kind } else { self.kind.clone() };
+        ResourceView {
+            id,
+            name,
+            url: self.ports.first().map(|port| port.url.clone()),
+            image: self.image.clone(),
+            build: self.build.clone(),
+            command: self.command.clone(),
+            env: self.env.clone(),
+            ports: self.ports.clone(),
+            depends_on: self.depends_on.clone(),
+            healthcheck: self.healthcheck.clone(),
+            engine: self.engine.clone(),
+            version: self.version.clone(),
+            volume: self.volume.clone(),
+            username: self
+                .credentials
+                .as_ref()
+                .and_then(|credentials| credentials.username.clone()),
+            state: STATE_STOPPED.to_string(),
+            cost: Cost::default(),
+            kind,
+        }
+    }
+}

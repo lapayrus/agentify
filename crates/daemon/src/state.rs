@@ -14,13 +14,14 @@ use crate::auth;
 use crate::clock;
 
 /// Schema version the running binary expects.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Ordered migrations. Each entry is applied exactly once, inside a
 /// transaction, and recorded in `schema_migrations`.
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        r#"
     CREATE TABLE instance (
         id         TEXT PRIMARY KEY,
         created_at TEXT NOT NULL
@@ -35,7 +36,46 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         scopes     TEXT NOT NULL
     );
     "#,
-)];
+    ),
+    (
+        2,
+        r#"
+    -- A Project is a Manifest plus at least one Environment. The daemon mints
+    -- the id and owns the workspace path; the name is the Project's identity.
+    CREATE TABLE projects (
+        id             TEXT PRIMARY KEY,
+        name           TEXT NOT NULL UNIQUE,
+        source_kind    TEXT NOT NULL,
+        source_name    TEXT,
+        spec_json      TEXT NOT NULL,
+        workspace_path TEXT NOT NULL,
+        created_at     TEXT NOT NULL
+    );
+
+    -- v0 recognises only `dev`, and creating a Project creates it.
+    CREATE TABLE environments (
+        id         TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        name       TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (project_id, name)
+    );
+
+    -- Resources are stored per Environment, keyed by the name the Manifest uses.
+    CREATE TABLE resources (
+        id             TEXT PRIMARY KEY,
+        project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        environment_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+        name           TEXT NOT NULL,
+        kind           TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        UNIQUE (environment_id, name)
+    );
+
+    CREATE INDEX resources_by_project ON resources (project_id);
+    "#,
+    ),
+];
 
 /// Agent tokens expire after seven days by default (ADR-0003).
 const TOKEN_LIFETIME_DAYS: i64 = 7;
@@ -63,6 +103,52 @@ pub struct IssuedToken {
 pub struct Instance {
     pub id: String,
     pub created_at: String,
+}
+
+/// An Environment row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentRecord {
+    pub id: String,
+    pub name: String,
+}
+
+/// A Resource row: identity and kind. The details live in the Project's spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceRecord {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+/// A Project as stored: rows plus the normalized spec JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRecord {
+    pub id: String,
+    pub name: String,
+    pub source_kind: String,
+    pub source_name: Option<String>,
+    pub spec_json: String,
+    pub workspace_path: String,
+    pub created_at: String,
+    pub environment: EnvironmentRecord,
+    pub resources: Vec<ResourceRecord>,
+}
+
+/// What a caller supplies to create a Project. The daemon mints every id and
+/// every daemon-owned name before it gets here.
+#[derive(Debug, Clone)]
+pub struct NewProject {
+    pub id: String,
+    pub name: String,
+    pub source_kind: String,
+    pub source_name: Option<String>,
+    pub spec_json: String,
+    pub workspace_path: String,
+    pub created_at: String,
+    pub environment_id: String,
+    pub environment_name: String,
+    /// `(id, name, kind)` per Resource.
+    pub resources: Vec<(String, String, String)>,
 }
 
 pub struct State {
@@ -234,6 +320,143 @@ impl State {
             Ok(record)
         })
     }
+
+    /// Insert a Project with its Environment and Resources in one transaction.
+    ///
+    /// Returns `Ok(false)` when the name is already taken, so the caller can
+    /// report `AlreadyExists` without racing on a unique-constraint message.
+    pub fn create_project(&self, project: NewProject) -> Result<bool> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+
+            let taken: bool = tx
+                .query_row(
+                    "SELECT 1 FROM projects WHERE name = ?1",
+                    [&project.name],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if taken {
+                return Ok(false);
+            }
+
+            tx.execute(
+                "INSERT INTO projects (id, name, source_kind, source_name, spec_json, workspace_path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    project.id,
+                    project.name,
+                    project.source_kind,
+                    project.source_name,
+                    project.spec_json,
+                    project.workspace_path,
+                    project.created_at,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO environments (id, project_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    project.environment_id,
+                    project.id,
+                    project.environment_name,
+                    project.created_at,
+                ],
+            )?;
+            for (id, name, kind) in &project.resources {
+                tx.execute(
+                    "INSERT INTO resources (id, project_id, environment_id, name, kind, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        id,
+                        project.id,
+                        project.environment_id,
+                        name,
+                        kind,
+                        project.created_at,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    /// Every Project, oldest first.
+    pub fn list_projects(&self) -> Result<Vec<ProjectRecord>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT p.id, p.name, p.source_kind, p.source_name, p.spec_json,
+                        p.workspace_path, p.created_at, e.id, e.name
+                 FROM projects p
+                 JOIN environments e ON e.project_id = p.id AND e.name = ?1
+                 ORDER BY p.created_at, p.name",
+            )?;
+            let rows = statement
+                .query_map([agentify_proto::DEV_ENVIRONMENT], project_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .map(|record| hydrate_resources(conn, record))
+                .collect()
+        })
+    }
+
+    /// A Project by name or by id.
+    pub fn find_project(&self, reference: &str) -> Result<Option<ProjectRecord>> {
+        self.with_conn(|conn| {
+            let record = conn
+                .query_row(
+                    "SELECT p.id, p.name, p.source_kind, p.source_name, p.spec_json,
+                            p.workspace_path, p.created_at, e.id, e.name
+                     FROM projects p
+                     JOIN environments e ON e.project_id = p.id AND e.name = ?2
+                     WHERE p.name = ?1 OR p.id = ?1
+                     LIMIT 1",
+                    rusqlite::params![reference, agentify_proto::DEV_ENVIRONMENT],
+                    project_row,
+                )
+                .optional()?;
+            match record {
+                Some(record) => Ok(Some(hydrate_resources(conn, record)?)),
+                None => Ok(None),
+            }
+        })
+    }
+}
+
+fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
+    Ok(ProjectRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        source_kind: row.get(2)?,
+        source_name: row.get(3)?,
+        spec_json: row.get(4)?,
+        workspace_path: row.get(5)?,
+        created_at: row.get(6)?,
+        environment: EnvironmentRecord {
+            id: row.get(7)?,
+            name: row.get(8)?,
+        },
+        resources: Vec::new(),
+    })
+}
+
+fn hydrate_resources(
+    conn: &Connection,
+    mut record: ProjectRecord,
+) -> Result<ProjectRecord> {
+    let mut statement =
+        conn.prepare("SELECT id, name, kind FROM resources WHERE project_id = ?1 ORDER BY name")?;
+    record.resources = statement
+        .query_map([&record.id], |row| {
+            Ok(ResourceRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(record)
 }
 
 fn split_scopes(raw: String) -> Vec<String> {

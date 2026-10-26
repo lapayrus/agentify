@@ -9,6 +9,8 @@ pub mod auth;
 pub mod clock;
 pub mod config;
 pub mod discovery;
+pub mod fixtures;
+pub mod projects;
 pub mod server;
 pub mod state;
 

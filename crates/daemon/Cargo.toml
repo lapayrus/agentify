@@ -16,6 +16,7 @@ name = "agentifyd"
 path = "src/main.rs"
 
 [dependencies]
+agentify-manifest = { workspace = true }
 agentify-proto = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
