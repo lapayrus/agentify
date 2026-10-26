@@ -2,12 +2,13 @@
 // rendering lives in render.js. No business logic belongs here: the shell asks
 // the daemon (through the Rust command) and paints what it is told.
 
-import { render } from "./render.js";
+import { render, projectsOf } from "./render.js";
 
 const POLL_INTERVAL_MS = 5000;
 const app = document.getElementById("app");
 
 let status = { state: "loading" };
+let selected = null;
 
 async function askDaemon() {
   const tauri = window.__TAURI__;
@@ -28,9 +29,30 @@ async function askDaemon() {
   }
 }
 
+/** Keep the selection if the daemon still lists it, otherwise pick the first. */
+function reconcileSelection() {
+  const projects = projectsOf(status);
+  if (projects.length === 0) {
+    selected = null;
+    return;
+  }
+  const keep = projects.find(
+    (project) => project.id === selected || project.name === selected,
+  );
+  selected = (keep ?? projects[0]).id;
+}
+
 function paint() {
   app.dataset.connection = status.state;
-  app.innerHTML = render(status);
+  app.innerHTML = render({ ...status, selected });
+
+  for (const button of app.querySelectorAll("[data-project]")) {
+    button.addEventListener("click", () => {
+      selected = button.dataset.project;
+      paint();
+    });
+  }
+
   const retry = document.getElementById("retry");
   if (retry) {
     retry.addEventListener("click", () => {
@@ -42,6 +64,7 @@ function paint() {
 
 async function refresh() {
   status = await askDaemon();
+  reconcileSelection();
   paint();
 }
 

@@ -100,7 +100,8 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// What the walking skeleton can do: an events stream and nothing else.
+    /// What this build can do: an events stream and nothing else. Project,
+    /// Backend, ingress, and stats capabilities arrive with later tickets.
     pub fn v0_skeleton() -> Self {
         Self {
             pty: false,

@@ -31,3 +31,4 @@ tauri = { version = "2", features = [] }
 [dev-dependencies]
 agentify-daemon = { path = "../../crates/daemon" }
 tempfile = "3"
+ureq = { version = "2", default-features = false }
