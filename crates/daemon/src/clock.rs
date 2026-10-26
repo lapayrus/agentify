@@ -23,3 +23,26 @@ fn format(value: OffsetDateTime) -> String {
 pub fn is_expired(timestamp: &str) -> bool {
     timestamp <= now_rfc3339().as_str()
 }
+
+/// Parse an RFC 3339 timestamp written by this daemon.
+pub fn parse(timestamp: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(timestamp, &Rfc3339).ok()
+}
+
+/// True when `timestamp` is older than `age`. An unparseable timestamp counts
+/// as stale, so a corrupt row cannot make a replay live forever.
+pub fn is_older_than(timestamp: &str, age: std::time::Duration) -> bool {
+    let Some(at) = parse(timestamp) else {
+        return true;
+    };
+    let age = time::Duration::seconds(age.as_secs().min(i64::MAX as u64) as i64);
+    OffsetDateTime::now_utc() - at > age
+}
+
+/// Milliseconds between two RFC 3339 timestamps, when both parse.
+pub fn millis_between(from: &str, to: &str) -> Option<u64> {
+    let from = parse(from)?;
+    let to = parse(to)?;
+    let millis = (to - from).whole_milliseconds();
+    u64::try_from(millis.max(0)).ok()
+}

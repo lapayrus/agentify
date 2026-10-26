@@ -14,7 +14,7 @@ use crate::auth;
 use crate::clock;
 
 /// Schema version the running binary expects.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Ordered migrations. Each entry is applied exactly once, inside a
 /// transaction, and recorded in `schema_migrations`.
@@ -75,6 +75,61 @@ const MIGRATIONS: &[(i64, &str)] = &[
     CREATE INDEX resources_by_project ON resources (project_id);
     "#,
     ),
+    (
+        3,
+        r#"
+    -- Desired state is what the user or an Agent asked for; observed state is
+    -- what the daemon last saw. They diverge after a daemon restart, which is
+    -- why both are stored rather than one state column.
+    ALTER TABLE environments ADD COLUMN desired_state  TEXT NOT NULL DEFAULT 'stopped';
+    ALTER TABLE environments ADD COLUMN observed_state TEXT NOT NULL DEFAULT 'stopped';
+    ALTER TABLE environments ADD COLUMN health         TEXT NOT NULL DEFAULT 'unknown';
+    ALTER TABLE environments ADD COLUMN updated_at     TEXT NOT NULL DEFAULT '';
+
+    -- A port lease is machine-wide: one row per (Environment, Resource, guest
+    -- port), and one host port may belong to exactly one row.
+    CREATE TABLE port_leases (
+        id             TEXT PRIMARY KEY,
+        environment_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+        resource       TEXT NOT NULL,
+        guest_port     INTEGER NOT NULL,
+        host_port      INTEGER NOT NULL,
+        created_at     TEXT NOT NULL,
+        UNIQUE (environment_id, resource, guest_port)
+    );
+
+    CREATE UNIQUE INDEX port_leases_host_port ON port_leases (host_port);
+    CREATE INDEX port_leases_by_environment ON port_leases (environment_id);
+
+    -- A mutation that outlives its request timeout still has to be finishable.
+    CREATE TABLE operations (
+        id             TEXT PRIMARY KEY,
+        kind           TEXT NOT NULL,
+        project_id     TEXT NOT NULL,
+        environment_id TEXT NOT NULL,
+        state          TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        updated_at     TEXT NOT NULL,
+        finished_at    TEXT,
+        error_code     TEXT,
+        error_detail   TEXT,
+        result_json    TEXT
+    );
+
+    CREATE INDEX operations_by_environment ON operations (environment_id);
+
+    -- `Idempotency-Key` on a mutation replays the original response for 24h.
+    CREATE TABLE idempotency_records (
+        key          TEXT PRIMARY KEY,
+        method       TEXT NOT NULL,
+        path         TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        status       INTEGER NOT NULL,
+        body         TEXT NOT NULL,
+        created_at   TEXT NOT NULL
+    );
+    "#,
+    ),
 ];
 
 /// Agent tokens expire after seven days by default (ADR-0003).
@@ -110,6 +165,59 @@ pub struct Instance {
 pub struct EnvironmentRecord {
     pub id: String,
     pub name: String,
+    /// What the last mutation asked for: `running` or `stopped`.
+    pub desired_state: String,
+    /// What the daemon last observed.
+    pub observed_state: String,
+    /// `healthy`, `unhealthy`, or `unknown`, decided by the daemon's probes.
+    pub health: String,
+    pub updated_at: String,
+}
+
+/// A stored state transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateUpdate {
+    pub desired_state: String,
+    pub observed_state: String,
+    pub health: String,
+}
+
+/// One row of the machine-wide port registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRecord {
+    pub environment_id: String,
+    pub resource: String,
+    pub guest_port: u16,
+    pub host_port: u16,
+    pub created_at: String,
+}
+
+/// A stored operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRecord {
+    pub id: String,
+    pub kind: String,
+    pub project_id: String,
+    pub environment_id: String,
+    pub state: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+    pub error_code: Option<String>,
+    pub error_detail: Option<String>,
+    pub result_json: Option<String>,
+}
+
+/// A replayed response for an `Idempotency-Key`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyRecord {
+    pub key: String,
+    pub method: String,
+    pub path: String,
+    pub request_hash: String,
+    pub status: u16,
+    pub body: String,
+    pub created_at: String,
 }
 
 /// A Resource row: identity and kind. The details live in the Project's spec.
@@ -387,7 +495,8 @@ impl State {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
                 "SELECT p.id, p.name, p.source_kind, p.source_name, p.spec_json,
-                        p.workspace_path, p.created_at, e.id, e.name
+                        p.workspace_path, p.created_at, e.id, e.name,
+                        e.desired_state, e.observed_state, e.health, e.updated_at
                  FROM projects p
                  JOIN environments e ON e.project_id = p.id AND e.name = ?1
                  ORDER BY p.created_at, p.name",
@@ -407,7 +516,8 @@ impl State {
             let record = conn
                 .query_row(
                     "SELECT p.id, p.name, p.source_kind, p.source_name, p.spec_json,
-                            p.workspace_path, p.created_at, e.id, e.name
+                            p.workspace_path, p.created_at, e.id, e.name,
+                            e.desired_state, e.observed_state, e.health, e.updated_at
                      FROM projects p
                      JOIN environments e ON e.project_id = p.id AND e.name = ?2
                      WHERE p.name = ?1 OR p.id = ?1
@@ -422,6 +532,309 @@ impl State {
             }
         })
     }
+
+    /// Record a state transition. Short and local: no await happens while the
+    /// connection is held.
+    pub fn set_environment_state(&self, environment_id: &str, update: &StateUpdate) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE environments
+                 SET desired_state = ?2, observed_state = ?3, health = ?4, updated_at = ?5
+                 WHERE id = ?1",
+                rusqlite::params![
+                    environment_id,
+                    update.desired_state,
+                    update.observed_state,
+                    update.health,
+                    clock::now_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Every Environment with its stored state, for startup reconciliation.
+    pub fn list_environments(&self) -> Result<Vec<EnvironmentRecord>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT id, name, desired_state, observed_state, health, updated_at
+                 FROM environments ORDER BY created_at, id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(EnvironmentRecord {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        desired_state: row.get(2)?,
+                        observed_state: row.get(3)?,
+                        health: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// One Environment's stored state.
+    pub fn environment(&self, id: &str) -> Result<Option<EnvironmentRecord>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT id, name, desired_state, observed_state, health, updated_at
+                     FROM environments WHERE id = ?1",
+                    [id],
+                    |row| {
+                        Ok(EnvironmentRecord {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            desired_state: row.get(2)?,
+                            observed_state: row.get(3)?,
+                            health: row.get(4)?,
+                            updated_at: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+    }
+
+    // ---- port leases -------------------------------------------------------
+
+    /// Every lease for one Environment, ordered by Resource then guest port.
+    pub fn leases(&self, environment_id: &str) -> Result<Vec<LeaseRecord>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT environment_id, resource, guest_port, host_port, created_at
+                 FROM port_leases WHERE environment_id = ?1
+                 ORDER BY resource, guest_port",
+            )?;
+            let rows = statement
+                .query_map([environment_id], lease_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Every lease on the machine, so a caller can name the holder of a port.
+    pub fn all_leases(&self) -> Result<Vec<LeaseRecord>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT environment_id, resource, guest_port, host_port, created_at
+                 FROM port_leases ORDER BY host_port",
+            )?;
+            let rows = statement
+                .query_map([], lease_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Who holds a host port, if anyone.
+    pub fn lease_holder(&self, host_port: u16) -> Result<Option<LeaseRecord>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT environment_id, resource, guest_port, host_port, created_at
+                     FROM port_leases WHERE host_port = ?1",
+                    [host_port],
+                    lease_row,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Put an Environment's lease for one guest port in place, replacing any
+    /// previous row for it. Returns `false` when the host port belongs to
+    /// another Environment, or to another Resource of this one: one host port is
+    /// exactly one lease.
+    pub fn put_lease(&self, lease: &LeaseRecord) -> Result<bool> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let holder: Option<(String, String, u16)> = tx
+                .query_row(
+                    "SELECT environment_id, resource, guest_port FROM port_leases WHERE host_port = ?1",
+                    [lease.host_port],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((environment_id, resource, guest_port)) = holder {
+                let same_lease = environment_id == lease.environment_id
+                    && resource == lease.resource
+                    && guest_port == lease.guest_port;
+                if !same_lease {
+                    return Ok(false);
+                }
+            }
+            tx.execute(
+                "DELETE FROM port_leases
+                 WHERE environment_id = ?1 AND resource = ?2 AND guest_port = ?3",
+                rusqlite::params![lease.environment_id, lease.resource, lease.guest_port],
+            )?;
+            tx.execute(
+                "INSERT INTO port_leases (id, environment_id, resource, guest_port, host_port, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    lease.environment_id,
+                    lease.resource,
+                    lease.guest_port,
+                    lease.host_port,
+                    lease.created_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    /// Release every lease an Environment holds.
+    pub fn release_leases(&self, environment_id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM port_leases WHERE environment_id = ?1",
+                [environment_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    // ---- operations --------------------------------------------------------
+
+    pub fn create_operation(&self, operation: &OperationRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO operations (id, kind, project_id, environment_id, state,
+                                         created_at, updated_at, finished_at, error_code,
+                                         error_detail, result_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, NULL)",
+                rusqlite::params![
+                    operation.id,
+                    operation.kind,
+                    operation.project_id,
+                    operation.environment_id,
+                    operation.state,
+                    operation.created_at,
+                    operation.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Finish an operation. Idempotent: a second finish leaves the first result.
+    pub fn finish_operation(
+        &self,
+        id: &str,
+        state: &str,
+        error_code: Option<&str>,
+        error_detail: Option<&str>,
+        result_json: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let now = clock::now_rfc3339();
+            conn.execute(
+                "UPDATE operations
+                 SET state = ?2, updated_at = ?3, finished_at = ?3,
+                     error_code = ?4, error_detail = ?5, result_json = ?6
+                 WHERE id = ?1 AND state = 'running'",
+                rusqlite::params![id, state, now, error_code, error_detail, result_json],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn operation(&self, id: &str) -> Result<Option<OperationRecord>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT id, kind, project_id, environment_id, state, created_at,
+                            updated_at, finished_at, error_code, error_detail, result_json
+                     FROM operations WHERE id = ?1",
+                    [id],
+                    |row| {
+                        Ok(OperationRecord {
+                            id: row.get(0)?,
+                            kind: row.get(1)?,
+                            project_id: row.get(2)?,
+                            environment_id: row.get(3)?,
+                            state: row.get(4)?,
+                            created_at: row.get(5)?,
+                            updated_at: row.get(6)?,
+                            finished_at: row.get(7)?,
+                            error_code: row.get(8)?,
+                            error_detail: row.get(9)?,
+                            result_json: row.get(10)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+    }
+
+    // ---- idempotency -------------------------------------------------------
+
+    pub fn idempotency(&self, key: &str) -> Result<Option<IdempotencyRecord>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT key, method, path, request_hash, status, body, created_at
+                     FROM idempotency_records WHERE key = ?1",
+                    [key],
+                    |row| {
+                        Ok(IdempotencyRecord {
+                            key: row.get(0)?,
+                            method: row.get(1)?,
+                            path: row.get(2)?,
+                            request_hash: row.get(3)?,
+                            status: row.get(4)?,
+                            body: row.get(5)?,
+                            created_at: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+    }
+
+    pub fn put_idempotency(&self, record: &IdempotencyRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO idempotency_records
+                     (key, method, path, request_hash, status, body, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    record.key,
+                    record.method,
+                    record.path,
+                    record.request_hash,
+                    record.status,
+                    record.body,
+                    record.created_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Drop replayed responses older than the cutoff (`now - 24h`).
+    pub fn purge_idempotency_before(&self, cutoff: &str) -> Result<usize> {
+        self.with_conn(|conn| {
+            let removed =
+                conn.execute("DELETE FROM idempotency_records WHERE created_at < ?1", [cutoff])?;
+            Ok(removed)
+        })
+    }
+}
+
+fn lease_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LeaseRecord> {
+    Ok(LeaseRecord {
+        environment_id: row.get(0)?,
+        resource: row.get(1)?,
+        guest_port: row.get(2)?,
+        host_port: row.get(3)?,
+        created_at: row.get(4)?,
+    })
 }
 
 fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
@@ -436,6 +849,10 @@ fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
         environment: EnvironmentRecord {
             id: row.get(7)?,
             name: row.get(8)?,
+            desired_state: row.get(9)?,
+            observed_state: row.get(10)?,
+            health: row.get(11)?,
+            updated_at: row.get(12)?,
         },
         resources: Vec::new(),
     })

@@ -8,11 +8,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+mod environment;
 mod paths;
 mod project;
 
 pub mod client;
 
+pub use environment::{
+    BackendRef, ExecRequest, ExecResponse, EnvironmentStatus, LeasedPortView, LogLineView,
+    LogsResponse, OperationView, ResourceStatsView, ResourceStatusView, StatsResponse,
+    TransitionDetail, HEALTH_HEALTHY, HEALTH_UNHEALTHY, HEALTH_UNKNOWN, IDEMPOTENCY_HEADER,
+    STATE_ABSENT, STATE_DEGRADED, STATE_FAILED, STATE_RUNNING, STATE_STARTING,
+};
 pub use paths::{resolve_data_root, APP_DIR_NAME, HOME_ENV};
 pub use project::{
     BuildView, Cost, CreateProjectRequest, EnvironmentView, HealthcheckView, PortView, Project,
@@ -100,8 +107,9 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// What this build can do: an events stream and nothing else. Project,
-    /// Backend, ingress, and stats capabilities arrive with later tickets.
+    /// What this build can do: an events stream and nothing else. Kept for the
+    /// walking skeleton's tests; a running daemon reports the *active Backend's*
+    /// capabilities instead.
     pub fn v0_skeleton() -> Self {
         Self {
             pty: false,
@@ -133,7 +141,10 @@ pub struct Whoami {
     pub scopes: Vec<String>,
     pub daemon_version: String,
     pub api_version: String,
+    /// What the *active* Backend can do, not what the daemon might do one day.
     pub capabilities: Capabilities,
+    /// The Backend serving this daemon.
+    pub backend: BackendRef,
     pub actor: Actor,
     pub daemon: DaemonInfo,
 }
@@ -154,6 +165,14 @@ pub struct Problem {
     /// the Manifest (`resources.web.kind`) or the request body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The operation a caller can wait on. Present on a `504` from a mutation
+    /// that outlived the request timeout.
+    #[serde(
+        default,
+        rename = "operationId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub operation_id: Option<String>,
 }
 
 impl Problem {
@@ -165,12 +184,19 @@ impl Problem {
             code: code.to_string(),
             detail,
             path: None,
+            operation_id: None,
         }
     }
 
     /// The same problem, pointing at the field that failed.
     pub fn at(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
+        self
+    }
+
+    /// The same problem, carrying the operation to wait on.
+    pub fn for_operation(mut self, operation_id: impl Into<String>) -> Self {
+        self.operation_id = Some(operation_id.into());
         self
     }
 }
