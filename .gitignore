@@ -4,3 +4,5 @@ target/
 node_modules/
 dist/
 *.log
+# Tauri generates permission schemas and capability manifests at build time.
+ui/src-tauri/gen/
