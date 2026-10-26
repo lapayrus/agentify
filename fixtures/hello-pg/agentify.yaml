@@ -1,0 +1,41 @@
+# The one file a person writes. Everything else is daemon-owned.
+version: 1
+
+# The URL namespace: web.hello-pg.localhost
+project: hello-pg
+
+# Named secrets. The daemon stores the values; the manifest only names them.
+secrets:
+  pg-password:
+    generate: password # daemon creates it; never shown in the UI or API
+  api-token:
+    fromEnv: HELLO_API_TOKEN # imported once from the host environment
+
+resources:
+  web:
+    kind: app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: [node, server.js] # array, no shell quoting
+    env:
+      DATABASE_URL: postgres://hello:${secret:pg-password}@db:5432/hello
+      API_TOKEN: ${secret:api-token}
+      GREETING: hello # a literal, not a secret
+    ports:
+      - port: 3000
+        hostname: web # https://web.hello-pg.localhost
+    dependsOn: [db] # start order
+    healthcheck:
+      port: 3000
+      path: /health
+      interval: 5s
+
+  db:
+    kind: database
+    engine: postgres
+    version: "16"
+    credentials:
+      username: hello
+      password: ${secret:pg-password}
+    # volume omitted on purpose: the daemon names it hello-pg-db-data
