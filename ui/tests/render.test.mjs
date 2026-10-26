@@ -11,6 +11,10 @@ import {
   renderMain,
   render,
   renderProjectDetail,
+  renderStatusBar,
+  renderActions,
+  renderTabs,
+  renderLogs,
   costLabel,
   selectedProject,
 } from "../src/render.js";
@@ -238,4 +242,213 @@ test("render composes header, rail, and main into the three-zone shell", () => {
   const empty = render(connected);
   assert.match(empty, /<header/);
   assert.match(empty, /No Projects yet/);
+});
+
+// ---------------------------------------------------------------------------
+// Environment lifecycle: status bar, Start/Stop, and live logs.
+// ---------------------------------------------------------------------------
+
+/** `GET .../status` for a running Environment, as the daemon serves it. */
+const runningStatus = {
+  project: "hello-pg",
+  projectId: "proj-1",
+  environment: { id: "env-1", name: "dev", state: "running", cost: { cpu: null, memory: null, disk: null } },
+  health: "healthy",
+  backend: { name: "fake", version: "0.1.0", platform: "scripted" },
+  checkedAt: "2026-01-01T00:00:05Z",
+  resources: [
+    { name: "db", kind: "database", state: "running", health: "healthy", ports: [{ guestPort: 5432, hostPort: 40100 }] },
+    { name: "web", kind: "app", state: "running", health: "healthy", ports: [{ guestPort: 3000, hostPort: 40101 }] },
+  ],
+};
+
+const runningStats = {
+  state: "running",
+  cpuPercent: 2.5,
+  memoryBytes: 100663296,
+  diskBytes: 536870912,
+  cpu: "2.5%",
+  memory: "96 MB",
+  disk: "512 MB",
+  resources: [{ name: "environment", cpuPercent: "2.5%", memory: "96 MB" }],
+};
+
+const stoppedStatus = {
+  ...runningStatus,
+  environment: { ...runningStatus.environment, state: "stopped" },
+  health: "unknown",
+  resources: runningStatus.resources.map((resource) => ({
+    ...resource,
+    state: "stopped",
+    health: "unknown",
+    ports: [],
+  })),
+};
+
+const degradedStatus = {
+  ...runningStatus,
+  environment: { ...runningStatus.environment, state: "degraded" },
+  health: "unhealthy",
+  resources: [
+    { name: "db", kind: "database", state: "running", health: "healthy", ports: [{ guestPort: 5432, hostPort: 40100 }] },
+    { name: "web", kind: "app", state: "degraded", health: "unhealthy", ports: [{ guestPort: 3000, hostPort: 40101 }] },
+  ],
+};
+
+const logLines = [
+  { seq: 1, at: "2026-01-01T00:00:01.000Z", resource: "web", stream: "stdout", line: "fake: resource started" },
+  { seq: 2, at: "2026-01-01T00:00:02.000Z", resource: "web", stream: "stdout", line: "fake: listening on 127.0.0.1:40101" },
+];
+
+/** A view the shell assembles from the status, stats, and log endpoints. */
+function view(overrides = {}) {
+  return {
+    status: runningStatus,
+    stats: runningStats,
+    logs: { lines: [], following: false },
+    pending: null,
+    ...overrides,
+  };
+}
+
+test("the status bar shows state, health, resources, and cost while running", () => {
+  const bar = renderStatusBar(helloPg, runningStatus, runningStats);
+  assert.match(bar, /data-status="running"/);
+  assert.match(bar, /data-health="healthy"/);
+  assert.match(bar, /running/);
+  assert.match(bar, /healthy/);
+  assert.match(bar, /2 resources/);
+  assert.match(bar, /2 healthy/);
+  assert.match(bar, /2\.5% · 96 MB · 512 MB/);
+
+  const degraded = renderStatusBar(helloPg, degradedStatus, runningStats);
+  assert.match(degraded, /1 healthy/, "the bar counts only what answered");
+});
+
+test("a stopped Environment shows unknown health and placeholder cost", () => {
+  const bar = renderStatusBar(helloPg, stoppedStatus, null);
+  assert.match(bar, /data-status="stopped"/);
+  assert.match(bar, /data-health="unknown"/);
+  assert.match(bar, /— · — · —/, "no figures before the first start");
+});
+
+test("Start is available when stopped and Stop when running", () => {
+  const stopped = renderActions(helloPg, stoppedStatus, null);
+  assert.match(stopped, /data-action="start"(?![^>]*disabled)/);
+  assert.match(stopped, /data-action="stop"[^>]*disabled/);
+
+  const running = renderActions(helloPg, runningStatus, null);
+  assert.match(running, /data-action="start"[^>]*disabled/);
+  assert.match(running, /data-action="stop"(?![^>]*disabled)/);
+});
+
+test("a pending action disables both buttons and says what is happening", () => {
+  const starting = renderActions(helloPg, stoppedStatus, "start");
+  assert.match(starting, /Starting…/);
+  assert.match(starting, /data-action="start"[^>]*disabled/);
+  assert.match(starting, /data-action="stop"[^>]*disabled/);
+});
+
+test("the detail pane renders the status bar, actions, tabs, and health per Resource", () => {
+  const main = renderMain({ ...populated, view: view() });
+  assert.match(main, /data-project="hello-pg"/);
+  assert.match(main, /data-tab="overview"/);
+  assert.match(main, /class="statusbar" data-status="running"/);
+  assert.match(main, /data-action="start"/);
+  assert.match(main, /data-tab="overview" aria-selected="true"/);
+  assert.match(main, /data-tab="logs" aria-selected="false"/);
+  assert.match(main, /data-resource="web"[^>]*data-health="healthy"/);
+  assert.match(main, /fake/, "the active Backend is named");
+});
+
+test("a degraded Environment is visibly unhealthy, Resource by Resource", () => {
+  const main = renderMain({ ...populated, view: view({ status: degradedStatus }) });
+  assert.match(main, /data-status="degraded"/);
+  assert.match(main, /data-health="unhealthy"/);
+  assert.match(main, /data-resource="web"[^>]*data-health="unhealthy"/);
+  assert.match(main, /data-resource="db"[^>]*data-health="healthy"/);
+  assert.match(main, /degraded/);
+});
+
+test("a stopped Environment keeps its URLs and offers Start", () => {
+  const main = renderMain({ ...populated, view: view({ status: stoppedStatus, stats: null }) });
+  assert.match(main, /data-status="stopped"/);
+  assert.match(main, /https:\/\/web\.hello-pg\.localhost/, "links do not rot");
+  assert.match(main, /data-action="start"(?![^>]*disabled)/);
+});
+
+test("an Environment error is shown instead of pretending everything is fine", () => {
+  const main = renderMain({ ...populated, view: view({ status: null, stats: null, error: "daemon said no" }) });
+  assert.match(main, /data-error="environment"/);
+  assert.match(main, /daemon said no/);
+});
+
+test("the Logs tab renders lines and marks the stream as following", () => {
+  const logs = renderLogs({ lines: logLines, following: true });
+  assert.match(logs, /data-following="true"/);
+  assert.match(logs, /following/);
+  assert.match(logs, /fake: listening on 127\.0\.0\.1:40101/);
+  assert.match(logs, /data-resource="web"/);
+  assert.match(logs, /2 lines/);
+
+  const paused = renderLogs({ lines: logLines, following: false });
+  assert.match(paused, /data-following="false"/);
+  assert.match(paused, /paused/);
+});
+
+test("the Logs tab explains an empty stream instead of showing nothing", () => {
+  const empty = renderLogs({ lines: [], following: true });
+  assert.match(empty, /No log lines yet/);
+  assert.match(empty, /following/);
+  assert.match(renderLogs(undefined), /No log lines yet/);
+});
+
+test("selecting the Logs tab renders the panel in place of the Overview", () => {
+  const main = renderMain({
+    ...populated,
+    view: view({ tab: "logs", logs: { lines: logLines, following: true } }),
+  });
+  assert.match(main, /data-tab="logs"/);
+  assert.match(main, /data-tab="logs" aria-selected="true"/);
+  assert.match(main, /data-tab-panel="logs"/);
+  assert.match(main, /fake: resource started/);
+  assert.doesNotMatch(main, /data-tab-panel="overview"/);
+});
+
+test("streamed lines append, and the newest are shown", () => {
+  const first = renderLogs({ lines: logLines, following: true });
+  const streamed = renderLogs({
+    lines: [
+      ...logLines,
+      { seq: 3, at: "2026-01-01T00:00:03.000Z", resource: "web", stream: "stdout", line: "hello agent" },
+    ],
+    following: true,
+  });
+  assert.match(first, /2 lines/);
+  assert.match(streamed, /3 lines/);
+  assert.match(streamed, /hello agent/);
+  assert.ok(
+    streamed.indexOf("fake: resource started") < streamed.indexOf("hello agent"),
+    "order is preserved",
+  );
+});
+
+test("stderr lines are distinguishable, and log text is escaped", () => {
+  const logs = renderLogs({
+    lines: [
+      { seq: 1, at: "2026-01-01T00:00:01.000Z", resource: "web", stream: "stderr", line: "fake: command failed" },
+      { seq: 2, at: "2026-01-01T00:00:02.000Z", resource: "web", stream: "stdout", line: '<img src=x onerror="alert(1)">' },
+    ],
+    following: true,
+  });
+  assert.match(logs, /data-stream="stderr"/);
+  assert.doesNotMatch(logs, /<img/);
+  assert.match(logs, /&lt;img/);
+});
+
+test("renderTabs marks exactly one tab as selected", () => {
+  assert.match(renderTabs("overview"), /data-tab="overview" aria-selected="true"/);
+  assert.match(renderTabs("logs"), /data-tab="logs" aria-selected="true"/);
+  assert.match(renderTabs(undefined), /data-tab="overview" aria-selected="true"/);
+  assert.equal((renderTabs("logs").match(/aria-selected="true"/g) ?? []).length, 1);
 });
