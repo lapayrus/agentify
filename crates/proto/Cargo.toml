@@ -1,0 +1,16 @@
+[package]
+name = "agentify-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Wire types and on-disk formats shared by the Agentify daemon, MCP shim, CLI, and shell"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

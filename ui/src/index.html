@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agentify</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app" data-connection="loading">
+      <div class="shell">
+        <header class="top">
+          <div class="brand"><span class="mark">A</span>Agentify</div>
+          <div class="daemon">
+            <span class="dot dot-loading"></span>
+            <span class="project-count">0 Projects</span>
+            <span class="sep">·</span>
+            <span class="connection">connecting…</span>
+          </div>
+        </header>
+        <div class="body">
+          <aside class="rail" data-rail="projects" aria-label="Projects">
+            <div class="rail-head"><span>Projects</span><span class="badge">0</span></div>
+            <p class="rail-empty">No Projects yet</p>
+          </aside>
+          <main class="main" data-state="loading">
+            <h1>Connecting to the daemon</h1>
+          </main>
+        </div>
+      </div>
+    </div>
+    <noscript>
+      The Agentify shell needs JavaScript: it renders the daemon's state and
+      nothing more, and the daemon is the only place state lives.
+    </noscript>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

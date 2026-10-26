@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for the Agentify shell window: core IPC only. The shell calls one app command (daemon_status) and holds no privileged access to the daemon.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
