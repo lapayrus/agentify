@@ -1,0 +1,29 @@
+[package]
+name = "agentify-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Agentify MCP stdio shim: exposes the daemon API to MCP clients"
+
+[lib]
+name = "agentify_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentify-mcp"
+path = "src/main.rs"
+
+[dependencies]
+agentify-proto = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+agentify-daemon = { path = "../daemon" }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+ureq = { workspace = true }

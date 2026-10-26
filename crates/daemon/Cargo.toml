@@ -1,0 +1,46 @@
+[package]
+name = "agentify-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Agentify control plane: owns state and serves the loopback HTTP API"
+
+[lib]
+name = "agentify_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentifyd"
+path = "src/main.rs"
+
+[dependencies]
+agentify-proto = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+getrandom = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+ureq = { workspace = true }

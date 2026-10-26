@@ -1,0 +1,21 @@
+[package]
+name = "agentify-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Agentify command line: a thin client of the daemon API"
+
+[[bin]]
+name = "agentify"
+path = "src/main.rs"
+
+[dependencies]
+agentify-daemon = { path = "../daemon" }
+agentify-proto = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
