@@ -154,6 +154,150 @@ fn initialize_lists_tools_and_whoami_returns_the_http_payload() {
 }
 
 #[test]
+fn project_tools_create_list_and_get_through_the_same_api() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+        .expect("boot daemon");
+    let mut shim = Shim::spawn(temp.path());
+
+    shim.send(initialize());
+    shim.read();
+
+    shim.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let listed = shim.read();
+    let tools = listed["result"]["tools"].as_array().expect("tools");
+    for name in ["create_project", "list_projects", "get_project", "whoami"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} tool in {listed}"));
+        assert_eq!(tool["inputSchema"]["type"], "object", "{name} needs a schema");
+        assert!(
+            tool["description"].as_str().unwrap_or_default().len() > 20,
+            "{name} needs a description an Agent can act on"
+        );
+    }
+    let create = tools
+        .iter()
+        .find(|tool| tool["name"] == "create_project")
+        .expect("create_project");
+    assert_eq!(
+        create["inputSchema"]["properties"]["fixture"]["type"], "string",
+        "create_project takes a fixture name: {create}"
+    );
+    assert_eq!(
+        create["inputSchema"]["properties"]["manifest"]["type"], "string",
+        "create_project takes an inline Manifest: {create}"
+    );
+
+    // Empty list first.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "list_projects", "arguments": {} }
+    }));
+    let empty = shim.read();
+    assert_eq!(empty["result"]["isError"], false);
+    assert_eq!(empty["result"]["structuredContent"]["projects"], json!([]));
+
+    // Create from the bundled fixture.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": { "name": "create_project", "arguments": { "fixture": "hello-pg" } }
+    }));
+    let created = shim.read();
+    assert_eq!(created["result"]["isError"], false, "{created}");
+    assert_eq!(created["result"]["structuredContent"]["name"], "hello-pg");
+    assert_eq!(
+        created["result"]["structuredContent"]["environment"]["name"],
+        "dev"
+    );
+    assert_eq!(
+        created["result"]["structuredContent"]["resources"]
+            .as_array()
+            .expect("resources")
+            .len(),
+        2
+    );
+
+    // The same Project over plain HTTP, to prove the shim is only a mapping.
+    let http: Value = serde_json::from_str(
+        &ureq::get(&format!("{}/v1/projects/hello-pg", daemon.base_url()))
+            .set("Authorization", &format!("Bearer {}", daemon.token()))
+            .call()
+            .expect("get over HTTP")
+            .into_string()
+            .expect("body"),
+    )
+    .expect("project JSON");
+    assert_eq!(created["result"]["structuredContent"], http);
+
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": { "name": "list_projects", "arguments": {} }
+    }));
+    let listed = shim.read();
+    assert_eq!(
+        listed["result"]["structuredContent"]["projects"]
+            .as_array()
+            .expect("projects")
+            .len(),
+        1
+    );
+
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": { "name": "get_project", "arguments": { "project": "hello-pg" } }
+    }));
+    let fetched = shim.read();
+    assert_eq!(fetched["result"]["structuredContent"]["name"], "hello-pg");
+
+    // A duplicate name is a typed error, not prose.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": { "name": "create_project", "arguments": { "fixture": "hello-pg" } }
+    }));
+    let duplicate = shim.read();
+    assert_eq!(duplicate["error"]["data"]["code"], "AlreadyExists", "{duplicate}");
+
+    // Validation failures carry the path of the offending field.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": {
+            "name": "create_project",
+            "arguments": {
+                "manifest": "version: 1\nproject: bad\nresources:\n  web:\n    kind: app\n    image: node:22\n    env: { TOKEN: \"${secret:nope}\" }\n"
+            }
+        }
+    }));
+    let invalid = shim.read();
+    assert_eq!(invalid["error"]["data"]["code"], "ValidationFailed", "{invalid}");
+    assert_eq!(invalid["error"]["data"]["path"], "resources.web.env.TOKEN");
+
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": { "name": "get_project", "arguments": { "project": "nope" } }
+    }));
+    let missing = shim.read();
+    assert_eq!(missing["error"]["data"]["code"], "NotFound", "{missing}");
+
+    daemon.shutdown().expect("stop daemon");
+}
+
+#[test]
 fn whoami_reports_a_clear_error_when_the_daemon_is_not_running() {
     let temp = tempfile::tempdir().expect("temp dir");
     let mut shim = Shim::spawn(temp.path());
