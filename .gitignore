@@ -1,1 +1,6 @@
 .commandcode
+.worktrees/
+target/
+node_modules/
+dist/
+*.log

@@ -1,0 +1,658 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentify UI v0 — prototype</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    transition: background .15s ease, color .15s ease;
+  }
+  button { font: inherit; cursor: pointer; }
+  a { color: inherit; }
+  #app { padding-bottom: 96px; min-height: 100vh; }
+  h1, h2, h3, p { margin: 0; }
+
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+  .dot-running, .dot-healthy { background: #16a34a; }
+  .dot-degraded, .dot-unhealthy { background: #d97706; }
+  .dot-stopped, .dot-absent { background: #9ca3af; }
+  .dot-failed { background: #dc2626; }
+
+  /* ---------- A: control room ---------- */
+  body.v-A { background: #0f1115; color: #e6e9ef; }
+  .a-top {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 20px; border-bottom: 1px solid #262c37;
+    background: #12151b;
+  }
+  .a-brand { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -.01em; }
+  .a-mark {
+    display: grid; place-items: center; width: 22px; height: 22px;
+    background: #5eead4; color: #0b1210; border-radius: 5px; font: 700 12px/1 ui-monospace, monospace;
+  }
+  .a-daemon { display: flex; align-items: center; gap: 8px; color: #8b94a7; font: 12px/1.4 ui-monospace, monospace; }
+  .a-grid { display: grid; grid-template-columns: 230px minmax(0, 1fr) 300px; min-height: calc(100vh - 57px); }
+  @media (max-width: 1080px) { .a-grid { grid-template-columns: 200px minmax(0, 1fr); } .a-side { display: none; } }
+  .a-rail { border-right: 1px solid #262c37; padding: 16px 12px; background: #111419; }
+  .a-rail-head { display: flex; justify-content: space-between; align-items: center; color: #8b94a7; font: 11px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px; padding: 0 6px; }
+  .a-new { background: transparent; border: 1px solid #2c3442; color: #8b94a7; border-radius: 5px; padding: 1px 7px; }
+  .a-proj {
+    width: 100%; display: grid; grid-template-columns: 10px 1fr; grid-template-rows: auto auto;
+    gap: 2px 8px; text-align: left; background: transparent; border: 1px solid transparent;
+    color: #c9d0dc; padding: 9px 8px; border-radius: 7px; margin-bottom: 2px;
+  }
+  .a-proj:hover { background: #171c24; }
+  .a-proj.active { background: #1b2430; border-color: #2d3a4c; }
+  .a-proj .dot { grid-row: 1 / span 2; align-self: center; }
+  .a-proj-name { font-size: 13px; font-weight: 600; }
+  .a-proj-cost { grid-column: 2; font: 11px/1.3 ui-monospace, monospace; color: #79839a; }
+  .a-rail-foot { margin-top: 16px; padding: 10px 8px; border-top: 1px solid #222833; color: #fbbf24; font: 11px/1.4 ui-monospace, monospace; }
+  .a-main { padding: 22px 26px; min-width: 0; }
+  .a-title-row { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  .a-title-row h1 { font-size: 22px; letter-spacing: -.02em; display: flex; align-items: center; gap: 9px; }
+  .a-env { font: 10px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .08em; color: #5eead4; border: 1px solid #1f4d45; background: #10211e; padding: 3px 6px; border-radius: 4px; }
+  .a-url { display: inline-block; margin-top: 6px; color: #8b94a7; font: 12px/1.4 ui-monospace, monospace; text-decoration: none; border-bottom: 1px dotted #3a4354; }
+  .a-url:hover { color: #5eead4; }
+  .a-actions { display: flex; gap: 8px; }
+  .a-actions button {
+    background: #1a2029; color: #dbe2ee; border: 1px solid #2c3442; border-radius: 6px; padding: 7px 12px; font-size: 13px;
+  }
+  .a-actions button:hover { border-color: #5eead4; color: #5eead4; }
+  .a-statusbar { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; color: #8b94a7; font: 12px/1.4 ui-monospace, monospace; margin: 16px 0 18px; padding: 9px 12px; background: #12161d; border: 1px solid #232a35; border-radius: 7px; }
+  .badge { font: 10px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .07em; padding: 4px 7px; border-radius: 4px; }
+  .badge-running { background: #12301f; color: #4ade80; }
+  .badge-degraded { background: #33230a; color: #fbbf24; }
+  .badge-stopped { background: #23262c; color: #9ca3af; }
+  .badge-failed { background: #331414; color: #f87171; }
+  .a-tabs { display: flex; gap: 4px; border-bottom: 1px solid #262c37; margin-bottom: 14px; }
+  .a-tabs button { background: transparent; border: 0; border-bottom: 2px solid transparent; color: #8b94a7; padding: 8px 12px; font-size: 13px; }
+  .a-tabs button.on { color: #e6e9ef; border-bottom-color: #5eead4; }
+  table.a-res { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .a-res th { text-align: left; color: #79839a; font: 11px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .06em; padding: 8px 10px; border-bottom: 1px solid #262c37; }
+  .a-res td { padding: 10px; border-bottom: 1px solid #1c222c; vertical-align: top; }
+  .a-res .mono { font: 12px/1.4 ui-monospace, monospace; color: #a9b3c6; }
+  .a-res .strong { font-weight: 600; }
+  .a-logbox { height: 360px; overflow: auto; background: #0a0c10; border: 1px solid #222833; border-radius: 7px; padding: 12px 14px; font: 12px/1.65 ui-monospace, monospace; color: #a7b4c8; white-space: pre-wrap; }
+  .a-side { border-left: 1px solid #262c37; padding: 18px 14px; background: #111419; }
+  .a-approval { border: 1px solid #5a4413; background: #1c1709; border-radius: 8px; padding: 13px; margin-bottom: 22px; }
+  .a-approval-kicker { color: #fbbf24; font: 10px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .09em; margin-bottom: 9px; }
+  .a-approval-op { font: 12px/1.3 ui-monospace, monospace; color: #e6e9ef; }
+  .a-approval-target { font-size: 16px; font-weight: 650; margin: 4px 0 6px; }
+  .a-approval-meta { color: #a39577; font-size: 11px; line-height: 1.5; }
+  .a-approval-params { margin: 8px 0 11px; font: 11px/1.4 ui-monospace, monospace; color: #8b94a7; background: #12161d; border-radius: 5px; padding: 6px 7px; }
+  .a-approval-actions { display: flex; gap: 7px; }
+  .a-approval-actions button { flex: 1; border-radius: 5px; padding: 6px 9px; font-size: 12px; background: #fbbf24; color: #1b1403; border: 1px solid #fbbf24; }
+  .a-approval-actions button.ghost { background: transparent; color: #d6c9a8; border-color: #5a4413; }
+  .a-side h2 { font: 11px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .08em; color: #79839a; margin-bottom: 10px; }
+  .a-act { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 8px 0; border-bottom: 1px solid #1c222c; font-size: 12px; }
+  .a-act-op { color: #c9d0dc; }
+  .a-act-target { grid-column: 1; color: #79839a; font: 11px/1.4 ui-monospace, monospace; }
+  .a-act-at { grid-column: 2; grid-row: 1 / span 2; align-self: center; color: #5d687c; font: 10px/1.3 ui-monospace, monospace; }
+  .a-act-actor { color: #5eead4; }
+  .a-act-actor.human { color: #93c5fd; }
+  .a-empty { color: #79839a; font-size: 12px; padding: 8px 0; }
+
+  /* ---------- B: needs you ---------- */
+  body.v-B { background: #f7f5f1; color: #1d1c1a; }
+  .b-wrap { max-width: 1280px; margin: 0 auto; padding: 26px 24px; }
+  .b-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding-bottom: 16px; border-bottom: 1px solid #e5e1d8; margin-bottom: 22px; }
+  .b-brand { font-size: 20px; font-weight: 700; letter-spacing: -.02em; }
+  .b-sub { color: #726e66; font-size: 13px; }
+  .b-cols { display: grid; grid-template-columns: 1.05fr 1fr 1fr; gap: 26px; align-items: start; }
+  @media (max-width: 1000px) { .b-cols { grid-template-columns: 1fr; } }
+  .b-col h2 { font: 11px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .09em; color: #726e66; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .b-count { background: #1d1c1a; color: #fff; border-radius: 999px; padding: 2px 7px; font-size: 10px; }
+  .b-approval { background: #fff; border: 1px solid #e5e1d8; border-left: 3px solid #b45309; border-radius: 10px; padding: 16px; box-shadow: 0 1px 2px rgba(28,25,20,.04); }
+  .b-approval h3 { font-size: 17px; margin: 3px 0 2px; }
+  .b-kicker { color: #b45309; font: 10px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .09em; }
+  .b-op { font: 12px/1.4 ui-monospace, monospace; color: #726e66; margin-bottom: 8px; }
+  .b-meta { color: #8a857b; font-size: 12px; line-height: 1.6; }
+  .b-params { margin: 10px 0 14px; font: 11px/1.5 ui-monospace, monospace; background: #f3f0ea; border-radius: 6px; padding: 8px 10px; }
+  .b-actions { display: flex; gap: 8px; }
+  .b-actions button { border-radius: 7px; padding: 8px 14px; font-size: 13px; border: 1px solid #1d1c1a; background: #1d1c1a; color: #fff; }
+  .b-actions button.ghost { background: transparent; color: #5b574f; border-color: #d8d3c8; }
+  .b-hint { margin-top: 14px; color: #8a857b; font-size: 12px; line-height: 1.6; }
+  .b-card { background: #fff; border: 1px solid #e5e1d8; border-radius: 10px; padding: 13px 14px; margin-bottom: 9px; }
+  .b-card.active { border-color: #0f766e; box-shadow: 0 0 0 1px #0f766e inset; }
+  .b-card-top { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+  .b-card-name { font-weight: 650; }
+  .b-state { font: 10px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .06em; color: #726e66; display: flex; align-items: center; gap: 6px; }
+  .b-card-url { font: 11px/1.4 ui-monospace, monospace; color: #8a857b; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .b-card-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 9px; gap: 8px; }
+  .b-cost { font: 11px/1 ui-monospace, monospace; color: #8a857b; }
+  .b-mini { background: transparent; border: 1px solid #d8d3c8; border-radius: 6px; padding: 4px 9px; font-size: 12px; color: #5b574f; }
+  .b-mini:hover { border-color: #0f766e; color: #0f766e; }
+  .b-act { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 9px 0; border-bottom: 1px solid #ece8e0; font-size: 12.5px; }
+  .b-act-actor { font-weight: 600; }
+  .b-act-actor.agent { color: #0f766e; }
+  .b-act-actor.human { color: #1d4ed8; }
+  .b-act-target { grid-column: 1; color: #8a857b; font: 11px/1.4 ui-monospace, monospace; }
+  .b-act-at { grid-column: 2; grid-row: 1 / span 2; align-self: center; color: #a19c91; font-size: 10px; }
+  .b-detail { margin-top: 28px; background: #fff; border: 1px solid #e5e1d8; border-radius: 12px; padding: 20px; }
+  .b-detail-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+  .b-detail h2 { font-size: 18px; letter-spacing: -.01em; }
+  .b-detail .b-card-url { margin-top: 5px; }
+  table.b-res { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 16px; }
+  .b-res th { text-align: left; color: #8a857b; font: 10px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .07em; padding: 7px 8px; border-bottom: 1px solid #ece8e0; }
+  .b-res td { padding: 9px 8px; border-bottom: 1px solid #f0ece5; }
+  .b-logbox { height: 220px; overflow: auto; background: #fbfaf7; border: 1px solid #ece8e0; border-radius: 8px; padding: 11px 13px; font: 11.5px/1.65 ui-monospace, monospace; color: #5b574f; white-space: pre-wrap; }
+
+  /* ---------- C: command surface ---------- */
+  body.v-C { background: #fafafa; color: #0a0a0a; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  .c-wrap { max-width: 1000px; margin: 0 auto; padding: 24px 20px 20px; }
+  .c-head { display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #d4d4d4; padding-bottom: 14px; margin-bottom: 18px; }
+  .c-brand { font-weight: 700; letter-spacing: -.02em; }
+  .c-cmd { flex: 1; display: flex; align-items: center; gap: 8px; border: 1px solid #0a0a0a; padding: 7px 10px; background: #fff; }
+  .c-prompt { color: #737373; }
+  .c-cmd input { flex: 1; border: 0; outline: 0; font: inherit; font-size: 13px; background: transparent; color: #0a0a0a; }
+  .c-cmd-hint { color: #a3a3a3; font-size: 10px; white-space: nowrap; }
+  .c-approval { border: 1px solid #0a0a0a; background: #0a0a0a; color: #fff; padding: 10px 12px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; font-size: 12.5px; }
+  .c-approval strong { color: #fbbf24; font-weight: 600; }
+  .c-approval button { background: #fbbf24; color: #0a0a0a; border: 0; padding: 4px 10px; font: inherit; font-size: 12px; }
+  .c-approval button.ghost { background: transparent; color: #fff; border: 1px solid #525252; }
+  .c-list { border-top: 1px solid #d4d4d4; }
+  .c-row { border-bottom: 1px solid #d4d4d4; }
+  .c-row-main { width: 100%; display: grid; grid-template-columns: 88px 1fr 160px 210px; gap: 12px; align-items: center; background: transparent; border: 0; padding: 11px 6px; text-align: left; font: inherit; font-size: 13px; color: inherit; }
+  .c-row-main:hover { background: #f0f0f0; }
+  .c-row.active .c-row-main { background: #0a0a0a; color: #fff; }
+  .c-state { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: #737373; display: flex; align-items: center; gap: 6px; }
+  .c-row.active .c-state { color: #d4d4d4; }
+  .c-name { font-weight: 600; }
+  .c-cost { font-size: 11px; color: #737373; }
+  .c-row.active .c-cost { color: #a3a3a3; }
+  .c-url { font-size: 11px; color: #737373; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .c-row.active .c-url { color: #a3a3a3; }
+  .c-expand { padding: 4px 6px 18px 100px; }
+  @media (max-width: 760px) { .c-expand { padding-left: 6px; } .c-row-main { grid-template-columns: 76px 1fr; } .c-url, .c-cost { display: none; } }
+  .c-expand table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 12px; }
+  .c-expand th { text-align: left; color: #8a8a8a; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; padding: 5px 6px; border-bottom: 1px solid #d4d4d4; }
+  .c-expand td { padding: 7px 6px; border-bottom: 1px solid #e5e5e5; }
+  .c-expand-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+  .c-expand-actions button { background: #fff; border: 1px solid #0a0a0a; padding: 5px 11px; font: inherit; font-size: 12px; }
+  .c-expand-actions button:hover { background: #0a0a0a; color: #fff; }
+  .c-logbox { height: 180px; overflow: auto; background: #0a0a0a; color: #d4d4d4; padding: 10px 12px; font-size: 11.5px; line-height: 1.65; white-space: pre-wrap; }
+  .c-foot { margin-top: 18px; color: #8a8a8a; font-size: 11px; display: flex; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+  .c-empty { padding: 30px 6px; color: #737373; font-size: 12.5px; }
+
+  /* ---------- shared prototype chrome ---------- */
+  .api-strip {
+    position: fixed; left: 16px; bottom: 20px; z-index: 998;
+    max-width: 46vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    background: #111; color: #86efac; border: 1px solid #333; border-radius: 6px;
+    padding: 7px 10px; font: 11px/1.3 ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+  .switcher {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 999;
+    display: flex; align-items: center; gap: 4px;
+    background: #111; color: #fff; border: 1px solid #444; border-radius: 999px;
+    padding: 5px 7px; box-shadow: 0 10px 34px rgba(0,0,0,.35);
+    font: 12px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+  .switcher button { background: transparent; border: 0; color: #fff; padding: 5px 8px; font-size: 15px; line-height: 1; }
+  .switcher button:hover { color: #5eead4; }
+  #switcher-label { min-width: 150px; text-align: center; white-space: nowrap; }
+</style>
+</head>
+<body class="v-A">
+<div id="app"></div>
+<div class="api-strip" id="api-strip"></div>
+<div class="switcher">
+  <button id="prev" title="Previous variant (←)">←</button>
+  <span id="switcher-label"></span>
+  <button id="next" title="Next variant (→)">→</button>
+</div>
+
+<script>
+/* THROWAWAY UI PROTOTYPE — three variants over one in-memory state. */
+(function () {
+  "use strict";
+
+  var VARIANTS = [
+    { key: "A", name: "Control room" },
+    { key: "B", name: "Needs you" },
+    { key: "C", name: "Command surface" }
+  ];
+
+  var state = {
+    variant: "A",
+    selected: "hello-pg",
+    tab: "overview",
+    lastApi: "GET /v1/projects",
+    projects: [
+      {
+        name: "hello-pg", env: "dev", state: "running", health: "healthy",
+        url: "https://web.hello-pg.localhost", cpu: "3%", mem: "112 MB", disk: "48 MB",
+        actor: "agent · claude-code", updated: "12s ago",
+        resources: [
+          { name: "web", kind: "app", state: "running", health: "healthy", cpu: "2%", mem: "48 MB", detail: "build . / Dockerfile · :3000" },
+          { name: "db", kind: "database", state: "running", health: "healthy", cpu: "1%", mem: "64 MB", detail: "postgres 16 · volume hello-pg-db-data" }
+        ]
+      },
+      {
+        name: "docs-site", env: "dev", state: "stopped", health: "—",
+        url: "https://web.docs-site.localhost", cpu: "0%", mem: "0 MB", disk: "31 MB",
+        actor: "you", updated: "18m ago",
+        resources: [
+          { name: "web", kind: "app", state: "stopped", health: "—", cpu: "0%", mem: "0 MB", detail: "static · :3000" }
+        ]
+      },
+      {
+        name: "api-playground", env: "dev", state: "degraded", health: "unhealthy",
+        url: "https://web.api-playground.localhost", cpu: "11%", mem: "203 MB", disk: "96 MB",
+        actor: "agent · codex", updated: "2m ago",
+        resources: [
+          { name: "web", kind: "app", state: "running", health: "unhealthy", cpu: "9%", mem: "131 MB", detail: "build . / Dockerfile · :3000" },
+          { name: "db", kind: "database", state: "running", health: "healthy", cpu: "2%", mem: "72 MB", detail: "postgres 16 · volume api-playground-db-data" }
+        ]
+      }
+    ],
+    approvals: [
+      { id: "apr_7f2", operation: "delete_project", target: "api-playground", requestedBy: "agent · codex", at: "2m ago", expires: "13m left", params: "keepVolumes=false" }
+    ],
+    activity: [
+      { at: "now", actor: "agent · codex", kind: "agent", op: "run_command", target: "hello-pg/web", result: "ok" },
+      { at: "1m", actor: "you", kind: "human", op: "stop_environment", target: "docs-site", result: "ok" },
+      { at: "2m", actor: "agent · codex", kind: "agent", op: "request_approval", target: "api-playground", result: "pending" },
+      { at: "4m", actor: "agent · claude-code", kind: "agent", op: "create_checkpoint", target: "hello-pg", result: "ok" },
+      { at: "12m", actor: "you", kind: "human", op: "create_project", target: "hello-pg", result: "ok" }
+    ],
+    logs: [
+      "db   database system is ready to accept connections",
+      "web  listening on :3000",
+      "web  GET /health 200 2ms",
+      "db   checkpoint complete: wrote 42 buffers",
+      "web  GET /api/greeting 200 4ms",
+      "web  POST /api/greeting 201 7ms",
+      "db   connection authorized: user=hello database=hello",
+      "web  GET /health 200 1ms"
+    ]
+  };
+
+  var app = document.getElementById("app");
+  var apiStrip = document.getElementById("api-strip");
+  var label = document.getElementById("switcher-label");
+
+  function esc(value) {
+    return String(value)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function selected() {
+    for (var i = 0; i < state.projects.length; i += 1) {
+      if (state.projects[i].name === state.selected) return state.projects[i];
+    }
+    return state.projects[0] || null;
+  }
+
+  function pending() {
+    return state.approvals.length;
+  }
+
+  function setApi(method, path) {
+    state.lastApi = method + " " + path;
+    apiStrip.textContent = state.lastApi;
+  }
+
+  function record(actor, kind, op, target, result) {
+    state.activity.unshift({ at: "now", actor: actor, kind: kind, op: op, target: target, result: result });
+    if (state.activity.length > 30) state.activity.pop();
+  }
+
+  function logsText() {
+    return state.logs.join("\n");
+  }
+
+  function activityRows(limit, actorClass) {
+    return state.activity.slice(0, limit).map(function (a) {
+      return '<div class="' + actorClass + '-act">' +
+        '<span class="' + actorClass + '-act-actor ' + a.kind + '">' + esc(a.actor) + '</span>' +
+        '<span class="' + actorClass + '-act-at">' + esc(a.at) + '</span>' +
+        '<span class="' + actorClass + '-act-target">' + esc(a.op) + ' · ' + esc(a.target) + ' · ' + esc(a.result) + '</span>' +
+        '</div>';
+    }).join("");
+  }
+
+  /* ---------- shared data renderers ---------- */
+
+  function approvalA(a) {
+    if (!a) return '<div class="a-approval"><div class="a-approval-kicker">Approvals</div><div class="a-empty">Nothing waiting. Agents continue until an Approval is required.</div></div>';
+    return '<section class="a-approval">' +
+      '<div class="a-approval-kicker">Approval needed · ' + esc(a.expires) + '</div>' +
+      '<div class="a-approval-op">' + esc(a.operation) + '</div>' +
+      '<div class="a-approval-target">' + esc(a.target) + '</div>' +
+      '<div class="a-approval-meta">' + esc(a.requestedBy) + ' · ' + esc(a.at) + '</div>' +
+      '<div class="a-approval-params">' + esc(a.params) + '</div>' +
+      '<div class="a-approval-actions">' +
+        '<button data-act="approve" data-id="' + esc(a.id) + '">Approve</button>' +
+        '<button class="ghost" data-act="deny" data-id="' + esc(a.id) + '">Deny</button>' +
+      '</div></section>';
+  }
+
+  function approvalB(a) {
+    if (!a) return '<div class="b-card"><p class="b-hint">Nothing waiting.</p></div>';
+    return '<article class="b-approval">' +
+      '<div class="b-kicker">Approval needed · ' + esc(a.expires) + '</div>' +
+      '<h3>' + esc(a.target) + '</h3>' +
+      '<div class="b-op">' + esc(a.operation) + '</div>' +
+      '<div class="b-meta">' + esc(a.requestedBy) + ' · ' + esc(a.at) + '</div>' +
+      '<div class="b-params">' + esc(a.params) + '</div>' +
+      '<div class="b-actions">' +
+        '<button data-act="approve" data-id="' + esc(a.id) + '">Approve</button>' +
+        '<button class="ghost" data-act="deny" data-id="' + esc(a.id) + '">Deny</button>' +
+      '</div></article>';
+  }
+
+  function resourceTable(p, cls) {
+    return '<table class="' + cls + '-res"><thead><tr><th>Resource</th><th>Kind</th><th>State</th><th>Health</th><th>CPU</th><th>Memory</th><th>Detail</th></tr></thead><tbody>' +
+      p.resources.map(function (r) {
+        return "<tr>" +
+          '<td class="strong">' + esc(r.name) + "</td>" +
+          "<td>" + esc(r.kind) + "</td>" +
+          '<td><span class="dot dot-' + esc(r.state) + '"></span> ' + esc(r.state) + "</td>" +
+          "<td>" + esc(r.health) + "</td>" +
+          '<td class="mono">' + esc(r.cpu) + "</td>" +
+          '<td class="mono">' + esc(r.mem) + "</td>" +
+          '<td class="mono">' + esc(r.detail) + "</td>" +
+          "</tr>";
+      }).join("") + "</tbody></table>";
+  }
+
+  /* ---------- variant A ---------- */
+
+  function renderA() {
+    var p = selected();
+    var ap = state.approvals[0];
+    var main = p ? (
+      '<div class="a-title-row">' +
+        '<div><h1>' + esc(p.name) + '<span class="a-env">' + esc(p.env) + '</span></h1>' +
+        '<a class="a-url" href="' + esc(p.url) + '" target="_blank" rel="noreferrer">' + esc(p.url) + '</a></div>' +
+        '<div class="a-actions">' +
+          '<button data-act="start" data-project="' + esc(p.name) + '">Start</button>' +
+          '<button data-act="stop" data-project="' + esc(p.name) + '">Stop</button>' +
+          '<button data-act="tab" data-tab="logs">Logs</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="a-statusbar">' +
+        '<span class="badge badge-' + esc(p.state) + '">' + esc(p.state) + '</span>' +
+        '<span>health ' + esc(p.health) + '</span>' +
+        '<span>' + p.resources.length + ' resources</span>' +
+        '<span>' + esc(p.cpu) + ' cpu · ' + esc(p.mem) + ' mem · ' + esc(p.disk) + ' disk</span>' +
+        '<span>updated ' + esc(p.updated) + ' by ' + esc(p.actor) + '</span>' +
+      '</div>' +
+      '<div class="a-tabs">' +
+        '<button class="' + (state.tab === "overview" ? "on" : "") + '" data-act="tab" data-tab="overview">Overview</button>' +
+        '<button class="' + (state.tab === "logs" ? "on" : "") + '" data-act="tab" data-tab="logs">Logs</button>' +
+      '</div>' +
+      (state.tab === "overview"
+        ? resourceTable(p, "a")
+        : '<pre class="a-logbox" id="logbox">' + esc(logsText()) + '</pre>')
+    ) : '<p class="a-empty">No projects yet.</p>';
+
+    return '<header class="a-top">' +
+        '<div class="a-brand"><span class="a-mark">A</span> Agentify</div>' +
+        '<div class="a-daemon"><span class="dot dot-running"></span> daemon 0.1.0 · api v1 · scopes read, operate, admin</div>' +
+      '</header>' +
+      '<div class="a-grid">' +
+        '<aside class="a-rail">' +
+          '<div class="a-rail-head"><span>Projects</span><button class="a-new" data-act="new" title="POST /v1/projects">+</button></div>' +
+          state.projects.map(function (proj) {
+            return '<button class="a-proj ' + (proj.name === state.selected ? "active" : "") + '" data-act="select" data-project="' + esc(proj.name) + '">' +
+              '<span class="dot dot-' + esc(proj.state) + '"></span>' +
+              '<span class="a-proj-name">' + esc(proj.name) + '</span>' +
+              '<span class="a-proj-cost">' + esc(proj.cpu) + ' · ' + esc(proj.mem) + '</span>' +
+            '</button>';
+          }).join("") +
+          '<div class="a-rail-foot">' + pending() + ' approval pending</div>' +
+        '</aside>' +
+        '<main class="a-main">' + main + '</main>' +
+        '<aside class="a-side">' + approvalA(ap) +
+          '<h2>Activity</h2>' + activityRows(6, "a") +
+        '</aside>' +
+      '</div>';
+  }
+
+  /* ---------- variant B ---------- */
+
+  function renderB() {
+    var p = selected();
+    var ap = state.approvals[0];
+    return '<div class="b-wrap">' +
+      '<header class="b-head"><div class="b-brand">Agentify</div><div class="b-sub">' + state.projects.length + ' Projects · daemon connected · api v1</div></header>' +
+      '<div class="b-cols">' +
+        '<section class="b-col">' +
+          '<h2>Needs you <span class="b-count">' + pending() + '</span></h2>' +
+          approvalB(ap) +
+          '<p class="b-hint">Agents keep working until an operation needs an Approval. Approvals are single-use and expire.</p>' +
+        '</section>' +
+        '<section class="b-col">' +
+          '<h2>Projects</h2>' +
+          state.projects.map(function (proj) {
+            return '<article class="b-card ' + (proj.name === state.selected ? "active" : "") + '">' +
+              '<div class="b-card-top"><span class="b-card-name">' + esc(proj.name) + '</span>' +
+                '<span class="b-state"><span class="dot dot-' + esc(proj.state) + '"></span>' + esc(proj.state) + '</span></div>' +
+              '<div class="b-card-url">' + esc(proj.url) + '</div>' +
+              '<div class="b-card-foot"><span class="b-cost">' + esc(proj.cpu) + ' · ' + esc(proj.mem) + ' · ' + esc(proj.disk) + '</span>' +
+                '<span><button class="b-mini" data-act="select" data-project="' + esc(proj.name) + '">Open</button> ' +
+                '<button class="b-mini" data-act="' + (proj.state === "running" ? "stop" : "start") + '" data-project="' + esc(proj.name) + '">' + (proj.state === "running" ? "Stop" : "Start") + '</button></span></div>' +
+            '</article>';
+          }).join("") +
+        '</section>' +
+        '<section class="b-col">' +
+          '<h2>Activity</h2>' + activityRows(8, "b") +
+        '</section>' +
+      '</div>' +
+      (p ? '<section class="b-detail">' +
+        '<div class="b-detail-head"><div><h2>' + esc(p.name) + ' · ' + esc(p.env) + '</h2><div class="b-card-url">' + esc(p.url) + ' · ' + esc(p.health) + ' · updated ' + esc(p.updated) + ' by ' + esc(p.actor) + '</div></div>' +
+          '<div class="b-actions"><button data-act="start" data-project="' + esc(p.name) + '">Start</button><button class="ghost" data-act="stop" data-project="' + esc(p.name) + '">Stop</button></div></div>' +
+        resourceTable(p, "b") +
+        '<h2 style="font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:#8a857b;margin-bottom:8px">Logs</h2>' +
+        '<pre class="b-logbox" id="logbox">' + esc(logsText()) + '</pre>' +
+      '</section>' : "") +
+    '</div>';
+  }
+
+  /* ---------- variant C ---------- */
+
+  function renderC() {
+    var p = selected();
+    var ap = state.approvals[0];
+    var banner = ap ? '<div class="c-approval"><span>Approval needed</span> <strong>' + esc(ap.operation) + ' ' + esc(ap.target) + '</strong> <span>' + esc(ap.requestedBy) + ' · ' + esc(ap.expires) + '</span>' +
+      '<span style="margin-left:auto"><button data-act="approve" data-id="' + esc(ap.id) + '">Approve</button> <button class="ghost" data-act="deny" data-id="' + esc(ap.id) + '">Deny</button></span></div>' : "";
+    return '<div class="c-wrap">' +
+      '<header class="c-head"><div class="c-brand">agentify</div>' +
+        '<div class="c-cmd"><span class="c-prompt">&gt;</span><input id="c-filter" placeholder="filter projects…" autocomplete="off"><span class="c-cmd-hint">← → variants</span></div>' +
+      '</header>' +
+      banner +
+      '<main class="c-list">' +
+      state.projects.map(function (proj) {
+        var active = proj.name === state.selected;
+        return '<div class="c-row ' + (active ? "active" : "") + '" data-name="' + esc(proj.name) + '">' +
+          '<button class="c-row-main" data-act="select" data-project="' + esc(proj.name) + '">' +
+            '<span class="c-state"><span class="dot dot-' + esc(proj.state) + '"></span>' + esc(proj.state) + '</span>' +
+            '<span class="c-name">' + esc(proj.name) + '</span>' +
+            '<span class="c-cost">' + esc(proj.cpu) + ' · ' + esc(proj.mem) + ' · ' + esc(proj.disk) + '</span>' +
+            '<span class="c-url">' + esc(proj.url.replace("https://", "")) + '</span>' +
+          '</button>' +
+          (active ? '<div class="c-expand">' +
+            '<table><thead><tr><th>Resource</th><th>State</th><th>Health</th><th>Detail</th></tr></thead><tbody>' +
+              proj.resources.map(function (r) {
+                return "<tr><td>" + esc(r.name) + " <span style=\"color:#8a8a8a\">" + esc(r.kind) + "</span></td><td>" + esc(r.state) + "</td><td>" + esc(r.health) + "</td><td>" + esc(r.detail) + "</td></tr>";
+              }).join("") +
+            '</tbody></table>' +
+            '<div class="c-expand-actions">' +
+              '<button data-act="start" data-project="' + esc(proj.name) + '">start</button>' +
+              '<button data-act="stop" data-project="' + esc(proj.name) + '">stop</button>' +
+              '<button data-act="tab" data-tab="logs">logs</button>' +
+            '</div>' +
+            '<pre class="c-logbox" id="logbox">' + esc(logsText()) + '</pre>' +
+          '</div>' : "") +
+        '</div>';
+      }).join("") +
+      '</main>' +
+      '<footer class="c-foot"><span>' + state.projects.length + ' projects · ' + pending() + ' approval pending</span><span>daemon 0.1.0 · api v1 · read, operate, admin</span></footer>' +
+    '</div>';
+  }
+
+  /* ---------- actions ---------- */
+
+  function findProject(name) {
+    for (var i = 0; i < state.projects.length; i += 1) {
+      if (state.projects[i].name === name) return state.projects[i];
+    }
+    return null;
+  }
+
+  function actStart(name) {
+    var p = findProject(name);
+    if (!p) return;
+    p.state = "running"; p.health = "healthy"; p.actor = "you"; p.updated = "now";
+    p.cpu = "2%"; p.mem = "96 MB";
+    record("you", "human", "start_environment", p.name, "ok");
+    setApi("POST", "/v1/projects/" + p.name + "/environments/dev/start");
+    render();
+  }
+
+  function actStop(name) {
+    var p = findProject(name);
+    if (!p) return;
+    p.state = "stopped"; p.health = "—"; p.actor = "you"; p.updated = "now";
+    p.cpu = "0%"; p.mem = "0 MB";
+    record("you", "human", "stop_environment", p.name, "ok");
+    setApi("POST", "/v1/projects/" + p.name + "/environments/dev/stop");
+    render();
+  }
+
+  function actApprove(id) {
+    var a = null;
+    state.approvals = state.approvals.filter(function (x) { if (x.id === id) { a = x; return false; } return true; });
+    if (!a) return;
+    record("you", "human", "approve", a.operation + " " + a.target, "ok");
+    if (a.operation === "delete_project") {
+      state.projects = state.projects.filter(function (p) { return p.name !== a.target; });
+      if (state.selected === a.target) state.selected = state.projects[0] ? state.projects[0].name : null;
+    }
+    setApi("POST", "/v1/approvals/" + id + "/approve");
+    render();
+  }
+
+  function actDeny(id) {
+    var a = null;
+    state.approvals = state.approvals.filter(function (x) { if (x.id === id) { a = x; return false; } return true; });
+    if (!a) return;
+    record("you", "human", "deny", a.operation + " " + a.target, "denied");
+    setApi("POST", "/v1/approvals/" + id + "/deny");
+    render();
+  }
+
+  app.addEventListener("click", function (event) {
+    var button = event.target.closest("[data-act]");
+    if (!button) return;
+    var act = button.getAttribute("data-act");
+    var name = button.getAttribute("data-project");
+    var id = button.getAttribute("data-id");
+
+    if (act === "select" && name) {
+      state.selected = name;
+      setApi("GET", "/v1/projects/" + name);
+      render();
+    } else if (act === "start" && name) {
+      actStart(name);
+    } else if (act === "stop" && name) {
+      actStop(name);
+    } else if (act === "approve" && id) {
+      actApprove(id);
+    } else if (act === "deny" && id) {
+      actDeny(id);
+    } else if (act === "tab") {
+      state.tab = button.getAttribute("data-tab");
+      render();
+    } else if (act === "new") {
+      setApi("POST", "/v1/projects");
+    }
+  });
+
+  /* C's filter stays local; it maps to GET /v1/projects?q= */
+  app.addEventListener("input", function (event) {
+    if (event.target.id !== "c-filter") return;
+    var q = event.target.value.toLowerCase();
+    Array.prototype.forEach.call(document.querySelectorAll(".c-row"), function (row) {
+      row.style.display = row.getAttribute("data-name").indexOf(q) === -1 ? "none" : "";
+    });
+    setApi("GET", "/v1/projects?q=" + encodeURIComponent(event.target.value));
+  });
+
+  /* ---------- switcher + fake log stream ---------- */
+
+  function setVariant(key) {
+    state.variant = key;
+    var url = new URL(window.location.href);
+    url.searchParams.set("variant", key);
+    window.history.replaceState(null, "", url.toString());
+    render();
+  }
+
+  function cycle(delta) {
+    var index = 0;
+    for (var i = 0; i < VARIANTS.length; i += 1) if (VARIANTS[i].key === state.variant) index = i;
+    var next = (index + delta + VARIANTS.length) % VARIANTS.length;
+    setVariant(VARIANTS[next].key);
+  }
+
+  document.getElementById("prev").addEventListener("click", function () { cycle(-1); });
+  document.getElementById("next").addEventListener("click", function () { cycle(1); });
+
+  document.addEventListener("keydown", function (event) {
+    var tag = (event.target && event.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || (event.target && event.target.isContentEditable)) return;
+    if (event.key === "ArrowLeft") { event.preventDefault(); cycle(-1); }
+    if (event.key === "ArrowRight") { event.preventDefault(); cycle(1); }
+  });
+
+  var LOG_LINES = [
+    "web  GET /health 200 2ms",
+    "web  GET /api/greeting 200 3ms",
+    "db   connection authorized: user=hello database=hello",
+    "web  POST /api/greeting 201 6ms",
+    "db   checkpoint complete: wrote 18 buffers",
+    "web  GET /health 200 1ms"
+  ];
+
+  setInterval(function () {
+    var p = selected();
+    if (!p || p.state !== "running") return;
+    state.logs.push(LOG_LINES[Math.floor(Math.random() * LOG_LINES.length)]);
+    if (state.logs.length > 60) state.logs.shift();
+    var box = document.getElementById("logbox");
+    if (box) {
+      box.textContent = logsText();
+      box.scrollTop = box.scrollHeight;
+    }
+  }, 2400);
+
+  /* ---------- boot ---------- */
+
+  var fromUrl = new URLSearchParams(window.location.search).get("variant");
+  for (var i = 0; i < VARIANTS.length; i += 1) {
+    if (VARIANTS[i].key === fromUrl) state.variant = fromUrl;
+  }
+
+  function render() {
+    document.body.className = "v-" + state.variant;
+    var html = state.variant === "A" ? renderA() : state.variant === "B" ? renderB() : renderC();
+    app.innerHTML = html;
+    var variant = null;
+    for (var j = 0; j < VARIANTS.length; j += 1) if (VARIANTS[j].key === state.variant) variant = VARIANTS[j];
+    label.textContent = variant.key + " · " + variant.name;
+    apiStrip.textContent = state.lastApi;
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

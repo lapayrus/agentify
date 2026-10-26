@@ -1,0 +1,775 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentify manifest v0 — prototype</title>
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --panel: #ffffff;
+    --ink: #1b1a17;
+    --muted: #6b675f;
+    --line: #e4e0d8;
+    --accent: #0f766e;
+    --accent-soft: #e6f4f1;
+    --bad: #b42318;
+    --bad-soft: #fdf0ee;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 40px 24px 80px; }
+  .kicker {
+    margin: 0 0 8px;
+    font-size: 12px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  h1 { font-size: 28px; line-height: 1.2; margin: 0 0 10px; letter-spacing: -.01em; }
+  h1 code { font-size: .9em; background: var(--accent-soft); padding: 2px 6px; border-radius: 5px; }
+  .lede { margin: 0 0 28px; max-width: 760px; color: var(--muted); }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+  .scenario {
+    font: inherit;
+    font-size: 13px;
+    padding: 7px 12px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--panel);
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .scenario:hover { border-color: var(--accent); }
+  .scenario.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px;
+    min-width: 0;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 4px; }
+  .panel h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 20px 0 8px; }
+  .case-desc { margin: 0 0 14px; color: var(--muted); font-size: 14px; }
+  pre {
+    margin: 0;
+    padding: 16px;
+    background: #1c1b19;
+    color: #f4f1ea;
+    border-radius: 8px;
+    overflow: auto;
+    font: 12.5px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+    tab-size: 2;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .92em; }
+  .status {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    padding: 4px 9px;
+    border-radius: 999px;
+    margin-bottom: 12px;
+  }
+  .status.ok { background: var(--accent-soft); color: var(--accent); }
+  .status.bad { background: var(--bad-soft); color: var(--bad); }
+  .meta { margin: 0 0 4px; }
+  .muted { color: var(--muted); }
+  ul { margin: 0; padding-left: 18px; }
+  li { margin: 3px 0; }
+  .errors { color: var(--bad); }
+  .errors code { color: var(--bad); }
+  .res {
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    padding: 12px 14px;
+    margin: 10px 0;
+  }
+  .res h3 { margin: 0 0 6px; font-size: 14px; text-transform: none; letter-spacing: 0; color: var(--ink); }
+  .kind {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 999px;
+    padding: 2px 7px;
+    margin-left: 6px;
+    vertical-align: 1px;
+  }
+  .res p { margin: 4px 0; font-size: 13.5px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  .schema { margin-top: 20px; }
+  .schema h2 { margin-bottom: 12px; }
+  .footer { margin-top: 28px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="kicker">Throwaway prototype · answers one question</p>
+  <h1>What should <code>agentify.yaml</code> look like in v0?</h1>
+  <p class="lede">
+    Click a case. The left panel is the file a person writes. The right panel is what the daemon
+    must understand, infer, or reject. Nothing is saved and nothing runs.
+  </p>
+
+  <div class="controls" id="scenarios"></div>
+
+  <main>
+    <section class="panel">
+      <h2 id="case-title">Case</h2>
+      <p class="case-desc" id="case-desc"></p>
+      <pre id="yaml"></pre>
+    </section>
+
+    <section class="panel">
+      <h2>What the daemon sees</h2>
+      <div id="result"></div>
+    </section>
+  </main>
+
+  <section class="panel schema">
+    <h2>The shape being tested</h2>
+    <table>
+      <thead>
+        <tr><th>Key</th><th>Required</th><th>Rule</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>version</code></td><td>yes</td><td><code>1</code></td></tr>
+        <tr><td><code>project</code></td><td>yes</td><td>lower-case kebab; it becomes the URL namespace</td></tr>
+        <tr><td><code>secrets</code></td><td>no</td><td>name → <code>{ generate: password|token }</code> or <code>{ fromEnv: NAME }</code></td></tr>
+        <tr><td><code>resources</code></td><td>yes</td><td>map of resource name → resource; at least one</td></tr>
+        <tr><td><code>resources.*.kind</code></td><td>yes</td><td><code>app</code> or <code>database</code> in v0</td></tr>
+        <tr><td><code>app.image</code> / <code>app.build</code></td><td>one of</td><td>exactly one, never both</td></tr>
+        <tr><td><code>app.command</code></td><td>no</td><td>array of strings; no shell quoting</td></tr>
+        <tr><td><code>app.env</code></td><td>no</td><td>literal strings and <code>${secret:name}</code> references</td></tr>
+        <tr><td><code>app.ports</code></td><td>no</td><td><code>{ port, hostname? }</code>; hostname is required when a resource declares more than one</td></tr>
+        <tr><td><code>app.dependsOn</code></td><td>no</td><td>resource names; start order, cycles rejected</td></tr>
+        <tr><td><code>app.healthcheck</code></td><td>no</td><td><code>{ port?, path?, interval? }</code>; defaults to a TCP check on the first port</td></tr>
+        <tr><td><code>db.engine</code></td><td>yes</td><td><code>postgres</code> in v0</td></tr>
+        <tr><td><code>db.credentials</code></td><td>yes</td><td>username plus a <code>${secret:name}</code> password</td></tr>
+        <tr><td><code>db.volume</code></td><td>no</td><td>name only; the daemon generates <code>&lt;project&gt;-&lt;resource&gt;-data</code></td></tr>
+        <tr><td>any unknown field</td><td>—</td><td>rejected: typos fail loudly</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <p class="footer">
+    Not settled here: a <code>service</code> kind, per-environment overrides, and importing
+    <code>devcontainer.json</code> or Compose. Those belong to later tickets.
+  </p>
+</div>
+
+<div id="yaml-sources" hidden>
+  <pre data-id="vertical">version: 1
+project: hello-pg
+
+secrets:
+  pg-password:
+    generate: password
+  api-token:
+    fromEnv: HELLO_API_TOKEN
+
+resources:
+  web:
+    kind: app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: [node, server.js]
+    env:
+      DATABASE_URL: postgres://hello:${secret:pg-password}@db:5432/hello
+      API_TOKEN: ${secret:api-token}
+      GREETING: hello
+    ports:
+      - port: 3000
+        hostname: web
+    dependsOn: [db]
+    healthcheck:
+      port: 3000
+      path: /health
+      interval: 5s
+
+  db:
+    kind: database
+    engine: postgres
+    version: "16"
+    credentials:
+      username: hello
+      password: ${secret:pg-password}</pre>
+
+  <pre data-id="minimal">version: 1
+project: tiny
+
+resources:
+  web:
+    kind: app
+    image: nginx:1.27-alpine</pre>
+
+  <pre data-id="multi">version: 1
+project: multi
+
+resources:
+  web:
+    kind: app
+    image: node:22-alpine
+    ports:
+      - port: 3000
+        hostname: web
+      - port: 3001
+        hostname: api</pre>
+
+  <pre data-id="generated">version: 1
+project: lazy
+
+secrets:
+  pg:
+    generate: password
+
+resources:
+  db:
+    kind: database
+    engine: postgres
+    credentials:
+      username: app
+      password: ${secret:pg}</pre>
+
+  <pre data-id="typo">version: 1
+project: oops
+
+resorces:
+  web:
+    kind: app
+    image: nginx</pre>
+
+  <pre data-id="missing-secret">version: 1
+project: leaky
+
+resources:
+  web:
+    kind: app
+    image: node:22-alpine
+    env:
+      DATABASE_URL: postgres://x:${secret:missing}@db:5432/x</pre>
+
+  <pre data-id="duplicate">version: 1
+project: clash
+
+resources:
+  web:
+    kind: app
+    image: node:22-alpine
+    ports:
+      - port: 3000
+        hostname: app
+  api:
+    kind: app
+    image: node:22-alpine
+    ports:
+      - port: 3000
+        hostname: app</pre>
+
+  <pre data-id="ambiguous">version: 1
+project: ambiguous
+
+resources:
+  web:
+    kind: app
+    image: node:22-alpine
+    ports:
+      - port: 3000
+      - port: 3001</pre>
+</div>
+
+<script>
+/* PURE MODULE — no DOM, no handlers. This is the part worth lifting. */
+window.ManifestModel = (function () {
+  "use strict";
+
+  var NAME = /^[a-z][a-z0-9-]{0,30}$/;
+  var HOST = /^[a-z][a-z0-9-]*$/;
+  var SECRET_REF = /\$\{secret:([a-z0-9-]+)\}/g;
+  var TOP = ["version", "project", "secrets", "resources"];
+  var FIELDS = {
+    app: ["kind", "image", "build", "command", "env", "ports", "dependsOn", "healthcheck"],
+    database: ["kind", "engine", "version", "credentials", "volume"]
+  };
+
+  function normalize(input) {
+    var errors = [];
+    function add(path, msg) { errors.push({ path: path, msg: msg }); }
+
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      return { ok: false, errors: [{ path: "(root)", msg: "manifest must be an object" }], project: null, version: null, secrets: [], resources: [], generated: [] };
+    }
+
+    Object.keys(input).forEach(function (key) {
+      if (TOP.indexOf(key) === -1) add(key, "unknown field — strict mode rejects typos");
+    });
+    if (input.version !== 1) add("version", "required, must be 1");
+    if (!input.project) add("project", "required");
+    else if (!NAME.test(input.project)) add("project", "must be lower-case kebab-case, up to 31 characters");
+
+    var secrets = [];
+    var secretNames = {};
+    var secretDefs = input.secrets || {};
+    if (input.secrets !== undefined && (typeof input.secrets !== "object" || Array.isArray(input.secrets))) {
+      add("secrets", "must be a map of name → source");
+      secretDefs = {};
+    }
+    Object.keys(secretDefs).forEach(function (name) {
+      var def = secretDefs[name];
+      if (!NAME.test(name)) add("secrets." + name, "invalid secret name");
+      var generate = def && def.generate;
+      var fromEnv = def && def.fromEnv;
+      if (!!generate === !!fromEnv) {
+        add("secrets." + name, "exactly one of generate or fromEnv");
+        return;
+      }
+      if (generate && ["password", "token"].indexOf(generate) === -1) add("secrets." + name + ".generate", "must be password or token");
+      if (fromEnv && typeof fromEnv !== "string") add("secrets." + name + ".fromEnv", "must be an environment variable name");
+      secretNames[name] = true;
+      secrets.push({ name: name, source: generate ? "generated " + generate : "imported from $" + fromEnv });
+    });
+
+    function collectRefs(value, path) {
+      var match;
+      var re = new RegExp(SECRET_REF.source, "g");
+      while ((match = re.exec(value))) {
+        if (!secretNames[match[1]]) add(path, "references undefined secret " + match[1]);
+      }
+      if (value.indexOf("${") !== -1 && !/\$\{secret:[a-z0-9-]+\}/.test(value)) {
+        add(path, "only ${secret:name} references are supported in v0");
+      }
+    }
+
+    var resourcesIn = input.resources;
+    var names = [];
+    if (!resourcesIn || typeof resourcesIn !== "object" || Array.isArray(resourcesIn) || Object.keys(resourcesIn).length === 0) {
+      add("resources", "at least one resource is required");
+    } else {
+      names = Object.keys(resourcesIn);
+      var routes = {};
+
+      names.forEach(function (name) {
+        var r = resourcesIn[name];
+        if (!NAME.test(name)) add("resources." + name, "invalid resource name");
+        if (!r || typeof r !== "object" || Array.isArray(r)) { add("resources." + name, "must be a map"); return; }
+        var allowed = FIELDS[r.kind];
+        if (!allowed) { add("resources." + name + ".kind", "must be app or database in v0"); return; }
+        Object.keys(r).forEach(function (key) {
+          if (allowed.indexOf(key) === -1) add("resources." + name + "." + key, "unknown field — strict mode rejects typos");
+        });
+
+        if (r.kind === "app") {
+          if (!!r.image === !!r.build) add("resources." + name, "exactly one of image or build");
+          if (r.command !== undefined && (!Array.isArray(r.command) || r.command.some(function (x) { return typeof x !== "string"; }))) {
+            add("resources." + name + ".command", "must be an array of strings");
+          }
+        }
+
+        if (r.kind === "database") {
+          if (!r.engine) add("resources." + name + ".engine", "required");
+          else if (r.engine !== "postgres") add("resources." + name + ".engine", "v0 supports postgres only");
+          if (!r.credentials || typeof r.credentials !== "object") {
+            add("resources." + name + ".credentials", "required");
+          } else {
+            if (!r.credentials.username) add("resources." + name + ".credentials.username", "required");
+            if (r.credentials.password) collectRefs(r.credentials.password, "resources." + name + ".credentials.password");
+          }
+        }
+
+        if (r.env !== undefined && (typeof r.env !== "object" || Array.isArray(r.env))) {
+          add("resources." + name + ".env", "must be a map");
+        } else {
+          Object.keys(r.env || {}).forEach(function (key) {
+            var value = r.env[key];
+            if (typeof value !== "string") add("resources." + name + ".env." + key, "must be a string");
+            else collectRefs(value, "resources." + name + ".env." + key);
+          });
+        }
+
+        if (r.ports !== undefined && !Array.isArray(r.ports)) {
+          add("resources." + name + ".ports", "must be a list");
+        } else {
+          var ports = r.ports || [];
+          if (ports.length > 1 && ports.some(function (p) { return !p || !p.hostname; })) {
+            add("resources." + name + ".ports", "every port needs a hostname when a resource declares more than one");
+          }
+          ports.forEach(function (p, index) {
+            var path = "resources." + name + ".ports[" + index + "]";
+            if (!p || typeof p !== "object") { add(path, "must be a map"); return; }
+            if (!Number.isInteger(p.port) || p.port < 1 || p.port > 65535) add(path + ".port", "must be an integer 1–65535");
+            if (p.hostname !== undefined && !HOST.test(p.hostname)) add(path + ".hostname", "must be lower-case kebab-case");
+            var host = p.hostname || (ports.length === 1 ? name : null);
+            if (host && input.project) {
+              var fqdn = host + "." + input.project + ".localhost";
+              if (routes[fqdn]) add(path + ".hostname", "duplicate route " + fqdn + " (also " + routes[fqdn] + ")");
+              else routes[fqdn] = name;
+            }
+          });
+        }
+
+        if (r.dependsOn !== undefined) {
+          if (!Array.isArray(r.dependsOn)) add("resources." + name + ".dependsOn", "must be a list");
+          else r.dependsOn.forEach(function (dep) {
+            if (dep === name) add("resources." + name + ".dependsOn", "a resource cannot depend on itself");
+            else if (names.indexOf(dep) === -1) add("resources." + name + ".dependsOn", "unknown resource " + dep);
+          });
+        }
+      });
+
+      var state = {};
+      function visit(node, stack) {
+        if (state[node] === 2) return;
+        if (state[node] === 1) {
+          add("resources." + node + ".dependsOn", "dependency cycle: " + stack.concat(node).join(" → "));
+          return;
+        }
+        state[node] = 1;
+        var deps = (resourcesIn[node] && resourcesIn[node].dependsOn) || [];
+        deps.forEach(function (dep) {
+          if (names.indexOf(dep) !== -1) visit(dep, stack.concat(node));
+        });
+        state[node] = 2;
+      }
+      names.forEach(function (name) { visit(name, []); });
+    }
+
+    var normalized = [];
+    names.forEach(function (name) {
+      var r = resourcesIn[name];
+      if (!r || !FIELDS[r.kind]) return;
+      if (r.kind === "app") {
+        var ports = r.ports || [];
+        var hc = r.healthcheck || (ports.length ? { port: ports[0].port, path: null, interval: "5s", inferred: true } : null);
+        if (hc && !hc.port && ports.length) hc = { port: ports[0].port, path: hc.path, interval: hc.interval || "5s", inferred: hc.inferred };
+        normalized.push({
+          name: name,
+          kind: "app",
+          source: r.image ? "image " + r.image : "build " + ((r.build && r.build.context) || ".") + " / " + ((r.build && r.build.dockerfile) || "Dockerfile"),
+          command: r.command || null,
+          env: Object.keys(r.env || {}).map(function (key) { return { key: key, value: r.env[key] }; }),
+          ports: ports.map(function (p) {
+            var host = p.hostname || (ports.length === 1 ? name : null);
+            return {
+              port: p.port,
+              hostname: host,
+              url: host && input.project ? "https://" + host + "." + input.project + ".localhost" : null
+            };
+          }),
+          dependsOn: r.dependsOn || [],
+          healthcheck: hc,
+          volume: null
+        });
+      } else {
+        var password = r.credentials && r.credentials.password;
+        var ref = password ? password.match(/\$\{secret:([a-z0-9-]+)\}/) : null;
+        normalized.push({
+          name: name,
+          kind: "database",
+          engine: r.engine,
+          version: r.version || "16",
+          username: r.credentials && r.credentials.username,
+          passwordRef: ref ? ref[1] : null,
+          volume: input.project ? input.project + "-" + name + "-" + ((r.volume && r.volume.name) || "data") : null,
+          volumeInferred: !r.volume
+        });
+      }
+    });
+
+    var generated = [];
+    if (input.project) {
+      generated.push("runtime distro agentify-" + input.project);
+      generated.push("opaque project id");
+      secrets.forEach(function (s) {
+        if (s.source.indexOf("generated") === 0) generated.push("value for secret " + s.name);
+      });
+      var routeCount = 0;
+      normalized.forEach(function (r) {
+        if (r.volume) generated.push("volume " + r.volume);
+        (r.ports || []).forEach(function (p) {
+          if (p.url) { generated.push("route " + p.url + " → :" + p.port); routeCount += 1; }
+        });
+      });
+      if (routeCount) generated.push(routeCount + " host port lease(s), assigned at start");
+    }
+
+    return {
+      ok: errors.length === 0,
+      errors: errors,
+      project: input.project || null,
+      version: input.version || null,
+      secrets: secrets,
+      resources: normalized,
+      generated: generated
+    };
+  }
+
+  return { normalize: normalize };
+})();
+</script>
+
+<script>
+/* THIN PAGE SHELL — throwaway. */
+(function () {
+  "use strict";
+
+  var SCENARIOS = [
+    {
+      id: "vertical",
+      title: "The vertical slice",
+      desc: "The exact Project the first slice must run: a Node app, Postgres, a generated password, a user-supplied token, and one route.",
+      manifest: {
+        version: 1,
+        project: "hello-pg",
+        secrets: {
+          "pg-password": { generate: "password" },
+          "api-token": { fromEnv: "HELLO_API_TOKEN" }
+        },
+        resources: {
+          web: {
+            kind: "app",
+            build: { context: ".", dockerfile: "Dockerfile" },
+            command: ["node", "server.js"],
+            env: {
+              DATABASE_URL: "postgres://hello:${secret:pg-password}@db:5432/hello",
+              API_TOKEN: "${secret:api-token}",
+              GREETING: "hello"
+            },
+            ports: [{ port: 3000, hostname: "web" }],
+            dependsOn: ["db"],
+            healthcheck: { port: 3000, path: "/health", interval: "5s" }
+          },
+          db: {
+            kind: "database",
+            engine: "postgres",
+            version: "16",
+            credentials: { username: "hello", password: "${secret:pg-password}" }
+          }
+        }
+      }
+    },
+    {
+      id: "minimal",
+      title: "Smallest legal manifest",
+      desc: "One app from a prebuilt image, no ports. Shows what the daemon infers when you say almost nothing.",
+      manifest: {
+        version: 1,
+        project: "tiny",
+        resources: { web: { kind: "app", image: "nginx:1.27-alpine" } }
+      }
+    },
+    {
+      id: "multi",
+      title: "Two ports, two hostnames",
+      desc: "A resource with more than one port. Every port must name its hostname; there is no sensible default.",
+      manifest: {
+        version: 1,
+        project: "multi",
+        resources: {
+          web: {
+            kind: "app",
+            image: "node:22-alpine",
+            ports: [{ port: 3000, hostname: "web" }, { port: 3001, hostname: "api" }]
+          }
+        }
+      }
+    },
+    {
+      id: "generated",
+      title: "Database with no volume declared",
+      desc: "The volume name is generated. Shows the line between what you write and what the daemon owns.",
+      manifest: {
+        version: 1,
+        project: "lazy",
+        secrets: { pg: { generate: "password" } },
+        resources: {
+          db: {
+            kind: "database",
+            engine: "postgres",
+            credentials: { username: "app", password: "${secret:pg}" }
+          }
+        }
+      }
+    },
+    {
+      id: "typo",
+      title: "Broken: typo in a top-level key",
+      desc: "Strict mode. A typo must fail loudly, not silently create an empty project.",
+      manifest: {
+        version: 1,
+        project: "oops",
+        resorces: { web: { kind: "app", image: "nginx" } }
+      }
+    },
+    {
+      id: "missing-secret",
+      title: "Broken: undefined secret",
+      desc: "Secret references are checked at parse time, before anything starts.",
+      manifest: {
+        version: 1,
+        project: "leaky",
+        resources: {
+          web: {
+            kind: "app",
+            image: "node:22-alpine",
+            env: { DATABASE_URL: "postgres://x:${secret:missing}@db:5432/x" }
+          }
+        }
+      }
+    },
+    {
+      id: "duplicate",
+      title: "Broken: two resources claim one hostname",
+      desc: "Routes are project-scoped and unique. The second claim fails.",
+      manifest: {
+        version: 1,
+        project: "clash",
+        resources: {
+          web: { kind: "app", image: "node:22-alpine", ports: [{ port: 3000, hostname: "app" }] },
+          api: { kind: "app", image: "node:22-alpine", ports: [{ port: 3000, hostname: "app" }] }
+        }
+      }
+    },
+    {
+      id: "ambiguous",
+      title: "Broken: two ports, no hostnames",
+      desc: "With more than one port there is no default hostname, so the manifest is rejected.",
+      manifest: {
+        version: 1,
+        project: "ambiguous",
+        resources: {
+          web: { kind: "app", image: "node:22-alpine", ports: [{ port: 3000 }, { port: 3001 }] }
+        }
+      }
+    }
+  ];
+
+  var current = SCENARIOS[0];
+  var bar = document.getElementById("scenarios");
+  var title = document.getElementById("case-title");
+  var desc = document.getElementById("case-desc");
+  var yaml = document.getElementById("yaml");
+  var result = document.getElementById("result");
+
+  function esc(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function resultHtml(r) {
+    var html = "";
+    html += '<div class="status ' + (r.ok ? "ok" : "bad") + '">' +
+      (r.ok ? "Valid manifest" : r.errors.length + " problem" + (r.errors.length === 1 ? "" : "s")) +
+      "</div>";
+
+    if (r.errors.length) {
+      html += '<ul class="errors">';
+      r.errors.forEach(function (e) {
+        html += "<li><code>" + esc(e.path) + "</code> " + esc(e.msg) + "</li>";
+      });
+      html += "</ul>";
+    }
+
+    if (r.project) {
+      html += '<p class="meta">Project <strong>' + esc(r.project) + "</strong> · manifest version " + esc(r.version) + "</p>";
+    }
+
+    if (r.secrets.length) {
+      html += "<h3>Secrets</h3><ul>";
+      r.secrets.forEach(function (s) {
+        html += "<li><code>" + esc(s.name) + "</code> — " + esc(s.source) + "</li>";
+      });
+      html += "</ul>";
+    }
+
+    if (r.resources.length) {
+      html += "<h3>Resources</h3>";
+      r.resources.forEach(function (res) {
+        html += '<article class="res"><h3>' + esc(res.name) + '<span class="kind">' + esc(res.kind) + "</span></h3>";
+        if (res.kind === "app") {
+          html += "<p>" + esc(res.source) + "</p>";
+          if (res.ports.length) {
+            html += "<p>Routes: " + res.ports.map(function (p) {
+              return p.url ? "<code>" + esc(p.url) + "</code> → :" + esc(p.port) : "no route";
+            }).join(", ") + "</p>";
+          } else {
+            html += '<p class="muted">No ports — not reachable from the browser.</p>';
+          }
+          if (res.dependsOn.length) {
+            html += "<p>Starts after: " + res.dependsOn.map(esc).join(", ") + "</p>";
+          }
+          if (res.env.length) {
+            var secretCount = res.env.filter(function (e) { return e.value.indexOf("${secret:") !== -1; }).length;
+            html += "<p>Env: " + res.env.map(function (e) { return esc(e.key); }).join(", ") +
+              ' <span class="muted">(' + secretCount + " secret reference" + (secretCount === 1 ? "" : "s") + ")</span></p>";
+          }
+          if (res.healthcheck) {
+            html += "<p>Health: " + (res.healthcheck.path ? "GET " + esc(res.healthcheck.path) : "TCP connect") +
+              " on :" + esc(res.healthcheck.port) +
+              (res.healthcheck.inferred ? ' <span class="muted">(inferred)</span>' : "") + "</p>";
+          }
+        } else {
+          html += "<p>" + esc(res.engine) + " " + esc(res.version) + " · user " + esc(res.username || "?") +
+            " · password from <code>" + esc(res.passwordRef || "none") + "</code></p>";
+          html += "<p>Data: <code>" + esc(res.volume) + "</code>" +
+            (res.volumeInferred ? ' <span class="muted">(name generated)</span>' : "") + "</p>";
+        }
+        html += "</article>";
+      });
+    }
+
+    if (r.generated.length) {
+      html += "<h3>Daemon supplies</h3><ul>";
+      r.generated.forEach(function (g) {
+        html += '<li class="muted">' + esc(g) + "</li>";
+      });
+      html += "</ul>";
+    }
+
+    return html;
+  }
+
+  function render() {
+    title.textContent = current.title;
+    desc.textContent = current.desc;
+    var source = document.querySelector('#yaml-sources pre[data-id="' + current.id + '"]');
+    yaml.textContent = source ? source.textContent.trim() : "";
+    result.innerHTML = resultHtml(ManifestModel.normalize(current.manifest));
+    Array.prototype.forEach.call(bar.children, function (button) {
+      button.classList.toggle("active", button.dataset.id === current.id);
+    });
+  }
+
+  SCENARIOS.forEach(function (scenario) {
+    var button = document.createElement("button");
+    button.className = "scenario";
+    button.dataset.id = scenario.id;
+    button.textContent = scenario.title;
+    button.addEventListener("click", function () {
+      current = scenario;
+      render();
+    });
+    bar.appendChild(button);
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>
