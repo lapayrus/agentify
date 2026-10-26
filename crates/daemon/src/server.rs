@@ -6,12 +6,17 @@
 //! Agent token published in the discovery file.
 
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentify_proto::{Actor, Capabilities, DaemonInfo, Discovery, Problem, Whoami, API_VERSION};
+use agentify_proto::{
+    Actor, Capabilities, CreateProjectRequest, DaemonInfo, Discovery, Problem, ProjectList, Whoami,
+    API_VERSION,
+};
 use anyhow::{Context, Result};
-use axum::extract::{Request, State};
+use axum::body::Bytes;
+use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -25,6 +30,7 @@ use crate::auth;
 use crate::clock;
 use crate::config::Config;
 use crate::discovery;
+use crate::projects::{self, CreateError};
 use crate::state::State as StateStore;
 
 /// Version of this daemon build.
@@ -39,6 +45,9 @@ pub struct Caller {
 
 struct AppState {
     state: StateStore,
+    /// The data root: the daemon owns every path under it, including each
+    /// Project's workspace.
+    data_root: PathBuf,
     instance_id: String,
     started_at: String,
     heartbeat: Duration,
@@ -197,6 +206,7 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
 
     let state = AppState {
         state,
+        data_root: config.data_root.clone(),
         instance_id: instance.id,
         started_at: clock::now_rfc3339(),
         heartbeat: config.heartbeat,
@@ -208,6 +218,8 @@ fn router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/v1/whoami", get(whoami))
         .route("/v1/events", get(events))
+        .route("/v1/projects", get(list_projects).post(create_project))
+        .route("/v1/projects/{project}", get(get_project))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_agent_token,
@@ -265,6 +277,77 @@ async fn events(State(app): State<Arc<AppState>>) -> Sse<impl futures_util::Stre
         Some((Ok::<Event, Infallible>(event), seq + 1))
     });
     Sse::new(stream)
+}
+
+/// `POST /v1/projects`: create a Project from exactly one of a bundled fixture
+/// or an inline Manifest. Nothing starts.
+async fn create_project(State(app): State<Arc<AppState>>, body: Bytes) -> Response {
+    let request: CreateProjectRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            return problem_at(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationFailed",
+                Some(format!(
+                    "the request body is not a create_project payload: {}",
+                    err
+                )),
+                Some(String::new()),
+            )
+        }
+    };
+
+    match projects::create(&app.state, &app.data_root, request) {
+        Ok(project) => (StatusCode::CREATED, Json(project)).into_response(),
+        Err(CreateError::Validation { path, detail }) => problem_at(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationFailed",
+            Some(detail),
+            Some(path),
+        ),
+        Err(CreateError::SourceMissing(detail)) => problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "SourceMissing",
+            Some(detail),
+        ),
+        Err(CreateError::AlreadyExists(detail)) => problem(
+            StatusCode::CONFLICT,
+            "AlreadyExists",
+            Some(detail),
+        ),
+        Err(CreateError::Store(err)) => {
+            problem(StatusCode::INTERNAL_SERVER_ERROR, "Internal", Some(format!("{err:#}")))
+        }
+    }
+}
+
+/// `GET /v1/projects`.
+async fn list_projects(State(app): State<Arc<AppState>>) -> Response {
+    match projects::list(&app.state) {
+        Ok(projects) => Json(ProjectList { projects }).into_response(),
+        Err(err) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            Some(format!("{err:#}")),
+        ),
+    }
+}
+
+/// `GET /v1/projects/{project}`: by name or id.
+async fn get_project(State(app): State<Arc<AppState>>, Path(reference): Path<String>) -> Response {
+    match projects::get(&app.state, &reference) {
+        Ok(Some(project)) => Json(project).into_response(),
+        Ok(None) => problem(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            Some(format!("no Project named or identified by {reference:?}")),
+        ),
+        Err(err) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            Some(format!("{err:#}")),
+        ),
+    }
 }
 
 async fn require_agent_token(
@@ -332,8 +415,18 @@ async fn not_found() -> Response {
 }
 
 fn problem(status: StatusCode, code: &str, detail: Option<String>) -> Response {
+    problem_at(status, code, detail, None)
+}
+
+fn problem_at(
+    status: StatusCode,
+    code: &str,
+    detail: Option<String>,
+    path: Option<String>,
+) -> Response {
     let title = status.canonical_reason().unwrap_or("Error").to_string();
-    let body = Problem::new(status.as_u16(), code, &title, detail);
+    let mut body = Problem::new(status.as_u16(), code, &title, detail);
+    body.path = path;
     let body = serde_json::to_vec(&body).unwrap_or_default();
     (
         status,

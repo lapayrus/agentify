@@ -9,10 +9,15 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 mod paths;
+mod project;
 
 pub mod client;
 
 pub use paths::{resolve_data_root, APP_DIR_NAME, HOME_ENV};
+pub use project::{
+    BuildView, Cost, CreateProjectRequest, EnvironmentView, HealthcheckView, PortView, Project,
+    ProjectList, ProjectSource, ResourceView, RouteView, DEV_ENVIRONMENT, STATE_STOPPED,
+};
 
 /// Version of the loopback HTTP API. Every path served by the daemon lives
 /// under `/v1`; a breaking change bumps this constant (ADR-0003).
@@ -144,6 +149,10 @@ pub struct Problem {
     pub code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Field the rejection is about, for `ValidationFailed`: a dotted path into
+    /// the Manifest (`resources.web.kind`) or the request body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 impl Problem {
@@ -154,7 +163,14 @@ impl Problem {
             status,
             code: code.to_string(),
             detail,
+            path: None,
         }
+    }
+
+    /// The same problem, pointing at the field that failed.
+    pub fn at(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
     }
 }
 

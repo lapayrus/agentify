@@ -28,18 +28,48 @@ pub enum ClientError {
 }
 
 impl ClientError {
-    /// Stable machine-readable code, mirroring the API's problem codes.
-    pub fn code(&self) -> &'static str {
+    /// Stable machine-readable code, mirroring the API's problem codes. When the
+    /// daemon sent a problem body, its `code` wins: an Agent branches on the
+    /// same code over HTTP and over MCP.
+    pub fn code(&self) -> String {
         match self {
-            ClientError::NoDaemon { .. } | ClientError::Unreachable { .. } => "BackendUnavailable",
-            ClientError::BadDiscovery { .. } | ClientError::BadBody { .. } => "Internal",
-            ClientError::Status { status, .. } => match status {
-                401 | 403 => "Unauthorized",
-                404 => "NotFound",
-                _ => "Internal",
-            },
+            ClientError::NoDaemon { .. } | ClientError::Unreachable { .. } => {
+                "BackendUnavailable".to_string()
+            }
+            ClientError::BadDiscovery { .. } | ClientError::BadBody { .. } => "Internal".to_string(),
+            ClientError::Status { status, body } => problem(body)
+                .and_then(|problem| {
+                    problem
+                        .get("code")
+                        .and_then(|code| code.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| {
+                    match status {
+                        401 | 403 => "Unauthorized",
+                        404 => "NotFound",
+                        409 => "AlreadyExists",
+                        422 => "ValidationFailed",
+                        _ => "Internal",
+                    }
+                    .to_string()
+                }),
         }
     }
+
+    /// The problem body the daemon returned, when there was one. Carries the
+    /// `path` of a validation failure through to the caller.
+    pub fn problem(&self) -> Option<Value> {
+        match self {
+            ClientError::Status { body, .. } => problem(body),
+            _ => None,
+        }
+    }
+}
+
+fn problem(body: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value.is_object().then_some(value)
 }
 
 impl std::fmt::Display for ClientError {
@@ -119,29 +149,85 @@ impl DaemonClient {
             .set("Authorization", &format!("Bearer {}", discovery.token))
             .timeout(REQUEST_TIMEOUT)
             .call();
+        parse(response, &url)
+    }
 
-        match response {
-            Ok(response) => {
-                let body = response.into_string().unwrap_or_default();
-                serde_json::from_str(&body).map_err(|err| ClientError::BadBody {
-                    detail: format!("{err}: {body}"),
-                })
-            }
-            Err(ureq::Error::Status(status, response)) => Err(ClientError::Status {
-                status,
-                body: response.into_string().unwrap_or_default(),
-            }),
-            Err(err) => Err(ClientError::Unreachable {
-                url,
-                detail: err.to_string(),
-            }),
-        }
+    /// `POST <path>` with a JSON body and parse the JSON response.
+    pub fn post_json(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
+        let discovery = self.discovery()?;
+        let url = format!("{}{}", discovery.url, path);
+        let response = ureq::post(&url)
+            .set("Authorization", &format!("Bearer {}", discovery.token))
+            .set("Content-Type", "application/json")
+            .timeout(REQUEST_TIMEOUT)
+            .send_string(&body.to_string());
+        parse(response, &url)
     }
 
     /// `GET /v1/whoami`.
     pub fn whoami(&self) -> Result<Value, ClientError> {
         self.get_json("/v1/whoami")
     }
+
+    /// `GET /v1/projects`.
+    pub fn list_projects(&self) -> Result<Value, ClientError> {
+        self.get_json("/v1/projects")
+    }
+
+    /// `GET /v1/projects/{project}`, by name or id.
+    pub fn get_project(&self, project: &str) -> Result<Value, ClientError> {
+        self.get_json(&format!("/v1/projects/{}", encode_segment(project)))
+    }
+
+    /// `POST /v1/projects` with exactly one source.
+    pub fn create_project(
+        &self,
+        fixture: Option<&str>,
+        manifest: Option<&str>,
+    ) -> Result<Value, ClientError> {
+        let mut body = serde_json::Map::new();
+        if let Some(fixture) = fixture {
+            body.insert("fixture".to_string(), Value::String(fixture.to_string()));
+        }
+        if let Some(manifest) = manifest {
+            body.insert("manifest".to_string(), Value::String(manifest.to_string()));
+        }
+        self.post_json("/v1/projects", &Value::Object(body))
+    }
+}
+
+fn parse(response: Result<ureq::Response, ureq::Error>, url: &str) -> Result<Value, ClientError> {
+    match response {
+        Ok(response) => {
+            let body = response.into_string().unwrap_or_default();
+            serde_json::from_str(&body).map_err(|err| ClientError::BadBody {
+                detail: format!("{err}: {body}"),
+            })
+        }
+        Err(ureq::Error::Status(status, response)) => Err(ClientError::Status {
+            status,
+            body: response.into_string().unwrap_or_default(),
+        }),
+        Err(err) => Err(ClientError::Unreachable {
+            url: url.to_string(),
+            detail: err.to_string(),
+        }),
+    }
+}
+
+/// Percent-encode the characters that cannot appear in a path segment. A
+/// Project name is lower-case kebab, so this is belt and braces.
+fn encode_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
