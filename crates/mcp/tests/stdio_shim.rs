@@ -344,3 +344,274 @@ fn unknown_methods_and_tools_are_json_rpc_errors() {
         .unwrap_or_default()
         .contains("delete_project"));
 }
+
+#[test]
+fn environment_tools_drive_the_whole_lifecycle_over_the_same_api() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+        .expect("boot daemon");
+    let mut shim = Shim::spawn(temp.path());
+
+    shim.send(initialize());
+    shim.read();
+
+    // The new tools are advertised with schemas an Agent can act on.
+    shim.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let listed = shim.read();
+    let tools = listed["result"]["tools"].as_array().expect("tools");
+    for name in [
+        "start_environment",
+        "stop_environment",
+        "get_status",
+        "run_command",
+        "read_logs",
+        "get_stats",
+        "wait_for_operation",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} tool in {listed}"));
+        assert_eq!(tool["inputSchema"]["type"], "object", "{name} needs a schema");
+        assert!(
+            tool["description"].as_str().unwrap_or_default().len() > 40,
+            "{name} needs a description an Agent can act on"
+        );
+    }
+    // Environment tools are addressed by Project; the idempotency waiter by
+    // operation.
+    for name in [
+        "start_environment",
+        "stop_environment",
+        "get_status",
+        "run_command",
+        "read_logs",
+        "get_stats",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .expect("the tool exists");
+        assert_eq!(
+            tool["inputSchema"]["properties"]["project"]["type"], "string",
+            "{name} takes a project: {tool}"
+        );
+    }
+    let wait = tools
+        .iter()
+        .find(|tool| tool["name"] == "wait_for_operation")
+        .expect("wait_for_operation");
+    assert_eq!(
+        wait["inputSchema"]["properties"]["operationId"]["type"], "string",
+        "wait_for_operation takes an operation id: {wait}"
+    );
+    assert_eq!(wait["inputSchema"]["required"], json!(["operationId"]));
+    let run_command = tools
+        .iter()
+        .find(|tool| tool["name"] == "run_command")
+        .expect("run_command");
+    assert_eq!(
+        run_command["inputSchema"]["properties"]["command"]["type"], "array",
+        "run_command takes an argv list: {run_command}"
+    );
+    assert_eq!(
+        run_command["inputSchema"]["required"],
+        json!(["project", "resource", "command"])
+    );
+
+    // A Project to drive.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "create_project", "arguments": { "fixture": "hello-pg" } }
+    }));
+    let created = shim.read();
+    assert_eq!(created["result"]["isError"], false, "{created}");
+
+    // Status before anything runs.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": { "name": "get_status", "arguments": { "project": "hello-pg" } }
+    }));
+    let before = shim.read();
+    assert_eq!(before["result"]["isError"], false, "{before}");
+    assert_eq!(
+        before["result"]["structuredContent"]["environment"]["state"],
+        "stopped"
+    );
+    assert_eq!(
+        before["result"]["structuredContent"]["backend"]["name"],
+        "fake"
+    );
+
+    // Start, and compare against the HTTP payload to prove the shim is a mapping.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": { "name": "start_environment", "arguments": { "project": "hello-pg" } }
+    }));
+    let started = shim.read();
+    assert_eq!(started["result"]["isError"], false, "{started}");
+    let status_payload = &started["result"]["structuredContent"];
+    assert_eq!(status_payload["environment"]["state"], "running", "{started}");
+    let operation_id = status_payload["operationId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("start returns an operation id: {started}"))
+        .to_string();
+
+    let http: Value = serde_json::from_str(
+        &ureq::get(&format!(
+            "{}/v1/projects/hello-pg/environments/dev/status",
+            daemon.base_url()
+        ))
+        .set("Authorization", &format!("Bearer {}", daemon.token()))
+        .call()
+        .expect("status over HTTP")
+        .into_string()
+        .expect("body"),
+    )
+    .expect("status JSON");
+    assert_eq!(
+        status_payload["environment"]["state"], http["environment"]["state"],
+        "MCP reports the same state as HTTP"
+    );
+
+    // The operation that start produced can be waited on.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": { "name": "wait_for_operation", "arguments": { "operationId": operation_id } }
+    }));
+    let waited = shim.read();
+    assert_eq!(waited["result"]["isError"], false, "{waited}");
+    assert_eq!(
+        waited["result"]["structuredContent"]["state"], "succeeded",
+        "{waited}"
+    );
+    assert_eq!(
+        waited["result"]["structuredContent"]["result"]["environment"]["state"], "running",
+        "the waiter receives the mutation's result: {waited}"
+    );
+
+    // run_command returns stdout, stderr, and the exit code.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "run_command",
+            "arguments": { "project": "hello-pg", "resource": "web", "command": ["echo", "from-mcp"] }
+        }
+    }));
+    let ran = shim.read();
+    assert_eq!(ran["result"]["isError"], false, "{ran}");
+    assert_eq!(ran["result"]["structuredContent"]["stdout"], "from-mcp\n");
+    assert_eq!(ran["result"]["structuredContent"]["exitCode"], 0);
+
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": {
+            "name": "run_command",
+            "arguments": { "project": "hello-pg", "resource": "web", "command": ["fail", "7"] }
+        }
+    }));
+    let failed = shim.read();
+    assert_eq!(
+        failed["result"]["structuredContent"]["exitCode"], 7,
+        "a non-zero exit is a result, not a tool error: {failed}"
+    );
+
+    // read_logs returns a bounded tail and a cursor.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": { "name": "read_logs", "arguments": { "project": "hello-pg", "tail": 5 } }
+    }));
+    let logs = shim.read();
+    assert_eq!(logs["result"]["isError"], false, "{logs}");
+    let lines = logs["result"]["structuredContent"]["lines"]
+        .as_array()
+        .expect("lines");
+    assert!(!lines.is_empty(), "{logs}");
+    assert!(lines.len() <= 5, "the tail is bounded: {logs}");
+    assert!(
+        logs["result"]["structuredContent"]["nextSince"].is_string(),
+        "a cursor comes back for the next read: {logs}"
+    );
+
+    // get_stats reports environment-level figures.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": { "name": "get_stats", "arguments": { "project": "hello-pg" } }
+    }));
+    let stats = shim.read();
+    assert_eq!(stats["result"]["isError"], false, "{stats}");
+    assert_eq!(stats["result"]["structuredContent"]["state"], "running");
+    assert!(
+        stats["result"]["structuredContent"]["memoryBytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+
+    // stop_environment is idempotent and reports the stopped state.
+    for (id, label) in [(11, "first"), (12, "second")] {
+        shim.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": "stop_environment", "arguments": { "project": "hello-pg" } }
+        }));
+        let stopped = shim.read();
+        assert_eq!(stopped["result"]["isError"], false, "{label}: {stopped}");
+        assert_eq!(
+            stopped["result"]["structuredContent"]["environment"]["state"], "stopped",
+            "{label}: {stopped}"
+        );
+    }
+
+    // A typed failure keeps its code across MCP.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "tools/call",
+        "params": {
+            "name": "run_command",
+            "arguments": { "project": "hello-pg", "resource": "web", "command": ["echo", "hi"] }
+        }
+    }));
+    let refused = shim.read();
+    assert_eq!(refused["error"]["data"]["code"], "NotProvisioned", "{refused}");
+
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 14,
+        "method": "tools/call",
+        "params": { "name": "get_status", "arguments": { "project": "nope" } }
+    }));
+    let missing = shim.read();
+    assert_eq!(missing["error"]["data"]["code"], "NotFound", "{missing}");
+
+    // A malformed argument is a validation failure, not a crash.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 15,
+        "method": "tools/call",
+        "params": { "name": "run_command", "arguments": { "project": "hello-pg" } }
+    }));
+    let invalid = shim.read();
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    assert_eq!(invalid["error"]["data"]["code"], "ValidationFailed");
+
+    daemon.shutdown().expect("stop daemon");
+}

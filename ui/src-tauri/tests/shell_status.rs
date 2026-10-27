@@ -78,3 +78,60 @@ fn a_missing_daemon_is_reported_as_unreachable_with_a_reason() {
         other => panic!("expected an unreachable shell, got {other:?}"),
     }
 }
+
+#[test]
+fn start_and_stop_from_the_shell_go_through_the_same_api() {
+    use agentify_shell::{
+        environment_action_for, environment_logs_for, environment_stats_for, environment_status_for,
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+        .expect("boot daemon");
+    ureq::post(&format!("{}/v1/projects", daemon.base_url()))
+        .set("Authorization", &format!("Bearer {}", daemon.token()))
+        .set("Content-Type", "application/json")
+        .send_string(&serde_json::json!({ "fixture": "hello-pg" }).to_string())
+        .expect("create the fixture Project");
+
+    let before = environment_status_for(temp.path(), "hello-pg").expect("status");
+    assert_eq!(before["environment"]["state"], "stopped");
+    assert_eq!(before["backend"]["name"], "fake");
+
+    let started = environment_action_for(temp.path(), "hello-pg", "start");
+    assert!(started.ok, "start failed: {started:?}");
+    assert_eq!(started.action, "start");
+    assert_eq!(
+        started.status.as_ref().expect("status")["environment"]["state"],
+        "running"
+    );
+
+    let stats = environment_stats_for(temp.path(), "hello-pg").expect("stats");
+    assert_eq!(stats["state"], "running");
+    assert!(stats["memoryBytes"].as_u64().unwrap_or(0) > 0, "{stats}");
+    assert_eq!(stats["memory"], "96 MB");
+
+    let logs = environment_logs_for(temp.path(), "hello-pg", Some(20), None).expect("logs");
+    let lines = logs["lines"].as_array().expect("lines");
+    assert!(!lines.is_empty(), "the Logs tab has something to show: {logs}");
+    assert!(logs["nextSince"].is_string(), "the cursor drives following: {logs}");
+
+    let stopped = environment_action_for(temp.path(), "hello-pg", "stop");
+    assert!(stopped.ok, "stop failed: {stopped:?}");
+    assert_eq!(
+        stopped.status.as_ref().expect("status")["environment"]["state"],
+        "stopped"
+    );
+
+    // An unknown action never reaches the daemon.
+    let unknown = environment_action_for(temp.path(), "hello-pg", "reset");
+    assert!(!unknown.ok);
+    assert_eq!(unknown.code.as_deref(), Some("ValidationFailed"));
+
+    // A typed daemon failure reaches the shell with its code.
+    let missing = environment_action_for(temp.path(), "nope", "start");
+    assert!(!missing.ok);
+    assert_eq!(missing.code.as_deref(), Some("NotFound"));
+
+    daemon.shutdown().expect("stop daemon");
+}

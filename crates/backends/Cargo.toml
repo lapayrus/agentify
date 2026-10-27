@@ -1,0 +1,23 @@
+[package]
+name = "agentify-backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Backend contract, its capabilities and typed errors, and the scripted fake"
+
+[lib]
+name = "agentify_backends"
+path = "src/lib.rs"
+
+[dependencies]
+agentify-proto = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

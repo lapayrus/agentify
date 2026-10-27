@@ -6,13 +6,18 @@
 
 pub mod acl;
 pub mod auth;
+pub mod backends;
 pub mod clock;
 pub mod config;
 pub mod discovery;
 pub mod fixtures;
+pub mod health;
+pub mod lifecycle;
+pub mod ports;
 pub mod projects;
 pub mod server;
 pub mod state;
 
 pub use config::Config;
+pub use lifecycle::Lifecycle;
 pub use server::{start_in_background, RunningDaemon, DAEMON_VERSION};

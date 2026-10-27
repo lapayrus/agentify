@@ -20,6 +20,16 @@ _Avoid_: workload, container; "service" only for the Resource kind
 The runtime substrate that hosts an Environment: a WSL distro, an Apple container microVM, or a Lima VM.
 _Avoid_: provider, destination, host, server
 
+**Port lease**:
+A host port on `127.0.0.1` the daemon reserves for one guest port of one Resource, and releases on stop. The
+daemon owns the registry; a Backend binds what it is leased and never invents a port.
+_Avoid_: port mapping, port forward, assigned port
+
+**Operation**:
+A mutation the daemon runs under an id, so a caller whose HTTP call timed out can wait for its outcome instead
+of retrying.
+_Avoid_: job, task, request
+
 **Manifest**:
 The `agentify.yaml` file that declares a Project's desired state.
 _Avoid_: config, spec, compose file

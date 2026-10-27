@@ -235,20 +235,25 @@ fn discard(project_dir: &Path) {
 
 /// Build the wire view from the stored rows and the normalized spec.
 fn view(record: &ProjectRecord) -> Result<Project> {
-    let spec: StoredSpec = serde_json::from_str(&record.spec_json).with_context(|| {
-        format!(
-            "reading the stored spec of Project {:?} ({})",
-            record.name, record.id
-        )
-    })?;
+    let spec = stored_spec(record)?;
 
     let source = ProjectSource::parse(&record.source_kind).unwrap_or(ProjectSource::Manifest);
+    let environment_state = if record.environment.observed_state.is_empty() {
+        STATE_STOPPED.to_string()
+    } else {
+        record.environment.observed_state.clone()
+    };
     let resources = record
         .resources
         .iter()
         .map(|resource| {
             let stored = spec.resources.get(&resource.name).cloned().unwrap_or_default();
-            stored.into_view(resource.id.clone(), resource.name.clone(), resource.kind.clone())
+            let mut view =
+                stored.into_view(resource.id.clone(), resource.name.clone(), resource.kind.clone());
+            // Resources share the Environment's observed state until per-Resource
+            // state is observed separately.
+            view.state = environment_state.clone();
+            view
         })
         .collect();
 
@@ -262,11 +267,90 @@ fn view(record: &ProjectRecord) -> Result<Project> {
         environment: EnvironmentView {
             id: record.environment.id.clone(),
             name: record.environment.name.clone(),
-            state: STATE_STOPPED.to_string(),
+            state: environment_state,
+            // Per-Environment cost belongs to the status bar, which reads
+            // `GET .../stats`; the rail keeps its placeholder.
             cost: Cost::default(),
         },
         resources,
         routes: spec.routes,
+    })
+}
+
+/// The guest ports this Project declares, as `(resource, guest port)` pairs the
+/// daemon leases host ports for.
+///
+/// An app declares its ports in the Manifest. A Postgres database does not: it
+/// listens on 5432, so that is what the daemon leases and probes.
+pub fn port_requests(record: &ProjectRecord) -> Result<Vec<(String, u16)>> {
+    let spec = stored_spec(record)?;
+    let mut requests = Vec::new();
+    for resource in record.resources.iter() {
+        let stored = spec.resources.get(&resource.name);
+        match stored {
+            Some(stored) if !stored.ports.is_empty() => {
+                for port in &stored.ports {
+                    requests.push((resource.name.clone(), port.port));
+                }
+            }
+            Some(stored) if stored.kind == "database" && stored.engine.as_deref() == Some("postgres") => {
+                requests.push((resource.name.clone(), 5432));
+            }
+            _ => {}
+        }
+    }
+    Ok(requests)
+}
+
+/// The spec a Backend is handed, before the daemon adds its port leases.
+pub fn environment_spec(record: &ProjectRecord) -> Result<agentify_backends::EnvironmentSpec> {
+    let spec = stored_spec(record)?;
+    let mut environment = agentify_backends::EnvironmentSpec::new(
+        record.environment.id.clone(),
+        record.name.clone(),
+    );
+    environment.workspace = PathBuf::from(&record.workspace_path);
+
+    for resource in record.resources.iter() {
+        let stored = spec.resources.get(&resource.name).cloned().unwrap_or_default();
+        let kind = if stored.kind.is_empty() {
+            resource.kind.clone()
+        } else {
+            stored.kind.clone()
+        };
+        environment.with_resource(agentify_backends::ResourceSpec {
+            name: resource.name.clone(),
+            kind,
+            image: stored.image.clone(),
+            build: stored.build.as_ref().map(|build| agentify_backends::spec::BuildSpec {
+                context: build.context.clone(),
+                dockerfile: build.dockerfile.clone(),
+            }),
+            command: stored.command.clone(),
+            env: stored.env.clone(),
+            ports: stored.ports.iter().map(|port| port.port).collect(),
+            depends_on: stored.depends_on.clone(),
+            healthcheck: stored.healthcheck.as_ref().map(|check| {
+                agentify_backends::HealthcheckSpec {
+                    port: check.port,
+                    path: check.path.clone(),
+                    interval: check.interval.clone(),
+                }
+            }),
+            engine: stored.engine.clone(),
+            version: stored.version.clone(),
+            volume: stored.volume.clone(),
+        });
+    }
+    Ok(environment)
+}
+
+fn stored_spec(record: &ProjectRecord) -> Result<StoredSpec> {
+    serde_json::from_str(&record.spec_json).with_context(|| {
+        format!(
+            "reading the stored spec of Project {:?} ({})",
+            record.name, record.id
+        )
     })
 }
 

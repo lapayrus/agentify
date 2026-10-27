@@ -151,15 +151,40 @@ function resourceDetail(resource) {
   return `${image}${command}`;
 }
 
-function resourceRow(resource) {
+const STATES = ["running", "stopped", "starting", "provisioning", "degraded", "failed", "absent"];
+const HEALTHS = ["healthy", "unhealthy", "unknown"];
+
+function safeState(state) {
+  return STATES.includes(state) ? state : "unknown";
+}
+
+function safeHealth(health) {
+  return HEALTHS.includes(health) ? health : "unknown";
+}
+
+function healthDot(health) {
+  return `dot dot-health-${safeHealth(health)}`;
+}
+
+/**
+ * The state a row shows for a Resource: the snapshot's own answer first, and
+ * the Environment's state when the daemon has not observed it separately.
+ */
+function resourceState(resource, fallback) {
+  return safeState(resource?.state ?? fallback);
+}
+
+function resourceRow(resource, environmentState) {
   const depends = Array.isArray(resource.dependsOn) && resource.dependsOn.length > 0
     ? resource.dependsOn.join(", ")
     : "—";
-  return `        <tr data-resource="${escapeHtml(resource.name)}" data-kind="${escapeHtml(resource.kind)}">
+  const health = resource.health ? `<span class="${healthDot(resource.health)}"></span>${escapeHtml(safeHealth(resource.health))}` : "—";
+  return `        <tr data-resource="${escapeHtml(resource.name)}" data-kind="${escapeHtml(resource.kind)}" data-health="${escapeHtml(resource.health ?? "unknown")}">
           <td class="resource-name">${escapeHtml(resource.name)}</td>
           <td>${escapeHtml(resource.kind)}</td>
           <td class="resource-detail">${escapeHtml(resourceDetail(resource))}</td>
-          <td>${escapeHtml(resource.state ?? "—")}</td>
+          <td>${escapeHtml(resourceState(resource, environmentState))}</td>
+          <td>${health}</td>
           <td>${escapeHtml(depends)}</td>
         </tr>`;
 }
@@ -187,10 +212,15 @@ ${items}
 }
 
 /** The detail pane: Environment badge, URLs, and the Resource table. */
-export function renderProjectDetail(project) {
+export function renderProjectDetail(project, view = {}) {
   const environment = project.environment ?? {};
-  const resources = Array.isArray(project.resources) ? project.resources : [];
-  const state = environment.state ?? "unknown";
+  const snapshot = view.status ?? null;
+  const resources = Array.isArray(snapshot?.resources)
+    ? snapshot.resources
+    : Array.isArray(project.resources)
+      ? project.resources
+      : [];
+  const state = safeState(snapshot?.environment?.state ?? environment.state ?? "unknown");
   const source =
     project.source === "fixture"
       ? `Created from the bundled <code>${escapeHtml(project.sourceName ?? "fixture")}</code> fixture.`
@@ -198,21 +228,27 @@ export function renderProjectDetail(project) {
   const rows = resources.length
     ? `      <table class="resources">
         <thead>
-          <tr><th>Resource</th><th>Kind</th><th>Detail</th><th>State</th><th>Depends on</th></tr>
+          <tr><th>Resource</th><th>Kind</th><th>Detail</th><th>State</th><th>Health</th><th>Depends on</th></tr>
         </thead>
         <tbody>
-${resources.map(resourceRow).join("\n")}
+${resources.map((resource) => resourceRow(resource, state)).join("\n")}
         </tbody>
       </table>`
     : `      <p class="empty-note">This Project declares no Resources.</p>`;
+  const tab = view.tab === "logs" ? "logs" : "overview";
 
-  return `<main class="main" data-project="${escapeHtml(project.name)}" data-state="connected">
+  return `<main class="main" data-project="${escapeHtml(project.name)}" data-state="connected" data-tab="${tab}">
   <header class="project-head">
     <h1>${escapeHtml(project.name)}</h1>
     <span class="env-badge" data-env="${escapeHtml(environment.name ?? "dev")}">${escapeHtml(environment.name ?? "dev")}</span>
-    <span class="state state-${escapeHtml(state)}"><span class="${stateDot(state)}"></span>${escapeHtml(state)}</span>
+    <span class="state state-${state}"><span class="${stateDot(state)}"></span>${escapeHtml(state)}</span>
   </header>
-  <p class="lede">${source} Its Environment and Resources exist; nothing is running yet — start comes later.</p>
+  <p class="lede">${source} Start brings its Resources up and leases host ports; Stop keeps the runtime and its data.</p>
+${renderStatusBar(project, snapshot, view.stats)}
+${renderActions(project, snapshot, view.pending)}
+${renderTabs(tab)}
+${view.error ? `<p class="reason" data-error="environment">${escapeHtml(view.error)}</p>` : ""}
+${tab === "logs" ? renderLogs(view.logs) : `<div data-tab-panel="overview">
 ${renderUrls(project)}
   <section class="resources-section" data-section="resources">
     <h2>Resources</h2>
@@ -222,9 +258,97 @@ ${rows}
     <div><dt>environment</dt><dd>${escapeHtml(environment.id ?? "—")}</dd></div>
     <div><dt>project</dt><dd>${escapeHtml(project.id ?? "—")}</dd></div>
     <div><dt>workspace</dt><dd>${escapeHtml(project.workspace ?? "—")}</dd></div>
-    <div><dt>cost</dt><dd>${escapeHtml(costLabel(environment.cost))}</dd></div>
+    <div><dt>backend</dt><dd>${escapeHtml(snapshot?.backend?.name ?? "unknown")}</dd></div>
   </dl>
+</div>`}
 </main>`;
+}
+
+/**
+ * The status bar: state, health, how many Resources, and cost. Every figure is
+ * the daemon's; the shell formats nothing it was not told.
+ */
+export function renderStatusBar(project, snapshot, stats) {
+  const environment = project?.environment ?? {};
+  const state = safeState(snapshot?.environment?.state ?? environment.state ?? "unknown");
+  const health = safeHealth(snapshot?.health ?? "unknown");
+  const resources = Array.isArray(snapshot?.resources)
+    ? snapshot.resources
+    : Array.isArray(project?.resources)
+      ? project.resources
+      : [];
+  const healthy = resources.filter((resource) => resource.health === "healthy").length;
+  const cost = stats ?? environment.cost ?? {};
+  const figures = costLabel({ cpu: cost.cpu, memory: cost.memory, disk: cost.disk });
+
+  return `  <div class="statusbar" data-status="${state}" data-health="${health}">
+    <span class="status-state"><span class="${stateDot(state)}"></span>${escapeHtml(state)}</span>
+    <span class="status-health" data-health="${health}"><span class="${healthDot(health)}"></span>${escapeHtml(health)}</span>
+    <span class="status-resources">${escapeHtml(`${resources.length} resource${resources.length === 1 ? "" : "s"}`)}${resources.length > 0 ? ` · ${healthy} healthy` : ""}</span>
+    <span class="status-cost cost">${escapeHtml(figures)}</span>
+  </div>`;
+}
+
+/** Start and Stop. The shell asks the daemon; it never decides the state. */
+export function renderActions(project, snapshot, pending) {
+  const state = safeState(snapshot?.environment?.state ?? project?.environment?.state ?? "unknown");
+  const busy = pending === "start" || pending === "stop";
+  const startDisabled = busy || state === "running" || state === "starting";
+  const stopDisabled = busy || state === "stopped" || state === "absent";
+  return `  <div class="actions">
+    <button type="button" class="action" data-action="start"${startDisabled ? " disabled" : ""}>${pending === "start" ? "Starting…" : "Start"}</button>
+    <button type="button" class="action" data-action="stop"${stopDisabled ? " disabled" : ""}>${pending === "stop" ? "Stopping…" : "Stop"}</button>
+  </div>`;
+}
+
+/** The Overview / Logs tabs. */
+export function renderTabs(tab) {
+  const current = tab === "logs" ? "logs" : "overview";
+  return `  <nav class="tabs" role="tablist">
+    <button type="button" class="tab" role="tab" data-tab="overview" aria-selected="${current === "overview"}">Overview</button>
+    <button type="button" class="tab" role="tab" data-tab="logs" aria-selected="${current === "logs"}">Logs</button>
+  </nav>`;
+}
+
+/** One log line, escaped, tagged with the Resource and stream it came from. */
+function logRow(line) {
+  const stream = line?.stream === "stderr" ? "stderr" : "stdout";
+  return `    <li class="log-line" data-seq="${escapeHtml(line?.seq ?? "")}" data-resource="${escapeHtml(line?.resource ?? "")}" data-stream="${stream}">
+      <span class="log-at">${escapeHtml(line?.at ?? "")}</span>
+      <span class="log-resource">${escapeHtml(line?.resource ?? "")}</span>
+      <span class="log-text">${escapeHtml(line?.line ?? "")}</span>
+    </li>`;
+}
+
+/**
+ * The Logs tab. `logs` is what the shell has collected: `lines`, a `following`
+ * flag, and an optional `error`. Following appends, so the list only grows.
+ */
+export function renderLogs(logs) {
+  const lines = Array.isArray(logs?.lines) ? logs.lines : [];
+  const following = logs?.following === true;
+  const head = `  <div class="logs-head">
+    <span>${escapeHtml(`${lines.length} line${lines.length === 1 ? "" : "s"}`)}</span>
+    <span class="live${following ? " live-on" : ""}" data-following="${following}">${following ? "following" : "paused"}</span>
+  </div>`;
+  if (logs?.error) {
+    return `<section class="logs" data-tab-panel="logs">
+${head}
+  <p class="reason">${escapeHtml(logs.error)}</p>
+</section>`;
+  }
+  if (lines.length === 0) {
+    return `<section class="logs" data-tab-panel="logs">
+${head}
+  <p class="empty-note">No log lines yet. Start the Environment, or run a command in a Resource.</p>
+</section>`;
+  }
+  return `<section class="logs" data-tab-panel="logs">
+${head}
+  <ol class="log-lines">
+${lines.map(logRow).join("\n")}
+  </ol>
+</section>`;
 }
 
 function renderEmptyProjects(whoami) {
@@ -287,7 +411,9 @@ export function renderMain(status) {
       return renderEmptyProjects(status.whoami);
     }
     const project = selectedProject(status);
-    return project ? renderProjectDetail(project) : renderSelectProject();
+    return project
+      ? renderProjectDetail(project, status.view ?? {})
+      : renderSelectProject();
   }
   if (status.state === "unreachable") {
     return renderUnreachable(status.reason);

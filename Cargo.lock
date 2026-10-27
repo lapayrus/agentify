@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "agentify-backends"
+version = "0.1.0"
+dependencies = [
+ "agentify-proto",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "agentify-cli"
 version = "0.1.0"
 dependencies = [
@@ -17,6 +29,7 @@ dependencies = [
 name = "agentify-daemon"
 version = "0.1.0"
 dependencies = [
+ "agentify-backends",
  "agentify-manifest",
  "agentify-proto",
  "anyhow",
