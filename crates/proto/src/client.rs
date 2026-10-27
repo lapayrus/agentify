@@ -195,6 +195,22 @@ impl DaemonClient {
         self.post_json("/v1/projects", &Value::Object(body))
     }
 
+    /// `DELETE /v1/projects/{project}`. Answers `202` with an `approvalId` and
+    /// an `operationId`: nothing is removed until a human approves.
+    pub fn delete_project(&self, project: &str) -> Result<Value, ClientError> {
+        let discovery = self.discovery()?;
+        let url = format!(
+            "{}/v1/projects/{}",
+            discovery.url,
+            encode_segment(project)
+        );
+        let response = ureq::request("DELETE", &url)
+            .set("Authorization", &format!("Bearer {}", discovery.token))
+            .timeout(REQUEST_TIMEOUT)
+            .call();
+        parse(response, &url)
+    }
+
     fn environment_path(project: &str, environment: &str) -> String {
         format!(
             "/v1/projects/{}/environments/{}",
@@ -222,6 +238,52 @@ impl DaemonClient {
     ) -> Result<Value, ClientError> {
         let path = format!("{}/stop", Self::environment_path(project, environment));
         self.post_json(&path, &Value::Object(serde_json::Map::new()))
+    }
+
+    /// `POST .../environments/{env}/reset`. Answers `202` with an `approvalId`
+    /// and an `operationId`: the data is cleared only after a human approves.
+    pub fn reset_environment(
+        &self,
+        project: &str,
+        environment: &str,
+    ) -> Result<Value, ClientError> {
+        let path = format!("{}/reset", Self::environment_path(project, environment));
+        self.post_json(&path, &Value::Object(serde_json::Map::new()))
+    }
+
+    /// `GET /v1/approvals?state=...`.
+    pub fn approvals(&self, state: Option<&str>) -> Result<Value, ClientError> {
+        match state {
+            Some(state) if !state.trim().is_empty() => {
+                self.get_json(&format!("/v1/approvals?state={}", encode_segment(state)))
+            }
+            _ => self.get_json("/v1/approvals"),
+        }
+    }
+
+    /// `POST /v1/approvals/{id}/approve`. The daemon prompts through the OS; a
+    /// caller cannot pass the gesture on its own.
+    pub fn approve(&self, approval_id: &str, body: &Value) -> Result<Value, ClientError> {
+        self.post_json(
+            &format!("/v1/approvals/{}/approve", encode_segment(approval_id)),
+            body,
+        )
+    }
+
+    /// `POST /v1/approvals/{id}/deny`. The target is left unchanged.
+    pub fn deny(&self, approval_id: &str, body: &Value) -> Result<Value, ClientError> {
+        self.post_json(
+            &format!("/v1/approvals/{}/deny", encode_segment(approval_id)),
+            body,
+        )
+    }
+
+    /// `GET /v1/activity`: the audit chain, newest first, with its verdict.
+    pub fn activity(&self, limit: Option<usize>) -> Result<Value, ClientError> {
+        match limit {
+            Some(limit) => self.get_json(&format!("/v1/activity?limit={limit}")),
+            None => self.get_json("/v1/activity"),
+        }
     }
 
     /// `GET .../environments/{env}/status`.

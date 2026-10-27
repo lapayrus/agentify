@@ -351,6 +351,201 @@ ${lines.map(logRow).join("\n")}
 </section>`;
 }
 
+// ---- Approvals and the activity feed --------------------------------------
+//
+// The right column. An Approval is what a destructive Agent call turned into:
+// the shell shows what a human is being asked to authorise and lets them say
+// yes or no. The feed below it is the daemon's audit chain, Agent and human
+// actions alike. Nothing here decides anything: the daemon does.
+
+const APPROVAL_STATES = ["pending", "approved", "denied", "expired"];
+
+function safeApprovalState(state) {
+  return APPROVAL_STATES.includes(state) ? state : "unknown";
+}
+
+function actorKind(actor) {
+  return actor?.kind === "human" ? "human" : actor?.kind === "agent" ? "agent" : "unknown";
+}
+
+/** `agent · token-1` or `human · raosu`: who acted, never just "someone". */
+export function actorLabel(actor) {
+  return `${actorKind(actor)} · ${actor?.id ?? "unknown"}`;
+}
+
+/** `project=hello-pg, projectId=proj-1`: the parameters the Approval covers. */
+export function parameterSummary(parameters) {
+  const list = Array.isArray(parameters) ? parameters : [];
+  if (list.length === 0) {
+    return "no parameters";
+  }
+  return list
+    .map((parameter) => `${parameter?.name ?? "?"}=${parameter?.value ?? ""}`)
+    .join(", ");
+}
+
+function renderApprovalParameters(approval) {
+  const list = Array.isArray(approval?.parameters) ? approval.parameters : [];
+  if (list.length === 0) {
+    return `      <p class="approval-params empty-note">No parameters were recorded.</p>`;
+  }
+  const rows = list
+    .map(
+      (parameter) =>
+        `        <div><dt>${escapeHtml(parameter?.name ?? "?")}</dt><dd>${escapeHtml(parameter?.value ?? "")}</dd></div>`,
+    )
+    .join("\n");
+  return `      <dl class="approval-params" data-summary="${escapeHtml(parameterSummary(list))}">
+${rows}
+      </dl>`;
+}
+
+/** What a decided Approval became, and who decided it. */
+function decisionLabel(approval) {
+  const state = safeApprovalState(approval?.state);
+  if (state === "expired") {
+    return "expired; nobody decided before the deadline";
+  }
+  if (state !== "approved" && state !== "denied") {
+    return `${state}; the daemon reported no decision`;
+  }
+  const who = approval?.decidedBy ? ` by ${actorLabel(approval.decidedBy)}` : "";
+  const when = approval?.decidedAt ? ` at ${approval.decidedAt}` : "";
+  return `${state}${who}${when}`;
+}
+
+/**
+ * One Approval: the operation, what it would change, who asked, the parameters
+ * it is bound to, and when it dies. A pending Approval offers Approve and Deny;
+ * `pending` names the decision already in flight, so both buttons say so and
+ * cannot be pressed twice.
+ */
+export function renderApprovalCard(approval, pending = null) {
+  const state = safeApprovalState(approval?.state);
+  const id = approval?.id ?? "";
+  const kind = actorKind(approval?.requester);
+  const inFlight = pending === "approve" || pending === "deny" ? pending : null;
+  const footer =
+    state === "pending"
+      ? `      <div class="approval-actions">
+        <button type="button" class="decision decision-approve" data-decision="approve" data-approval="${escapeHtml(id)}"${inFlight ? " disabled" : ""}>${inFlight === "approve" ? "Approving…" : "Approve"}</button>
+        <button type="button" class="decision decision-deny" data-decision="deny" data-approval="${escapeHtml(id)}"${inFlight ? " disabled" : ""}>${inFlight === "deny" ? "Denying…" : "Deny"}</button>
+      </div>
+      <p class="approval-note">Approve asks the OS for your gesture (Windows Hello); an Agent cannot produce it.</p>`
+      : `      <p class="approval-decision" data-decided="${state}">${escapeHtml(decisionLabel(approval))}</p>`;
+
+  return `    <article class="approval" data-approval="${escapeHtml(id)}" data-operation="${escapeHtml(approval?.operation ?? "unknown")}" data-state="${state}">
+      <header class="approval-head">
+        <span class="approval-operation">${escapeHtml(approval?.operation ?? "unknown")}</span>
+        <span class="approval-state" data-state="${state}">${escapeHtml(state)}</span>
+      </header>
+      <p class="approval-target"><span class="tag">target</span> <code>${escapeHtml(approval?.target ?? "—")}</code></p>
+      <p class="approval-requester"><span class="dot dot-actor-${kind}"></span>${escapeHtml(actorLabel(approval?.requester))}</p>
+${renderApprovalParameters(approval)}
+      <p class="approval-expiry">expires <time datetime="${escapeHtml(approval?.expiresAt ?? "")}">${escapeHtml(approval?.expiresAt ?? "unknown")}</time></p>
+${footer}
+    </article>`;
+}
+
+/**
+ * The Approval card or cards. Pending ones come first — they are the work —
+ * and a decided one stays visible so the outcome is not a silent disappearance.
+ * An empty inbox says so instead of rendering nothing.
+ */
+export function renderApprovals(approvals, decision = null, error = null) {
+  const list = Array.isArray(approvals) ? approvals : [];
+  const pending = list.filter((approval) => safeApprovalState(approval?.state) === "pending");
+  const ordered = [...pending, ...list.filter((approval) => safeApprovalState(approval?.state) !== "pending")];
+  const head = `  <div class="side-head"><span>Approvals</span><span class="badge">${pending.length}</span></div>`;
+  const failure = error
+    ? `\n  <p class="reason" data-error="approvals">${escapeHtml(error)}</p>`
+    : "";
+
+  if (ordered.length === 0) {
+    return `<section class="approvals" data-section="approvals" data-count="0">
+${head}${failure}
+  <p class="side-empty" data-empty="approvals">No Approvals pending</p>
+  <p class="side-hint">A destructive Agent call — <code>delete_project</code> or <code>reset_environment</code> — lands here and changes nothing until you decide.</p>
+</section>`;
+  }
+
+  const cards = ordered
+    .map((approval) =>
+      renderApprovalCard(
+        approval,
+        decision !== null && decision?.id === approval?.id ? decision.action : null,
+      ),
+    )
+    .join("\n");
+  return `<section class="approvals" data-section="approvals" data-count="${pending.length}">
+${head}${failure}
+${cards}
+</section>`;
+}
+
+/** One row of the feed: when, who, what, and how it ended. */
+function activityRow(entry) {
+  const kind = actorKind(entry?.actor);
+  const result = entry?.result ?? "unknown";
+  const target = entry?.target ? ` <code>${escapeHtml(entry.target)}</code>` : "";
+  const code = entry?.errorCode
+    ? ` <span class="activity-code">${escapeHtml(entry.errorCode)}</span>`
+    : "";
+  return `    <li class="activity-entry" data-seq="${escapeHtml(entry?.seq ?? "")}" data-actor="${kind}" data-operation="${escapeHtml(entry?.operation ?? "unknown")}" data-result="${escapeHtml(result)}">
+      <span class="activity-at">${escapeHtml(entry?.at ?? "")}</span>
+      <span class="activity-actor"><span class="dot dot-actor-${kind}"></span>${escapeHtml(actorLabel(entry?.actor))}</span>
+      <span class="activity-what">${escapeHtml(entry?.operation ?? "unknown")}${target}</span>
+      <span class="activity-result" data-result="${escapeHtml(result)}">${escapeHtml(result)}</span>${code}
+    </li>`;
+}
+
+/**
+ * The activity feed: the daemon's audit chain, newest first, Agent and human
+ * actions in one list. The footer carries the chain's verdict, because a feed
+ * nobody can verify is only a log.
+ */
+export function renderActivity(page, error = null) {
+  const entries = Array.isArray(page?.entries) ? page.entries : [];
+  const integrity = page?.integrity ?? {};
+  const verified = integrity.verified === true;
+  const head = `  <div class="side-head"><span>Activity</span><span class="badge">${entries.length}</span></div>`;
+  const failure = error ? `\n  <p class="reason" data-error="activity">${escapeHtml(error)}</p>` : "";
+
+  if (entries.length === 0) {
+    return `<section class="activity" data-section="activity" data-entries="0">
+${head}${failure}
+  <p class="side-empty" data-empty="activity">Nothing has happened yet</p>
+</section>`;
+  }
+
+  const chain = `  <p class="chain" data-verified="${verified}">${verified ? "chain verified" : "chain does not verify"} · ${escapeHtml(`${integrity.entries ?? entries.length} entr${(integrity.entries ?? entries.length) === 1 ? "y" : "ies"}`)}</p>`;
+  return `<section class="activity" data-section="activity" data-entries="${entries.length}" data-verified="${verified}">
+${head}${failure}
+  <ol class="activity-feed">
+${entries.map(activityRow).join("\n")}
+  </ol>
+${chain}
+</section>`;
+}
+
+/**
+ * The right column: the Approval card above the activity feed. While the daemon
+ * is unreachable there is nothing to decide and nothing to report, and the
+ * column says that rather than claiming an empty inbox.
+ */
+export function renderSide(status) {
+  const inbox = status?.inbox ?? {};
+  if (status?.state !== "connected") {
+    return `<aside class="side" data-rail="inbox" aria-label="Approvals and activity">
+  <p class="side-empty" data-empty="inbox">Approvals and activity appear once the daemon answers.</p>
+</aside>`;
+  }
+  return `<aside class="side" data-rail="inbox" aria-label="Approvals and activity">
+${renderApprovals(inbox.approvals, inbox.decision, inbox.approvalsError)}
+${renderActivity(inbox.activity, inbox.activityError)}
+</aside>`;
+}
+
 function renderEmptyProjects(whoami) {
   const scopes = (whoami?.scopes ?? []).join(", ") || "none";
   const capabilities = Object.entries(whoami?.capabilities ?? {})
@@ -421,13 +616,15 @@ export function renderMain(status) {
   return renderLoading();
 }
 
-// The three-zone shell: header, Project rail, main pane.
+// The three-zone shell: header, Project rail, main pane, and the right column
+// holding the Approval card over the activity feed.
 export function render(status) {
   return `<div class="shell" data-connection="${escapeHtml(status.state)}">
 ${renderHeader(status)}
 <div class="body">
 ${renderRail(status)}
 ${renderMain(status)}
+${renderSide(status)}
 </div>
 </div>`;
 }

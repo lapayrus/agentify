@@ -8,12 +8,19 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+mod approval;
 mod environment;
 mod paths;
 mod project;
 
 pub mod client;
 
+pub use approval::{
+    ActorIdentity, ActivityEntry, ActivityPage, ApprovalAccepted, ApprovalDecision,
+    ApprovalDecisionRequest, ApprovalList, ApprovalView, ChainIntegrity, ParameterView,
+    APPROVAL_APPROVED, APPROVAL_DENIED, APPROVAL_EXPIRED, APPROVAL_PENDING,
+    OPERATION_WAITING_FOR_APPROVAL,
+};
 pub use environment::{
     BackendRef, ExecRequest, ExecResponse, EnvironmentStatus, LeasedPortView, LogLineView,
     LogsResponse, OperationView, ResourceStatsView, ResourceStatusView, StatsResponse,
@@ -166,13 +173,21 @@ pub struct Problem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// The operation a caller can wait on. Present on a `504` from a mutation
-    /// that outlived the request timeout.
+    /// that outlived the request timeout, and on an approval problem.
     #[serde(
         default,
         rename = "operationId",
         skip_serializing_if = "Option::is_none"
     )]
     pub operation_id: Option<String>,
+    /// The Approval a problem is about. Present on `ApprovalRequired`,
+    /// `ApprovalExpired`, `ApprovalConsumed`, and `ApprovalMismatch`.
+    #[serde(
+        default,
+        rename = "approvalId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub approval_id: Option<String>,
 }
 
 impl Problem {
@@ -185,6 +200,7 @@ impl Problem {
             detail,
             path: None,
             operation_id: None,
+            approval_id: None,
         }
     }
 
@@ -197,6 +213,12 @@ impl Problem {
     /// The same problem, carrying the operation to wait on.
     pub fn for_operation(mut self, operation_id: impl Into<String>) -> Self {
         self.operation_id = Some(operation_id.into());
+        self
+    }
+
+    /// The same problem, carrying the Approval it is about.
+    pub fn for_approval(mut self, approval_id: impl Into<String>) -> Self {
+        self.approval_id = Some(approval_id.into());
         self
     }
 }

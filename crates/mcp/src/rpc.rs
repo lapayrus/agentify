@@ -20,7 +20,9 @@ see what exists, `create_project` to create one from a bundled fixture or an inl
 Environment up (idempotent: retrying is safe), `run_command` runs a bounded command in a Resource, \
 `read_logs` and `get_stats` observe it, and `stop_environment` stops it while keeping its data. If a \
 mutation takes too long the error carries an operation id: finish it with `wait_for_operation` instead \
-of retrying blindly. `whoami` reports scopes, versions, the active Backend, and its capabilities.";
+of retrying blindly. `delete_project` and `reset_environment` are destructive: they answer 202 with an \
+`approvalId` and an `operationId` and change nothing until a human approves, so watch `wait_for_operation` \
+rather than retrying. `whoami` reports scopes, versions, the active Backend, and its capabilities.";
 
 /// Handle one line of input. Returns the response to write, or `None` for
 /// notifications (which must not be answered).
@@ -146,6 +148,23 @@ Environment and Resources, and copies the fixture source into a workspace it own
             }
         },
         {
+            "name": "delete_project",
+            "title": "Delete a Project",
+            "description": "Delete a Project: its runtime, volumes, host-port leases, workspace, and rows, with \
+teardown verified before the call reports success. Destructive, so it does not run on the call: it answers 202 \
+with an `approvalId` and an `operationId`, changes nothing, and waits for a human to approve. Wait on the \
+`operationId` with `wait_for_operation` instead of retrying. Returns exactly the payload of \
+DELETE /v1/projects/{project}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Project name or id." }
+                },
+                "required": ["project"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "start_environment",
             "title": "Start an Environment",
             "description": "Bring a Project's dev Environment up and return its status once every Resource \
@@ -172,6 +191,25 @@ the call exceeds the daemon's timeout it answers 504 with an `operationId`; fini
             "description": "Stop a Project's dev Environment: its Resources stop, its host-port leases are \
 released, and its runtime and data are kept, so starting again is fast. Idempotent. Returns exactly the \
 payload of POST /v1/projects/{project}/environments/{environment}/stop.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Project name or id." },
+                    "environment": { "type": "string", "description": "Environment name; defaults to `dev`." }
+                },
+                "required": ["project"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "reset_environment",
+            "title": "Reset an Environment",
+            "description": "Clear a Project's dev Environment: its data is dropped, its runtime is rebuilt, and \
+it comes back up so entrypoint migrations re-run. The Project, its Manifest, and its host-port leases survive. \
+Destructive, so it does not run on the call: it answers 202 with an `approvalId` and an `operationId`, changes \
+nothing, and waits for a human to approve. Wait on the `operationId` with `wait_for_operation` instead of \
+retrying. Returns exactly the payload of POST \
+/v1/projects/{project}/environments/{environment}/reset.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -315,12 +353,20 @@ fn call_tool(id: Value, params: Value, client: &DaemonClient) -> Value {
             Ok((fixture, manifest)) => client.create_project(fixture.as_deref(), manifest.as_deref()),
             Err(message) => return invalid_arguments(id, &message),
         },
+        "delete_project" => match required_string(&arguments, "project") {
+            Ok(project) => client.delete_project(&project),
+            Err(message) => return invalid_arguments(id, &message),
+        },
         "start_environment" => match environment_arguments(&arguments) {
             Ok((project, environment)) => client.start_environment(&project, &environment),
             Err(message) => return invalid_arguments(id, &message),
         },
         "stop_environment" => match environment_arguments(&arguments) {
             Ok((project, environment)) => client.stop_environment(&project, &environment),
+            Err(message) => return invalid_arguments(id, &message),
+        },
+        "reset_environment" => match environment_arguments(&arguments) {
+            Ok((project, environment)) => client.reset_environment(&project, &environment),
             Err(message) => return invalid_arguments(id, &message),
         },
         "get_status" => match environment_arguments(&arguments) {

@@ -335,14 +335,14 @@ fn unknown_methods_and_tools_are_json_rpc_errors() {
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/call",
-        "params": { "name": "delete_project", "arguments": {} }
+        "params": { "name": "create_checkpoint", "arguments": {} }
     }));
     let unknown_tool = shim.read();
     assert_eq!(unknown_tool["error"]["code"], -32602);
     assert!(unknown_tool["error"]["message"]
         .as_str()
         .unwrap_or_default()
-        .contains("delete_project"));
+        .contains("create_checkpoint"));
 }
 
 #[test]
@@ -612,6 +612,254 @@ fn environment_tools_drive_the_whole_lifecycle_over_the_same_api() {
     let invalid = shim.read();
     assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
     assert_eq!(invalid["error"]["data"]["code"], "ValidationFailed");
+
+    daemon.shutdown().expect("stop daemon");
+}
+
+/// The tools that need a human: they answer 202 with ids and change nothing.
+#[test]
+fn destructive_tools_answer_202_and_wait_for_an_approval() {
+    use agentify_daemon::consent::ConsentMode;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut daemon = agentify_daemon::start_in_background(
+        agentify_daemon::Config::new(temp.path()).with_consent(ConsentMode::Granted),
+    )
+    .expect("boot daemon");
+    let mut shim = Shim::spawn(temp.path());
+
+    shim.send(initialize());
+    shim.read();
+
+    // Both tools are advertised, with schemas an Agent can act on.
+    shim.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let listed = shim.read();
+    let tools = listed["result"]["tools"].as_array().expect("tools");
+    for name in ["delete_project", "reset_environment"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} tool in {listed}"));
+        assert_eq!(tool["inputSchema"]["type"], "object", "{name} needs a schema");
+        assert_eq!(
+            tool["inputSchema"]["properties"]["project"]["type"], "string",
+            "{name} takes a project: {tool}"
+        );
+        assert_eq!(tool["inputSchema"]["required"], json!(["project"]));
+        assert!(
+            tool["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("202"),
+            "{name} says it asks a human first: {tool}"
+        );
+    }
+    let reset = tools
+        .iter()
+        .find(|tool| tool["name"] == "reset_environment")
+        .expect("reset_environment");
+    assert_eq!(
+        reset["inputSchema"]["properties"]["environment"]["type"], "string",
+        "reset_environment takes an Environment: {reset}"
+    );
+
+    // A Project to destroy.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "create_project", "arguments": { "fixture": "hello-pg" } }
+    }));
+    let created = shim.read();
+    assert_eq!(created["result"]["isError"], false, "{created}");
+
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": { "name": "start_environment", "arguments": { "project": "hello-pg" } }
+    }));
+    let started = shim.read();
+    assert_eq!(started["result"]["isError"], false, "{started}");
+
+    // reset_environment asks first: ids come back, nothing is reset.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": { "name": "reset_environment", "arguments": { "project": "hello-pg" } }
+    }));
+    let reset_accepted = shim.read();
+    assert_eq!(reset_accepted["result"]["isError"], false, "{reset_accepted}");
+    let reset_payload = &reset_accepted["result"]["structuredContent"];
+    assert_eq!(reset_payload["operation"], "reset_environment", "{reset_accepted}");
+    assert_eq!(reset_payload["target"], "hello-pg/dev", "{reset_accepted}");
+    assert!(
+        reset_payload["approvalId"].as_str().unwrap_or_default().len() > 8,
+        "reset names its Approval: {reset_accepted}"
+    );
+    let reset_operation = reset_payload["operationId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("reset names its operation: {reset_accepted}"))
+        .to_string();
+
+    // Its operation is waiting for a human, not running and not finished.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "tools/call",
+        "params": {
+            "name": "wait_for_operation",
+            "arguments": { "operationId": reset_operation, "timeoutMs": 200 }
+        }
+    }));
+    let reset_waiting = shim.read();
+    assert_eq!(reset_waiting["result"]["isError"], false, "{reset_waiting}");
+    assert_eq!(
+        reset_waiting["result"]["structuredContent"]["state"], "waiting_for_approval",
+        "{reset_waiting}"
+    );
+
+    // delete_project asks first too.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": { "name": "delete_project", "arguments": { "project": "hello-pg" } }
+    }));
+    let delete_accepted = shim.read();
+    assert_eq!(delete_accepted["result"]["isError"], false, "{delete_accepted}");
+    let delete_payload = &delete_accepted["result"]["structuredContent"];
+    assert_eq!(delete_payload["operation"], "delete_project", "{delete_accepted}");
+    assert_eq!(delete_payload["target"], "hello-pg", "{delete_accepted}");
+    assert!(
+        delete_payload["expiresAt"]
+            .as_str()
+            .unwrap_or_default()
+            .contains('T'),
+        "the Approval says when it dies: {delete_accepted}"
+    );
+    let approval_id = delete_payload["approvalId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("delete names its Approval: {delete_accepted}"))
+        .to_string();
+    let operation_id = delete_payload["operationId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("delete names its operation: {delete_accepted}"))
+        .to_string();
+
+    // The 202 body over MCP is the 202 body over HTTP: same fields, no drift.
+    let over_http: Value = serde_json::from_str(
+        &ureq::request(
+            "DELETE",
+            &format!("{}/v1/projects/hello-pg", daemon.base_url()),
+        )
+        .set("Authorization", &format!("Bearer {}", daemon.token()))
+        .call()
+        .expect("DELETE over HTTP")
+        .into_string()
+        .expect("body"),
+    )
+    .expect("202 JSON");
+    let mut over_mcp: Vec<&String> = delete_payload
+        .as_object()
+        .expect("an object")
+        .keys()
+        .collect();
+    let mut over_http_keys: Vec<&String> = over_http.as_object().expect("an object").keys().collect();
+    over_mcp.sort();
+    over_http_keys.sort();
+    assert_eq!(over_mcp, over_http_keys, "MCP and HTTP agree on the 202 shape");
+
+    // Nothing has changed yet.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": { "name": "get_project", "arguments": { "project": "hello-pg" } }
+    }));
+    let still_there = shim.read();
+    assert_eq!(still_there["result"]["isError"], false, "{still_there}");
+    assert_eq!(still_there["result"]["structuredContent"]["name"], "hello-pg");
+
+    // wait_for_operation still works, and reports a wait that ended before the
+    // operation did rather than pretending the work is done.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": {
+            "name": "wait_for_operation",
+            "arguments": { "operationId": operation_id, "timeoutMs": 400 }
+        }
+    }));
+    let waiting = shim.read();
+    assert_eq!(waiting["result"]["isError"], false, "{waiting}");
+    assert_eq!(
+        waiting["result"]["structuredContent"]["state"], "waiting_for_approval",
+        "the operation waits for a human, so a waiter keeps waiting: {waiting}"
+    );
+    assert_eq!(
+        waiting["result"]["structuredContent"]["kind"], "delete_project",
+        "{waiting}"
+    );
+
+    // A human at the console approves; the Agent's waiter then sees the result.
+    let decided: Value = serde_json::from_str(
+        &ureq::post(&format!(
+            "{}/v1/approvals/{approval_id}/approve",
+            daemon.base_url()
+        ))
+        .set("Authorization", &format!("Bearer {}", daemon.token()))
+        .set("Content-Type", "application/json")
+        .send_string("{}")
+        .expect("approve over HTTP")
+        .into_string()
+        .expect("body"),
+    )
+    .expect("decision JSON");
+    assert_eq!(decided["approval"]["state"], "approved", "{decided}");
+
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {
+            "name": "wait_for_operation",
+            "arguments": { "operationId": operation_id, "timeoutMs": 15000 }
+        }
+    }));
+    let finished = shim.read();
+    assert_eq!(finished["result"]["isError"], false, "{finished}");
+    assert_eq!(
+        finished["result"]["structuredContent"]["state"], "succeeded",
+        "an approved delete runs and reports its result: {finished}"
+    );
+    assert_eq!(
+        finished["result"]["structuredContent"]["result"]["verified"], true,
+        "the result says the teardown was verified: {finished}"
+    );
+
+    // The reset's Approval was never decided, so its data is untouched; the
+    // deleted Project is gone, as a typed error rather than prose.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": { "name": "get_project", "arguments": { "project": "hello-pg" } }
+    }));
+    let gone = shim.read();
+    assert_eq!(gone["error"]["data"]["code"], "NotFound", "{gone}");
+
+    // An operation id that does not exist is a typed error too.
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "tools/call",
+        "params": { "name": "wait_for_operation", "arguments": { "operationId": "nope" } }
+    }));
+    let missing = shim.read();
+    assert_eq!(missing["error"]["data"]["code"], "NotFound", "{missing}");
 
     daemon.shutdown().expect("stop daemon");
 }

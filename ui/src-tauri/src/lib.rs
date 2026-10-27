@@ -1,5 +1,6 @@
 //! The Tauri shell's only logic: ask the daemon who it is, what Projects it has,
-//! and how the selected Environment is doing.
+//! how the selected Environment is doing, which Approvals are waiting, and what
+//! has happened.
 //!
 //! The window is a client like the CLI and the MCP shim. It reads the discovery
 //! file (through `agentify_proto`) and calls the loopback API; it caches nothing
@@ -162,9 +163,143 @@ fn data_root() -> std::path::PathBuf {
     agentify_proto::resolve_data_root()
 }
 
+// ---- the Approval inbox and the activity feed ------------------------------
+
+/// The Approvals the daemon holds. `state` is `pending`, `approved`, `denied`,
+/// `expired`, or `all`; the daemon defaults to `pending`.
+pub fn approvals_for(
+    data_root: &Path,
+    state: Option<&str>,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    let client = agentify_proto::client::DaemonClient::new(data_root);
+    let mut payload = client
+        .approvals(state)
+        .map_err(|err| err.to_string())?;
+    if let Some(limit) = limit {
+        if let Some(approvals) = payload
+            .get_mut("approvals")
+            .and_then(|approvals| approvals.as_array_mut())
+        {
+            approvals.truncate(limit);
+        }
+    }
+    Ok(payload)
+}
+
+/// The audit chain as the activity feed serves it: newest first, with its
+/// verdict.
+pub fn activity_for(
+    data_root: &Path,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    agentify_proto::client::DaemonClient::new(data_root)
+        .activity(limit)
+        .map_err(|err| err.to_string())
+}
+
+/// What an Approve or Deny produced.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionResult {
+    /// True when the daemon recorded the decision.
+    pub ok: bool,
+    /// The decided Approval, as `GET /v1/approvals` serves it.
+    pub approval: Option<serde_json::Value>,
+    /// The operation the decision released or ended.
+    pub operation: Option<serde_json::Value>,
+    /// The daemon's stable problem code on failure.
+    pub code: Option<String>,
+    /// A human-readable explanation on failure.
+    pub detail: Option<String>,
+}
+
+/// Approve or deny one Approval. The daemon is the gate: approving prompts for
+/// the OS gesture, and the shell cannot produce it on its own. `operation` and
+/// `params` are what the card showed, so a yes covers exactly that.
+pub fn decide_approval_for(
+    data_root: &Path,
+    approval: &str,
+    approve: bool,
+    operation: Option<&str>,
+    params: Option<&str>,
+) -> DecisionResult {
+    let client = agentify_proto::client::DaemonClient::new(data_root);
+    let mut body = serde_json::Map::new();
+    if let Some(operation) = operation {
+        body.insert(
+            "operationId".to_string(),
+            serde_json::Value::String(operation.to_string()),
+        );
+    }
+    if let Some(params) = params {
+        body.insert(
+            "paramsHash".to_string(),
+            serde_json::Value::String(params.to_string()),
+        );
+    }
+    let body = serde_json::Value::Object(body);
+    let result = if approve {
+        client.approve(approval, &body)
+    } else {
+        client.deny(approval, &body)
+    };
+    match result {
+        Ok(payload) => DecisionResult {
+            ok: true,
+            approval: payload.get("approval").cloned(),
+            operation: payload.get("operation").cloned(),
+            code: None,
+            detail: None,
+        },
+        Err(err) => {
+            let problem = err.problem();
+            let field = |name: &str| {
+                problem
+                    .as_ref()
+                    .and_then(|problem| problem.get(name))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            };
+            DecisionResult {
+                ok: false,
+                approval: None,
+                operation: None,
+                code: Some(err.code()),
+                detail: Some(field("detail").unwrap_or_else(|| err.to_string())),
+            }
+        }
+    }
+}
+
 #[tauri::command]
 fn daemon_status() -> DaemonStatus {
     status_for(&data_root())
+}
+
+#[tauri::command]
+fn approvals(state: Option<String>, limit: Option<usize>) -> Result<serde_json::Value, String> {
+    approvals_for(&data_root(), state.as_deref(), limit)
+}
+
+#[tauri::command]
+fn activity(limit: Option<usize>) -> Result<serde_json::Value, String> {
+    activity_for(&data_root(), limit)
+}
+
+#[tauri::command]
+fn decide_approval(
+    approval: String,
+    approve: bool,
+    operation: Option<String>,
+    params: Option<String>,
+) -> DecisionResult {
+    decide_approval_for(
+        &data_root(),
+        &approval,
+        approve,
+        operation.as_deref(),
+        params.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -199,7 +334,10 @@ pub fn run() {
             environment_status,
             environment_stats,
             environment_logs,
-            environment_action
+            environment_action,
+            approvals,
+            activity,
+            decide_approval
         ])
         .run(tauri::generate_context!())
         .expect("the Agentify shell failed to start");
