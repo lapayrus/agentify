@@ -98,6 +98,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tempfile",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

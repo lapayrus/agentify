@@ -18,6 +18,9 @@ use crate::secrets::{self, SecretEnv, SecretStoreKind, Secrets};
 /// Environment variable that shortens the events heartbeat (milliseconds).
 pub const HEARTBEAT_ENV: &str = "AGENTIFY_HEARTBEAT_MS";
 
+/// Environment variable enabling an idle exit (milliseconds). `0` disables it.
+pub const IDLE_EXIT_ENV: &str = "AGENTIFY_IDLE_EXIT_MS";
+
 /// Environment variable that selects the Backend: `fake` until ticket 07.
 pub const BACKEND_ENV: &str = "AGENTIFY_BACKEND";
 
@@ -69,6 +72,12 @@ pub const SECRET_SERVICE_ENV: &str = "AGENTIFY_SECRET_SERVICE";
 /// Default heartbeat period for `GET /v1/events`.
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
 
+/// Default idle exit: ten minutes without a request, once nothing is running.
+///
+/// The shell polls while its window is open, so this only ends a daemon that
+/// nobody owns — one an MCP shim started and no Agent is using.
+pub const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(10 * 60);
+
 /// Default lifetime of an Approval: fifteen minutes.
 pub const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(15 * 60);
 
@@ -112,6 +121,9 @@ pub struct Config {
     pub bind_addr: std::net::SocketAddr,
     /// Period between SSE heartbeats.
     pub heartbeat: Duration,
+    /// Exit after this long with no request, when no Environment is running and
+    /// no Operation is in flight. `None` disables the idle exit.
+    pub idle_exit: Option<Duration>,
     /// Which Backend to drive. `fake` until ticket 07 wires WSL.
     pub backend: String,
     /// A script for the fake Backend, as JSON. `AGENTIFY_FAKE_SCRIPT` when the
@@ -166,6 +178,7 @@ impl Config {
             data_root: data_root.into(),
             bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             heartbeat: DEFAULT_HEARTBEAT,
+            idle_exit: Some(DEFAULT_IDLE_EXIT),
             backend: BACKEND_FAKE.to_string(),
             backend_script: None,
             operation_timeout: DEFAULT_OPERATION_TIMEOUT,
@@ -197,6 +210,10 @@ impl Config {
         config.backend = BACKEND_WSL.to_string();
         if let Ok(raw) = std::env::var(HEARTBEAT_ENV) {
             config.heartbeat = Duration::from_millis(whole_number(HEARTBEAT_ENV, &raw)?.max(10));
+        }
+        if let Ok(raw) = std::env::var(IDLE_EXIT_ENV) {
+            let millis = whole_number(IDLE_EXIT_ENV, &raw)?;
+            config.idle_exit = (millis > 0).then(|| Duration::from_millis(millis));
         }
         if let Ok(raw) = std::env::var(BACKEND_ENV) {
             if !raw.trim().is_empty() {
@@ -347,6 +364,12 @@ impl Config {
     /// fifteen minutes.
     pub fn with_approval_ttl(mut self, ttl: Duration) -> Self {
         self.approval_ttl = ttl;
+        self
+    }
+
+    /// Exit after this long without a request. Tests shorten the default.
+    pub fn with_idle_exit(mut self, idle: Duration) -> Self {
+        self.idle_exit = Some(idle);
         self
     }
 

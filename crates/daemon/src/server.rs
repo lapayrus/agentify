@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,6 +59,7 @@ use crate::consent::{self, ConsentOutcome, ConsentVerifier};
 use crate::disk::{DiskUsage, DISK_PRESSURE_BYTES};
 use crate::discovery;
 use crate::lifecycle::{self, Lifecycle, LifecycleError};
+use crate::logfile::DaemonLog;
 use crate::projects::{self, CreateError};
 use crate::redact::Redactor;
 use crate::secrets::{self, Secrets};
@@ -126,6 +128,13 @@ struct AppState {
     start_slots: Arc<Semaphore>,
     /// Measures free space on the data-root volume for the `whoami` warning.
     disk: Arc<dyn DiskUsage>,
+    /// When the last request arrived, in milliseconds since the Unix epoch.
+    /// The idle exit reads it; every route writes it.
+    last_activity: Arc<AtomicU64>,
+    /// Exit after this long without a request, when nothing is running.
+    idle_exit: Option<Duration>,
+    /// The bounded log file a console-less release build writes to.
+    log: Arc<DaemonLog>,
 }
 
 impl AppState {
@@ -140,6 +149,36 @@ impl AppState {
 
     fn backend_capabilities(&self) -> Capabilities {
         self.lifecycle.backend.describe().capabilities
+    }
+
+    /// Record that a request arrived.
+    fn touch(&self) {
+        self.last_activity
+            .store(now_millis(), Ordering::Relaxed);
+    }
+
+    /// Is this daemon unused enough to exit?
+    ///
+    /// A running Environment — desired or observed — and any Operation in flight
+    /// hold it open. A state read that fails is not permission to exit.
+    fn idle(&self) -> bool {
+        let Some(timeout) = self.idle_exit else {
+            return false;
+        };
+        let elapsed = now_millis().saturating_sub(self.last_activity.load(Ordering::Relaxed));
+        if elapsed < timeout.as_millis() as u64 {
+            return false;
+        }
+        if self.state.has_running_operations().unwrap_or(true) {
+            return false;
+        }
+        match self.state.list_environments() {
+            Ok(environments) => !environments.iter().any(|environment| {
+                environment.observed_state == STATE_RUNNING
+                    || environment.desired_state == STATE_RUNNING
+            }),
+            Err(_) => false,
+        }
     }
 
     /// The Agent actor behind an authenticated request.
@@ -351,13 +390,60 @@ async fn serve(
     // Adoption: what was asked to be running is brought back, in the
     // background, so the API answers while the workloads come up.
     spawn_adoption(app.clone());
+    // An unowned daemon ends by itself once nobody asks it anything.
+    spawn_idle_exit(app.clone());
+    let log = app.log.clone();
+    log.write(&format!("listening on {} (api {API_VERSION})", published.url));
     let served = axum::serve(listener, router(app))
         .with_graceful_shutdown(graceful)
         .await
         .context("serving the loopback API");
 
+    log.write("stopped");
     discovery::remove(&config);
     served
+}
+
+/// Record that a request arrived, so the idle exit does not fire under a live
+/// client. Health probes count: a probing caller is still a caller.
+async fn track_activity(
+    State(app): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    app.touch();
+    next.run(request).await
+}
+
+/// Exit when nobody has asked the daemon anything for a while.
+///
+/// This is what lets an MCP-only daemon be on demand rather than resident: it
+/// lives for the Agent's session and a little after. A running Environment or
+/// an Operation in flight always holds it open.
+fn spawn_idle_exit(app: Arc<AppState>) {
+    let Some(timeout) = app.idle_exit else {
+        return;
+    };
+    let tick = (timeout / 4).clamp(Duration::from_millis(25), Duration::from_secs(5));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tick).await;
+            if !app.idle() {
+                continue;
+            }
+            app.log
+                .write("idle: no request, no running Environment, no Operation; exiting");
+            app.shutdown.notify_one();
+            return;
+        }
+    });
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Bring every Environment whose desired state is `running` back up.
@@ -379,7 +465,8 @@ fn spawn_adoption(app: Arc<AppState>) {
         let projects = match app.state.list_projects() {
             Ok(projects) => projects,
             Err(err) => {
-                eprintln!("agentifyd: adoption could not read the Projects: {err:#}");
+                app.log
+                    .write(&format!("adoption could not read the Projects: {err:#}"));
                 return;
             }
         };
@@ -397,17 +484,17 @@ fn spawn_adoption(app: Arc<AppState>) {
             let lock = app.env_lock(&record.environment.id);
             let guard = lock.lock_owned().await;
             match app.lifecycle.start(&app.state, &record).await {
-                Ok(status) => eprintln!(
-                    "agentifyd: adopted {}/{} ({})",
+                Ok(status) => app.log.write(&format!(
+                    "adopted {}/{} ({})",
                     record.name, record.environment.name, status.health
-                ),
-                Err(err) => eprintln!(
-                    "agentifyd: adopting {}/{} failed: {} ({})",
+                )),
+                Err(err) => app.log.write(&format!(
+                    "adopting {}/{} failed: {} ({})",
                     record.name,
                     record.environment.name,
                     err.code(),
                     err.detail()
-                ),
+                )),
             }
             drop(guard);
         }
@@ -416,6 +503,11 @@ fn spawn_adoption(app: Arc<AppState>) {
 
 async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> {
     crate::config::ensure_data_root(&config.data_root)?;
+    let log = Arc::new(DaemonLog::open(&config.data_root)?);
+    log.write(&format!(
+        "agentifyd {DAEMON_VERSION} starting with data root {}",
+        config.data_root.display()
+    ));
 
     let state = StateStore::open(&config.data_root)?;
     let instance = state.instance()?;
@@ -433,7 +525,7 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
     // is wrong — but every lifecycle call answers `VersionMismatch`.
     let handshake = crate::handshake::check(config, &backend);
     if let Some(refusal) = &handshake.refusal {
-        eprintln!("agentifyd: {refusal}");
+        log.write(refusal);
     }
 
     let secrets = Arc::new(config.secrets());
@@ -495,6 +587,9 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
         shutdown: Arc::new(Notify::new()),
         start_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_STARTS)),
         disk: config.disk.clone(),
+        last_activity: Arc::new(AtomicU64::new(now_millis())),
+        idle_exit: config.idle_exit,
+        log,
     };
     Ok((state, listener, discovery))
 }
@@ -557,6 +652,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/healthz", get(healthz))
         .merge(protected)
         .fallback(not_found)
+        .layer(middleware::from_fn_with_state(state.clone(), track_activity))
         .with_state(state)
 }
 

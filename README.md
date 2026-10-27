@@ -63,6 +63,7 @@ learn about it.
 | `AGENTIFY_EXEC_TIMEOUT_MS` | `60000` | Upper bound on one `exec` |
 | `AGENTIFY_LOG_TAIL` | `200` | Default log tail |
 | `AGENTIFY_HEARTBEAT_MS` | `15000` | SSE heartbeat period |
+| `AGENTIFY_IDLE_EXIT_MS` | `600000` | Exit after this long with no request, when nothing is running; `0` disables it |
 | `AGENTIFY_SECRET_STORE` | `keyring` | Where secret values live: `keyring` (the OS credential manager) or `memory` (a test-only store) |
 | `AGENTIFY_SECRET_SERVICE` | `agentify-v0` | Keyring service name the values are filed under |
 | `AGENTIFY_INGRESS` | on | Set to `off` to run without local ingress (no Caddy, no `*.localhost` routes) |
@@ -183,13 +184,13 @@ The two are siblings on purpose. Tauri's per-user default is
 the program directory only, so Projects, Checkpoints, the rootfs cache, and the
 state database survive.
 
-The same hook file registers the daemon's login item: `POSTINSTALL` runs
-`agentify login-item install`, `PREUNINSTALL` runs `agentify login-item remove`.
-That is a per-user Scheduled Task (`Agentify Daemon`) with a logon trigger, an
-interactive token at `LeastPrivilege`, a `PT0S` execution limit, and restart on
-failure — never a Windows service, so the daemon runs in the user's own session
-and `%LOCALAPPDATA%` and keeps running with the UI closed. `agentify login-item
-status` reports what the scheduler holds.
+`PREUNINSTALL` removes a logon task left by v0.1.x; this build does not register
+one. The daemon's lifetime follows the app (ADR-0006): the shell starts it on
+demand, owns it in a Windows Job Object, and stops it when the window closes, so
+nothing is resident while Agentify is not running. An MCP client used with the
+app closed starts a daemon for its own session; a daemon nobody owns exits after
+ten idle minutes, and never while an Environment is running or an Operation is in
+flight.
 
 The bundle is signing-ready but unsigned locally: `bundle.windows` already names
 `digestAlgorithm: sha256` and a timestamp URL, and `certificateThumbprint` is

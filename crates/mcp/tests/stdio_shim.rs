@@ -21,6 +21,12 @@ impl Shim {
     fn spawn(home: &Path) -> Shim {
         let mut child = Command::new(env!("CARGO_BIN_EXE_agentify-mcp"))
             .env("AGENTIFY_HOME", home)
+            // A daemon the shim starts inherits these. The shim itself ignores
+            // them; they keep a retried call from provisioning WSL or binding
+            // ingress ports in a test.
+            .env("AGENTIFY_BACKEND", "fake")
+            .env("AGENTIFY_INGRESS", "off")
+            .env("AGENTIFY_SECRET_STORE", "memory")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -322,12 +328,28 @@ fn project_tools_create_list_and_get_through_the_same_api() {
 }
 
 #[test]
-fn whoami_reports_a_clear_error_when_the_daemon_is_not_running() {
+fn a_missing_daemon_is_started_and_the_call_is_retried() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut shim = Shim::spawn(temp.path());
+    let sidecar = Path::new(env!("CARGO_BIN_EXE_agentify-mcp"))
+        .parent()
+        .expect("the shim binary has a parent")
+        .join(if cfg!(windows) {
+            "agentifyd.exe"
+        } else {
+            "agentifyd"
+        });
+    if !sidecar.is_file() {
+        // `cargo test -p agentify-mcp` alone does not build the daemon binary.
+        eprintln!(
+            "skipping: {} is not staged; build the workspace first",
+            sidecar.display()
+        );
+        return;
+    }
 
+    let mut shim = Shim::spawn(temp.path());
     shim.send(initialize());
-    shim.read();
+    let _ = shim.read();
 
     shim.send(json!({
         "jsonrpc": "2.0",
@@ -337,13 +359,22 @@ fn whoami_reports_a_clear_error_when_the_daemon_is_not_running() {
     }));
     let called = shim.read();
     assert_eq!(called["id"], 7);
-    let message = called["error"]["message"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected an error response: {called}"));
     assert!(
-        message.contains("daemon unreachable"),
-        "the shim names the failure: {message}"
+        called.get("error").is_none() || called["error"].is_null(),
+        "the shim starts a daemon instead of failing: {called}"
     );
+    assert_eq!(
+        called["result"]["isError"], false,
+        "the retried call succeeds: {called}"
+    );
+    assert!(
+        agentify_proto::discovery_path(temp.path()).exists(),
+        "the shim's daemon published a discovery file"
+    );
+
+    // The daemon is a real process the shim started; leave nothing running.
+    agentify_proto::lifecycle::stop(temp.path(), &agentify_proto::lifecycle::SystemProcesses)
+        .expect("stop the daemon the shim started");
 }
 
 #[test]

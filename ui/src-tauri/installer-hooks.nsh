@@ -1,14 +1,13 @@
 ; NSIS hooks for Agentify's per-user installer.
 ;
-; Tauri includes this file via `bundle.windows.nsis.installerHooks`. The installer
-; itself does one thing beyond copying files: it registers the daemon's login
-; item, so an installed Agentify starts its daemon at the next logon without the
-; UI being open. Uninstalling removes it again — the same pair a person can run by
-; hand with `agentify login-item install` / `remove`.
+; Tauri includes this file via `bundle.windows.nsis.installerHooks`. The
+; installer itself does one thing beyond copying files: it stops the daemon that
+; is being replaced before a sidecar is overwritten. The daemon's lifetime
+; follows the app (ADR-0006), so no logon item is registered; a task left by
+; v0.1.x is removed during the upgrade and again on uninstall.
 ;
 ; Nothing here elevates. The installer runs as the user (installMode
-; "currentUser") and the task it registers is a per-user Scheduled Task at
-; LeastPrivilege, so no UAC prompt appears.
+; "currentUser"), so no UAC prompt appears.
 ;
 ; The data root is never touched: `$LOCALAPPDATA\Agentify\` is resolved by the
 ; binaries themselves, which is what lets an install-over keep Projects and state.
@@ -46,12 +45,16 @@
     DetailPrint "taskkill agentifyd exited with $1"
     Sleep 500
   ${EndIf}
+
+  ; v0.1.x registered a per-user logon task. This build does not, so remove the
+  ; old one: left in place it would start the new daemon at logon, outside the
+  ; app that is supposed to own it.
+  ExecWait '"$INSTDIR\agentify.exe" login-item remove' $0
+  DetailPrint "agentify login-item remove exited with $0"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  DetailPrint "Registering the Agentify daemon login item"
-  ExecWait '"$INSTDIR\agentify.exe" login-item install' $0
-  DetailPrint "agentify login-item install exited with $0"
+  DetailPrint "Agentify does not register a logon task; the daemon starts and stops with the app"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL

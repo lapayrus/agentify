@@ -19,6 +19,7 @@ pub mod handshake;
 pub mod health;
 pub mod ingress;
 pub mod lifecycle;
+pub mod logfile;
 pub mod login_item;
 pub mod ports;
 pub mod projects;
@@ -30,4 +31,15 @@ pub mod uninstall;
 
 pub use config::Config;
 pub use lifecycle::Lifecycle;
+pub use logfile::DaemonLog;
 pub use server::{start_in_background, RunningDaemon, DAEMON_VERSION};
+
+/// Write a line to the daemon's log file, creating it if needed.
+///
+/// Startup failures happen before a `DaemonLog` exists in the server, and a
+/// release daemon has no console to print to, so this is the one fallback.
+pub fn log_error(data_root: &std::path::Path, message: &str) {
+    if let Ok(log) = DaemonLog::open(data_root) {
+        log.write(message);
+    }
+}

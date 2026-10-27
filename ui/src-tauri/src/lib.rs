@@ -12,6 +12,10 @@ use agentify_proto::lifecycle::{self, EnsureError, Stop, SystemProcesses};
 use serde::Serialize;
 use tauri_plugin_updater::UpdaterExt;
 
+mod job;
+
+use job::DaemonJob;
+
 /// What the shell shows in its header, rail, and main pane.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -482,10 +486,15 @@ fn restart_daemon() -> Result<(), String> {
             "the daemon (pid {pid}, {found}) has an Operation in flight; wait for it to finish, then retry"
         ));
     }
-    std::process::Command::new(daemon_binary())
+    let mut child = std::process::Command::new(daemon_binary())
         .spawn()
-        .map(|_| ())
         .map_err(|err| format!("starting the daemon failed: {err}"))?;
+    if let Some(job) = daemon_job() {
+        if let Err(err) = job.attach(child.id()) {
+            let _ = child.kill();
+            return Err(err);
+        }
+    }
     clear_blocked();
     Ok(())
 }
@@ -639,6 +648,22 @@ async fn update_install(app: tauri::AppHandle) -> Result<(), String> {
 /// daemon from another build refused to be replaced because it is mid-Operation.
 static BLOCKED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// The job that owns the daemon for this shell run. Created once, on first use,
+/// and never closed until the process ends — which is exactly when the OS kills
+/// everything inside it.
+static JOB: std::sync::OnceLock<Option<DaemonJob>> = std::sync::OnceLock::new();
+
+fn daemon_job() -> Option<&'static DaemonJob> {
+    JOB.get_or_init(|| match DaemonJob::new() {
+        Ok(job) => Some(job),
+        Err(err) => {
+            eprintln!("agentify: {err}; a crash will not take the daemon with it");
+            None
+        }
+    })
+    .as_ref()
+}
+
 fn blocked() -> std::sync::MutexGuard<'static, Option<String>> {
     BLOCKED
         .lock()
@@ -668,12 +693,26 @@ pub fn ensure_daemon_at(
 /// running. A no-op when it is.
 fn ensure_daemon() {
     let outcome = ensure_daemon_at(&data_root(), env!("CARGO_PKG_VERSION"), || {
-        std::process::Command::new(daemon_binary())
+        let mut child = std::process::Command::new(daemon_binary())
             .spawn()
-            .map(|_| ())
-            .map_err(|err| format!("starting {} failed: {err}", daemon_binary().display()))
+            .map_err(|err| format!("starting {} failed: {err}", daemon_binary().display()))?;
+        if let Some(job) = daemon_job() {
+            if let Err(err) = job.attach(child.id()) {
+                let _ = child.kill();
+                return Err(format!("{err}; the daemon was stopped again"));
+            }
+        }
+        Ok(())
     });
     match outcome {
+        Ok(agentify_proto::lifecycle::Ensure::Running(discovery)) => {
+            // Adopted — for example, a daemon the MCP shim started. Own it too,
+            // so a crash of this window takes it with the job.
+            if let Some(job) = daemon_job() {
+                let _ = job.attach(discovery.pid);
+            }
+            clear_blocked();
+        }
         Ok(_) => clear_blocked(),
         Err(EnsureError::Busy { pid, found }) => {
             *blocked() = Some(format!(
@@ -701,7 +740,7 @@ pub fn run() {
         );
     }
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             daemon_status,
@@ -723,6 +762,15 @@ pub fn run() {
             update_check,
             update_install
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("the Agentify shell failed to start");
+
+    app.run(|_app, event| {
+        if let tauri::RunEvent::Exit = event {
+            // A normal exit stops the daemon gracefully, so it removes its own
+            // discovery file. The job object is the backstop for a crash, which
+            // never reaches this line.
+            let _ = lifecycle::stop(&data_root(), &SystemProcesses);
+        }
+    });
 }
