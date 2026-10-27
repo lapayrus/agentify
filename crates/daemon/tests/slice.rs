@@ -358,6 +358,30 @@ fn get_page(host: &str, pem: &str) -> String {
     }
 }
 
+/// `GET /` over TLS, retried until the page says what it should.
+///
+/// A restart is the one moment the route can answer before the app does: the
+/// daemon adopts the Environment in the background, so the first probes are a
+/// 502 from Caddy until the workload is back. Waiting for the *content* is what
+/// makes "the URL still serves" a statement about the app, not about Caddy.
+fn get_page_saying(host: &str, pem: &str, expected: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut last = String::new();
+    loop {
+        if let Ok(response) = https_get(host, pem) {
+            if response.contains(" 200 ") && body(&response).contains(expected) {
+                return response;
+            }
+            last = response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{host} never served {expected:?} again; the last answer was: {last}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn https_get(host: &str, ca_pem: &str) -> Result<String, String> {
     let mut roots = rustls::RootCertStore::empty();
     for der in certificates(ca_pem) {
@@ -469,6 +493,27 @@ fn port_open(port: u16) -> bool {
     .is_ok()
 }
 
+/// Poll the Environment's status until the daemon says it is running.
+///
+/// A daemon that restarts adopts its Environments in the background, so the app
+/// can answer before the daemon has finished saying so; a command sent in that
+/// window is refused with `NotProvisioned`. Waiting for the verdict is what a
+/// client does.
+fn running(daemon: &Daemon, project: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let status = daemon.status(project);
+        if status["environment"]["state"] == "running" {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{project} never came back up: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// A row read straight out of a Resource's Postgres, through `exec`.
 fn greeting(daemon: &Daemon, project: &str) -> String {
     let answer = daemon.exec(
@@ -517,6 +562,76 @@ fn database_url_digest(daemon: &Daemon, project: &str) -> String {
     );
     assert_eq!(answer["exitCode"], 0, "{project}: {answer}");
     answer["stdout"].as_str().unwrap_or_default().trim().to_string()
+}
+
+/// The verifier a database cluster stores for the role the fixture uses.
+///
+/// Two Projects generate their passwords independently, so their clusters hold
+/// different verifiers. Comparing them proves distinct credentials without
+/// either password ever leaving a container: the value printed is a hash of a
+/// hash, and neither cluster's password can be recovered from it.
+fn stored_verifier(daemon: &Daemon, project: &str) -> String {
+    let answer = daemon.exec(
+        project,
+        "db",
+        &[
+            "psql",
+            "-U",
+            "hello",
+            "-d",
+            "hello",
+            "-tAc",
+            "select md5(coalesce(rolpassword, '')) from pg_authid where rolname = 'hello'",
+        ],
+    );
+    assert_eq!(answer["exitCode"], 0, "{project}: {answer}");
+    let verifier = answer["stdout"].as_str().unwrap_or_default().trim().to_string();
+    assert_eq!(verifier.len(), 32, "{project}: unexpected verifier {verifier:?}");
+    verifier
+}
+
+/// Run a command and return `(exit code, stdout, stderr)`.
+fn run(daemon: &Daemon, project: &str, resource: &str, command: &[&str]) -> (i64, String, String) {
+    let answer = daemon.exec(project, resource, command);
+    (
+        answer["exitCode"].as_i64().unwrap_or(-1),
+        answer["stdout"].as_str().unwrap_or_default().to_string(),
+        answer["stderr"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+/// `C:\a\b` → `/mnt/c/a/b`: the path a distro with automount would use for a
+/// Windows directory, which is what "reading B's workspace from A" would mean if
+/// anything ever mounted the daemon's data root into a Project.
+fn windows_path_to_wsl(path: &str) -> String {
+    let drive = path
+        .chars()
+        .next()
+        .map(|letter| letter.to_ascii_lowercase())
+        .unwrap_or('c');
+    let rest = path.get(2..).unwrap_or("").replace('\\', "/");
+    format!("/mnt/{drive}{rest}")
+}
+
+/// The audit chain: `{ entries, integrity }`, newest entry first.
+fn activity(daemon: &Daemon) -> Value {
+    let (status, body) = daemon.get("/v1/activity?limit=500");
+    assert_eq!(status, 200, "the activity feed: {body}");
+    body
+}
+
+/// One entry of the feed, by what it recorded.
+fn audited<'a>(page: &'a Value, operation: &str, target: &str, result: &str) -> &'a Value {
+    page["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no entries in {page}"))
+        .iter()
+        .find(|entry| {
+            entry["operation"] == operation
+                && entry["target"] == target
+                && entry["result"] == result
+        })
+        .unwrap_or_else(|| panic!("no {operation} entry for {target} ({result}): {page:#}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -616,21 +731,42 @@ fn the_vertical_slice_runs_end_to_end_on_the_real_substrate() {
 
     // ---- 5. Restart the daemon: the row and the URL survive ----------------
     let web_lease = leases(&daemon.status(PROJECT), "web")[0].1;
+    let project_id = project["id"].as_str().expect("the Project id").to_string();
     daemon.shutdown();
     let mut daemon = Daemon::boot_after_restart();
     // Right after a restart the daemon reports what it observed, not what it
     // wished: the supervisor it was holding is gone.
     let observed = daemon.status(PROJECT);
     eprintln!("after the restart: {observed}");
+
+    // No `start` and no second migration: the daemon republishes the route from
+    // the database and adopts the Environment, so the app is back on the same
+    // hostname with the data the migration wrote before the restart.
+    let page = get_page_saying(HOST, &pem, ROW);
+    assert!(
+        page.starts_with("HTTP/1.") && page.contains(" 200 "),
+        "the URL must serve again as soon as the daemon is back: {page}"
+    );
+    let adopted = running(&daemon, PROJECT);
+    eprintln!("adopted after the restart: {adopted}");
+    assert_eq!(
+        greeting(&daemon, PROJECT),
+        ROW,
+        "the row survived the daemon restart"
+    );
+
+    // A start after a restart still converges on the same runtime, the same
+    // lease, and the same data: a restart is not a reset.
     let restarted = daemon.start(PROJECT);
     assert_eq!(
         restarted["environment"]["state"], "running",
         "a start after a restart converges on the same runtime: {restarted}"
     );
+    assert_eq!(restarted["health"], "healthy", "{restarted}");
     assert_eq!(
-        greeting(&daemon, PROJECT),
-        ROW,
-        "the row survived the daemon restart"
+        leases(&restarted, "web")[0].1,
+        web_lease,
+        "the restart keeps the lease the URL points at: {restarted}"
     );
     let page = get_page(HOST, &pem);
     assert!(
@@ -638,10 +774,27 @@ fn the_vertical_slice_runs_end_to_end_on_the_real_substrate() {
         "the URL still serves the row after a restart, on lease {web_lease}: {page}"
     );
 
-    // ---- 6. A second Project, and the isolation between them --------------
+    // ---- 6. A second Project starts alongside the first -------------------
     daemon.create(OTHER);
     let other = daemon.start(OTHER);
     assert_eq!(other["environment"]["state"], "running", "{other}");
+    assert_eq!(other["health"], "healthy", "{other}");
+    let (status, other_project) = daemon.get(&format!("/v1/projects/{OTHER}"));
+    assert_eq!(status, 200, "{other_project}");
+    let other_id = other_project["id"]
+        .as_str()
+        .expect("the second Project's id")
+        .to_string();
+    assert_ne!(project_id, other_id, "two Projects are two Projects");
+
+    // Both routes are right, and distinct: one hostname per Project, each
+    // pointing at its own lease.
+    assert_eq!(project["routes"][0]["url"], format!("https://{HOST}"));
+    assert_eq!(
+        other_project["routes"][0]["url"],
+        format!("https://{OTHER_HOST}")
+    );
+    assert_ne!(HOST, OTHER_HOST, "two Projects cannot share a hostname");
 
     // Separate leases: two Projects never share a host port.
     let hello_ports: Vec<u16> = ["web", "db"]
@@ -660,6 +813,13 @@ fn the_vertical_slice_runs_end_to_end_on_the_real_substrate() {
             "lease {port} is shared between two Projects: {hello_ports:?} and {other_ports:?}"
         );
     }
+    // And each route fronts its own Project's lease, not the other's.
+    assert!(hello_ports.contains(&web_lease), "{hello_ports:?}");
+    assert_ne!(
+        leases(&daemon.status(OTHER), "web")[0].1,
+        web_lease,
+        "the second Project has its own lease"
+    );
 
     // Separate credentials: a password is generated per Project, so A's cannot
     // authenticate to B's database.
@@ -671,6 +831,105 @@ fn the_vertical_slice_runs_end_to_end_on_the_real_substrate() {
         database_url_digest(&daemon, PROJECT),
         database_url_digest(&daemon, OTHER),
         "two Projects must not share one database credential"
+    );
+
+    // ---- 6b. A cannot read B's volumes, credentials, or hostname -----------
+    //
+    // Volumes first. The same absolute path inside the database container is
+    // each Project's own named volume, so a marker written by one is invisible
+    // to the other: the control (`A` reads its own marker) makes the crossed
+    // read a statement about the volume, not about a missing file.
+    let marker = "/var/lib/postgresql/data/.agentify-isolation";
+    let (code, out, err) = run(
+        &daemon,
+        PROJECT,
+        "db",
+        &["sh", "-c", &format!("echo {PROJECT} > {marker} && cat {marker}")],
+    );
+    assert_eq!(code, 0, "A writes into its own volume: {out}{err}");
+    assert_eq!(out.trim(), PROJECT, "{out}");
+    let (code, out, err) = run(
+        &daemon,
+        OTHER,
+        "db",
+        &["sh", "-c", &format!("echo {OTHER} > {marker} && cat {marker}")],
+    );
+    assert_eq!(code, 0, "B writes into its own volume: {out}{err}");
+    assert_eq!(out.trim(), OTHER, "{out}");
+    let (code, out, err) = run(&daemon, PROJECT, "db", &["cat", marker]);
+    assert_eq!(code, 0, "A reads its own volume: {out}{err}");
+    assert_eq!(
+        out.trim(),
+        PROJECT,
+        "A read {out:?} from the path B wrote {OTHER:?} into: the volumes are not separate"
+    );
+    // B's volume, by the name the daemon gave it, is in B's runtime and nowhere
+    // in A's.
+    let other_volume = format!("/var/lib/docker/volumes/{OTHER}-db-data/_data/PG_VERSION");
+    let (code, out, err) = run(&daemon, PROJECT, "db", &["cat", &other_volume]);
+    assert_ne!(code, 0, "A read B's volume at {other_volume}: {out}{err}");
+
+    // A's container has no host mount at all, so the daemon-owned workspace —
+    // where both Projects' source lives — is outside it. That is the spec's
+    // "no host mounts" rule, and it is what makes a workspace path unreachable
+    // rather than merely unlisted.
+    let (code, mounts, err) = run(&daemon, PROJECT, "web", &["cat", "/proc/mounts"]);
+    assert_eq!(code, 0, "reading A's mount table: {err}");
+    for forbidden in ["/mnt/c", "/mnt/wsl", " 9p ", "drvfs"] {
+        assert!(
+            !mounts.contains(forbidden),
+            "A's container has {forbidden} mounted, so the host filesystem is reachable from it: {mounts}"
+        );
+    }
+    // B's workspace, by the path a distro with automount would use, is not
+    // readable from A; nor is the in-runtime copy of B's source.
+    let other_workspace = other_project["workspace"]
+        .as_str()
+        .expect("B's workspace path");
+    let guest = windows_path_to_wsl(other_workspace);
+    let (code, out, err) = run(&daemon, PROJECT, "web", &["cat", &format!("{guest}/agentify.yaml")]);
+    assert_ne!(
+        code, 0,
+        "A read B's workspace at {guest}: {out}{err}"
+    );
+    let (code, out, err) = run(
+        &daemon,
+        PROJECT,
+        "web",
+        &["cat", "/srv/agentify/project/agentify.yaml"],
+    );
+    assert_ne!(code, 0, "A read B's in-runtime workspace: {out}{err}");
+
+    // B's hostname, from inside A. Windows resolves every name ending in
+    // `.localhost` to loopback in every distro — the platform's rule, because
+    // all WSL distros share one network namespace — so what must hold, and does,
+    // is that the name leads nowhere but loopback and that loopback inside A is
+    // A: nothing listens there, and B's page is not reachable by name.
+    let (code, out, _) = run(
+        &daemon,
+        PROJECT,
+        "web",
+        &["sh", "-c", &format!("getent hosts {OTHER_HOST} || true")],
+    );
+    eprintln!(
+        "`getent hosts {OTHER_HOST}` inside {PROJECT}/web: exit {code}, {:?}",
+        out.trim()
+    );
+    for line in out.lines() {
+        let address = line.split_whitespace().next().unwrap_or_default();
+        assert!(
+            address == "::1" || address == "127.0.0.1" || address.is_empty(),
+            "B's hostname resolved to {address} inside A, which is not loopback: {out}"
+        );
+    }
+    let fetch = format!(
+        "fetch('http://{OTHER_HOST}/').then(r=>r.text()).then(()=>{{console.log('reached');process.exit(0)}})\
+         .catch(e=>{{console.log('unreachable: '+((e.cause&&e.cause.code)||e.code||e.message));process.exit(1)}})"
+    );
+    let (code, out, _) = run(&daemon, PROJECT, "web", &["node", "-e", &fetch]);
+    assert_ne!(
+        code, 0,
+        "A reached B's route through B's hostname: {out}"
     );
 
     // Separate data: A's row is not in B's database, because B's volume is its
@@ -693,6 +952,65 @@ fn the_vertical_slice_runs_end_to_end_on_the_real_substrate() {
         crossed["exitCode"], 0,
         "Project B must not have Project A's table: {crossed}"
     );
+    // The refusal names the missing table, so it is B's own empty database
+    // answering rather than a connection that never happened.
+    let refusal = format!(
+        "{}{}",
+        crossed["stdout"].as_str().unwrap_or_default(),
+        crossed["stderr"].as_str().unwrap_or_default()
+    );
+    assert!(
+        refusal.contains("greetings"),
+        "B's own database says the table is missing: {refusal}"
+    );
+
+    // Separate credentials, proven at the server rather than by comparing
+    // strings: each cluster stores a verifier for the password the daemon
+    // generated for it, and the two verifiers are different passwords.
+    assert_ne!(
+        stored_verifier(&daemon, PROJECT),
+        stored_verifier(&daemon, OTHER),
+        "two Projects must not share one database password"
+    );
+    // And A's credentials do not open B's cluster: A's own connection string,
+    // aimed at B's database, is refused. Neither value leaves a container.
+    let (code, address, err) = run(&daemon, OTHER, "db", &["hostname", "-i"]);
+    assert_eq!(code, 0, "B's address: {err}");
+    let address = address
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!address.is_empty(), "B's database has no address");
+    let attempt = r#"
+const pg = require('pg');
+const url = new URL(process.env.DATABASE_URL);
+const client = new pg.Client({
+  host: process.argv[1],
+  port: 5432,
+  user: url.username,
+  password: decodeURIComponent(url.password),
+  database: url.pathname.slice(1),
+  connectionTimeoutMillis: 5000,
+});
+client
+  .connect()
+  .then(() => client.query('select 1'))
+  .then(() => { console.log('AUTHENTICATED'); return client.end(); })
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.log('refused: ' + (error.code || error.message));
+    process.exit(1);
+  });
+"#;
+    let (code, out, err) = run(&daemon, PROJECT, "web", &["node", "-e", attempt, &address]);
+    eprintln!("A's credentials against B's cluster at {address}: exit {code}, {:?}{:?}", out.trim(), err.trim());
+    assert_ne!(code, 0, "A authenticated to B's database at {address}: {out}{err}");
+    assert!(
+        !out.contains("AUTHENTICATED"),
+        "A authenticated to B's database: {out}"
+    );
+
     // And B's own page is its own hostname. It has no migration yet, so a 500
     // naming the missing table is the expected answer.
     let other_page = get_page(OTHER_HOST, &pem);
@@ -700,6 +1018,58 @@ fn the_vertical_slice_runs_end_to_end_on_the_real_substrate() {
         other_page.starts_with("HTTP/1."),
         "the second Project has its own URL: {other_page}"
     );
+
+    // ---- 6c. The audit: every mutation, both Projects, one chain ----------
+    let feed = activity(&daemon);
+    assert_eq!(
+        feed["integrity"]["verified"], true,
+        "the chain verifies: {:#}",
+        feed["integrity"]
+    );
+    let entries = feed["entries"].as_array().expect("entries");
+    assert!(entries.len() >= 8, "the feed is not empty: {}", entries.len());
+    // Newest first, so each entry links to the one after it in the array.
+    for pair in entries.windows(2) {
+        assert_eq!(
+            pair[0]["prevHash"], pair[1]["hash"],
+            "the chain is broken at seq {}: {pair:?}",
+            pair[0]["seq"]
+        );
+    }
+    let (status, whoami) = daemon.get("/v1/whoami");
+    assert_eq!(status, 200, "{whoami}");
+    let agent = whoami["actor"]["id"]
+        .as_str()
+        .expect("the Agent token id")
+        .to_string();
+    let expected: Vec<(&str, String, String, &str)> = vec![
+        ("create_project", PROJECT.to_string(), project_id.clone(), "succeeded"),
+        ("create_project", OTHER.to_string(), other_id.clone(), "succeeded"),
+        ("start_environment", format!("{PROJECT}/dev"), project_id.clone(), "succeeded"),
+        ("start_environment", format!("{OTHER}/dev"), other_id.clone(), "succeeded"),
+        ("exec", format!("{PROJECT}/dev/web"), project_id.clone(), "succeeded"),
+        ("exec", format!("{PROJECT}/dev/db"), project_id.clone(), "succeeded"),
+        ("exec", format!("{OTHER}/dev/web"), other_id.clone(), "succeeded"),
+        ("exec", format!("{OTHER}/dev/db"), other_id.clone(), "succeeded"),
+    ];
+    for (operation, target, project, result) in &expected {
+        let entry = audited(&feed, *operation, target.as_str(), result);
+        assert_eq!(entry["actor"]["kind"], "agent", "{entry}");
+        assert_eq!(
+            entry["actor"]["id"].as_str(),
+            Some(agent.as_str()),
+            "the token that made the call is the actor: {entry}"
+        );
+        assert_eq!(
+            entry["projectId"].as_str(),
+            Some(project.as_str()),
+            "{entry}"
+        );
+        assert!(
+            entry["hash"].as_str().map(str::len) == Some(64),
+            "every entry is hashed: {entry}"
+        );
+    }
 
     // ---- 7. Delete, on the scripted consent, and nothing remains -----------
     let (accepted, asked) = daemon.delete(&format!("/v1/projects/{PROJECT}"));
@@ -764,6 +1134,34 @@ fn the_vertical_slice_runs_end_to_end_on_the_real_substrate() {
         .0;
     let finished = daemon.wait(&operation);
     assert_eq!(finished["state"], "succeeded", "{finished}");
+
+    // ---- 9. The audit of both Projects, deletions included ----------------
+    let feed = activity(&daemon);
+    assert_eq!(
+        feed["integrity"]["verified"], true,
+        "the chain still verifies after both Projects are gone: {:#}",
+        feed["integrity"]
+    );
+    let entries = feed["entries"].as_array().expect("entries");
+    for pair in entries.windows(2) {
+        assert_eq!(
+            pair[0]["prevHash"], pair[1]["hash"],
+            "the chain is broken at seq {}: {pair:?}",
+            pair[0]["seq"]
+        );
+    }
+    // A delete is three mutations — asked, decided, done — and each one names
+    // the Project it touched. A deleted Project keeps its history.
+    for name in [PROJECT, OTHER] {
+        for result in ["requested", "approved", "succeeded"] {
+            let entry = audited(&feed, "delete_project", name, result);
+            assert_eq!(entry["target"], name, "{entry}");
+            assert!(
+                entry["projectId"].as_str().map(str::len) == Some(36),
+                "every delete entry names the Project it touched: {entry}"
+            );
+        }
+    }
 
     daemon.shutdown();
     machine.finish();

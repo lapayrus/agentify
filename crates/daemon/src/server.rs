@@ -30,7 +30,7 @@ use agentify_proto::{
     Discovery, ExecRequest, ExecResponse, LogLineView, LogsResponse, OperationView, Problem,
     ProjectList,
     StatsResponse, Whoami, API_VERSION, APPROVAL_APPROVED, APPROVAL_DENIED, APPROVAL_EXPIRED,
-    APPROVAL_PENDING, DEV_ENVIRONMENT, OPERATION_WAITING_FOR_APPROVAL,
+    APPROVAL_PENDING, DEV_ENVIRONMENT, OPERATION_WAITING_FOR_APPROVAL, STATE_RUNNING,
 };
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
@@ -320,7 +320,6 @@ async fn serve(
         published.url
     );
 
-    let app = router(Arc::new(state));
     let graceful = async move {
         let shutdown = shutdown;
         tokio::select! {
@@ -329,13 +328,71 @@ async fn serve(
         }
     };
 
-    let served = axum::serve(listener, app)
+    let app = Arc::new(state);
+    // Adoption: what was asked to be running is brought back, in the
+    // background, so the API answers while the workloads come up.
+    spawn_adoption(app.clone());
+    let served = axum::serve(listener, router(app))
         .with_graceful_shutdown(graceful)
         .await
         .context("serving the loopback API");
 
     discovery::remove(&config);
     served
+}
+
+/// Bring every Environment whose desired state is `running` back up.
+///
+/// A daemon restart is not a stop. On Windows the Backend's supervisor is a
+/// foreground process the daemon holds open, so a daemon that dies takes the
+/// workload and its leased ports with it — the data is still on disk, but the
+/// URL behind the route answers 502 until something starts the Environment
+/// again. Something is this: every Environment the user or an Agent asked to
+/// keep running is adopted here.
+///
+/// It runs as one background task per Environment, under the same per-Environment
+/// lock a mutation takes, so a start that arrives at the same moment waits for
+/// this rather than racing it. The Backend's `start` is idempotent and
+/// convergent, and the port registry hands back the same lease, so adopting a
+/// runtime that did survive is a no-op.
+fn spawn_adoption(app: Arc<AppState>) {
+    tokio::spawn(async move {
+        let projects = match app.state.list_projects() {
+            Ok(projects) => projects,
+            Err(err) => {
+                eprintln!("agentifyd: adoption could not read the Projects: {err:#}");
+                return;
+            }
+        };
+        for record in projects {
+            let desired = app
+                .state
+                .environment(&record.environment.id)
+                .ok()
+                .flatten()
+                .map(|environment| environment.desired_state)
+                .unwrap_or_default();
+            if desired != STATE_RUNNING {
+                continue;
+            }
+            let lock = app.env_lock(&record.environment.id);
+            let guard = lock.lock_owned().await;
+            match app.lifecycle.start(&app.state, &record).await {
+                Ok(status) => eprintln!(
+                    "agentifyd: adopted {}/{} ({})",
+                    record.name, record.environment.name, status.health
+                ),
+                Err(err) => eprintln!(
+                    "agentifyd: adopting {}/{} failed: {} ({})",
+                    record.name,
+                    record.environment.name,
+                    err.code(),
+                    err.detail()
+                ),
+            }
+            drop(guard);
+        }
+    });
 }
 
 async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> {
