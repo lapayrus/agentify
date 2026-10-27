@@ -40,7 +40,7 @@
       "icons/icon.ico"
     ],
     "externalBin": ["binaries/agentifyd", "binaries/agentify-mcp", "binaries/agentify"],
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
@@ -57,6 +57,14 @@
         "compression": "lzma",
         "installerHooks": "installer-hooks.nsh"
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZDODQ4OTI4ODE5NUIyNzUKUldSMXNwV0JLSW1FL0p5NmpqVGJmdElqbm1jMjc2NEhiYTNqWTlJWDdLaDBjQzFuYWU4azFjbmUK",
+      "endpoints": [
+        "https://github.com/lapayrus/agentify/releases/latest/download/latest.json"
+      ]
     }
   }
 }

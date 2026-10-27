@@ -20,6 +20,7 @@ fn main() -> ExitCode {
         "status" => status(),
         "bootstrap" => bootstrap(&args[1..]),
         "login-item" => login_item(&args[1..]),
+        "uninstall" => uninstall(&args[1..]),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS
@@ -50,6 +51,8 @@ Usage:
   agentify login-item install         start the daemon at logon (per-user task)
   agentify login-item status          is the login item registered?
   agentify login-item remove          take the login item out again
+  agentify uninstall                  remove login item, trust, and Caddy data
+  agentify uninstall --purge          also remove runtimes and the data root
 
   `agentify bootstrap` on its own only reports: it never installs WSL, enables a
   Windows feature, or asks for an administrator token. Consenting is a human
@@ -184,6 +187,80 @@ fn login_item(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `agentify uninstall [--purge]`.
+///
+/// Non-destructive by default: it removes the login item, the trusted root, and
+/// Caddy data, and leaves Projects and the state database. `--purge` is the
+/// explicit, confirmed removal that also deletes runtimes and the data root.
+fn uninstall(args: &[String]) -> ExitCode {
+    let purge = args.iter().any(|arg| arg == "--purge");
+    let data_root = agentify_proto::resolve_data_root();
+
+    // A running daemon holds state.db and its Caddy; stop it first so those files
+    // can be removed. Absence is not an error: there may be nothing to stop.
+    if let Err(err) = stop_daemon(&data_root) {
+        eprintln!("agentify: {err:#}");
+        return ExitCode::FAILURE;
+    }
+
+    match agentify_daemon::uninstall::run_system(&data_root, purge) {
+        Ok(report) => {
+            if purge {
+                println!("uninstall: purge complete");
+            } else {
+                println!("uninstall: complete; Projects and state are left in place");
+            }
+            if report.removed_login_item {
+                println!("  login item removed");
+            }
+            if report.removed_trust {
+                println!("  trusted root removed");
+            }
+            if report.removed_caddy {
+                println!("  Caddy data removed");
+            }
+            for distro in &report.removed_runtimes {
+                println!("  removed runtime {distro}");
+            }
+            if report.removed_data_root {
+                println!("  data root removed");
+            } else {
+                println!("  data root kept at {}", data_root.display());
+            }
+            for note in &report.notes {
+                println!("  note: {note}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("agentify: uninstall failed: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Ask a running daemon to shut down, then wait for its discovery file to
+/// disappear. Returns immediately when there is no daemon to stop.
+fn stop_daemon(data_root: &std::path::Path) -> anyhow::Result<()> {
+    let discovery_file = agentify_proto::discovery_path(data_root);
+    if !discovery_file.exists() {
+        return Ok(());
+    }
+
+    DaemonClient::new(data_root)
+        .shutdown()
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !discovery_file.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    anyhow::bail!("the daemon did not stop within 5 seconds")
 }
 
 fn run_daemon() -> ExitCode {

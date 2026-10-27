@@ -217,6 +217,38 @@ Caddy is not in the bundle yet. The daemon does not download it: ingress looks
 for `%LOCALAPPDATA%\Agentify\tools\caddy.exe` (or `AGENTIFY_CADDY`) and reports
 its typed `Missing` error until a pinned 2.10.2 binary is placed there.
 
+### Updates
+
+The shell updates itself through the Tauri updater plugin, and updates are built,
+signed, and published by a GitHub Actions workflow that pushes the NSIS bundle
+and the updater artifacts (`latest.json` + its signature) to a GitHub Release.
+The endpoint in `ui/src-tauri/tauri.conf.json` points at that release.
+
+To turn real updates on:
+
+1. Generate a minisign keypair:
+   `cd ui && npx tauri signer generate -w ~/.tauri/agentify-signing.key`
+2. Add the private key as the `TAURI_SIGNING_PRIVATE_KEY` repository secret.
+3. Paste the public key into `tauri.conf.json` under `plugins.updater.pubkey`
+   (replacing the `<REPLACE_WITH_MINISIGN_PUBLIC_KEY>` placeholder).
+4. Tag a release (`v0.1.1`) or run the `Release` workflow by hand.
+
+Before an update applies, the shell asks the daemon whether a mutation is in
+flight and refuses if one is. After the new daemon starts, its ordinary startup
+adoption brings desired-running Environments back and reports any that failed to
+adopt as degraded (`GET /v1/system/update_readiness` is the same gate).
+
+### Uninstall
+
+Uninstalling the app removes the login item, the trusted root, and Caddy data,
+and leaves Projects and `state.db` untouched. The confirmed, destructive removal
+is a separate command:
+
+```sh
+agentify uninstall            # non-destructive; Projects and state survive
+agentify uninstall --purge    # also delete runtimes, Checkpoints, and the data root
+```
+
 ## Data root and state
 
 * Default: `%LOCALAPPDATA%\Agentify\` on Windows, `~/Library/Application Support/Agentify/`

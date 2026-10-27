@@ -1,0 +1,43 @@
+name: Release
+
+# Signed updates are delivered through GitHub Releases. A tag or a manual run
+# builds the per-user NSIS bundle and the updater artifacts (latest.json + the
+# signature), signs them with TAURI_SIGNING_PRIVATE_KEY, and publishes them to a
+# GitHub Release. The app's updater endpoint points at that release's latest.json.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the shell's dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Build, sign, and publish the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        with:
+          projectPath: ui
+          tagName: v__VERSION__
+          releaseName: "Agentify v__VERSION__"
+          releaseBody: "Agentify v__VERSION__"
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true

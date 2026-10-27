@@ -40,4 +40,7 @@
   DetailPrint "Removing the Agentify daemon login item"
   ExecWait '"$INSTDIR\agentify.exe" login-item remove' $0
   DetailPrint "agentify login-item remove exited with $0"
+  DetailPrint "Removing the trusted root and Caddy data; Projects are left in place"
+  ExecWait '"$INSTDIR\agentify.exe" uninstall' $0
+  DetailPrint "agentify uninstall exited with $0"
 !macroend

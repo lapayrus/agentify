@@ -207,6 +207,17 @@ impl DaemonClient {
         self.get_json("/v1/handshake")
     }
 
+    /// `GET /v1/system/update_readiness`: whether a mutation is in flight, and
+    /// whether every desired-running Environment has been adopted and is healthy.
+    pub fn update_readiness(&self) -> Result<Value, ClientError> {
+        self.get_json("/v1/system/update_readiness")
+    }
+
+    /// `POST /v1/system/shutdown`: ask the daemon to shut down gracefully.
+    pub fn shutdown(&self) -> Result<Value, ClientError> {
+        self.post_json("/v1/system/shutdown", &serde_json::json!({}))
+    }
+
     /// `GET /v1/projects`.
     pub fn list_projects(&self) -> Result<Value, ClientError> {
         self.get_json("/v1/projects")

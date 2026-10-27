@@ -30,7 +30,8 @@ use agentify_proto::{
     Discovery, ExecRequest, ExecResponse, LogLineView, LogsResponse, OperationView, Problem,
     ProjectList,
     StatsResponse, Whoami, API_VERSION, APPROVAL_APPROVED, APPROVAL_DENIED, APPROVAL_EXPIRED,
-    APPROVAL_PENDING, DEV_ENVIRONMENT, OPERATION_WAITING_FOR_APPROVAL, STATE_RUNNING,
+    APPROVAL_PENDING, DEV_ENVIRONMENT, HEALTH_HEALTHY, OPERATION_WAITING_FOR_APPROVAL,
+    STATE_RUNNING,
 };
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
@@ -44,7 +45,7 @@ use axum::{Extension, Json, Router};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, OwnedMutexGuard};
+use tokio::sync::{oneshot, Notify, OwnedMutexGuard};
 use tokio::time::Instant;
 
 use crate::approval::{self, Destructive};
@@ -113,6 +114,9 @@ struct AppState {
     /// The startup handshake: what this build pins, what it found, and the
     /// sentence to show when the two disagree.
     handshake: crate::handshake::Handshake,
+    /// Signals the graceful-shutdown future that an API caller asked the daemon
+    /// to stop, so `POST /v1/system/shutdown` reuses the same exit path as Ctrl-C.
+    shutdown: Arc<Notify>,
 }
 
 impl AppState {
@@ -323,10 +327,13 @@ async fn serve(
         published.url
     );
 
+    let shutdown_notify = state.shutdown.clone();
+
     let graceful = async move {
         let shutdown = shutdown;
         tokio::select! {
             _ = shutdown => {}
+            _ = shutdown_notify.notified() => {}
             _ = tokio::signal::ctrl_c() => {}
         }
     };
@@ -476,6 +483,7 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
         redactors: Mutex::new(HashMap::new()),
         env_locks: Mutex::new(HashMap::new()),
         handshake,
+        shutdown: Arc::new(Notify::new()),
     };
     Ok((state, listener, discovery))
 }
@@ -522,6 +530,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/activity", get(activity))
         .route("/v1/operations/{id}", get(get_operation))
         .route("/v1/operations/{id}/wait", get(wait_operation))
+        .route("/v1/system/update_readiness", get(update_readiness))
+        .route("/v1/system/shutdown", post(shutdown_system))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_agent_token,
@@ -566,6 +576,73 @@ fn handshake_payload(app: &AppState) -> serde_json::Value {
         "components": app.handshake.report.components,
         "refusal": app.handshake.refusal,
     })
+}
+
+/// `GET /v1/system/update_readiness`: the two gates an update must clear before
+/// it may apply — no mutation in flight, and every desired-running Environment
+/// adopted and healthy.
+async fn update_readiness(State(app): State<Arc<AppState>>) -> Response {
+    let operations_in_flight = match app.state.has_running_operations() {
+        Ok(value) => value,
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                Some(format!("{err:#}")),
+            )
+        }
+    };
+
+    let (projects, environments) = match (app.state.list_projects(), app.state.list_environments()) {
+        (Ok(projects), Ok(environments)) => (projects, environments),
+        (Err(err), _) | (_, Err(err)) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                Some(format!("{err:#}")),
+            )
+        }
+    };
+
+    let names: HashMap<String, String> = projects
+        .iter()
+        .map(|project| (project.environment.id.clone(), project.name.clone()))
+        .collect();
+
+    let mut degraded_projects = Vec::new();
+    for environment in &environments {
+        if environment.desired_state != STATE_RUNNING {
+            continue;
+        }
+        let adopted = environment.observed_state == STATE_RUNNING
+            && environment.health == HEALTH_HEALTHY;
+        if !adopted {
+            degraded_projects.push(
+                names
+                    .get(&environment.id)
+                    .cloned()
+                    .unwrap_or_else(|| environment.id.clone()),
+            );
+        }
+    }
+
+    Json(serde_json::json!({
+        "operations_in_flight": operations_in_flight,
+        "adopted": degraded_projects.is_empty(),
+        "degraded_projects": degraded_projects,
+    }))
+    .into_response()
+}
+
+/// `POST /v1/system/shutdown`: the API path the updater and uninstaller use to
+/// stop the daemon before swapping or deleting its files.
+async fn shutdown_system(State(app): State<Arc<AppState>>) -> Response {
+    app.shutdown.notify_one();
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "status": "shutting_down" })),
+    )
+        .into_response()
 }
 
 async fn whoami(State(app): State<Arc<AppState>>, Extension(caller): Extension<Caller>) -> Json<Whoami> {

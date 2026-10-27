@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use serde::Serialize;
+use tauri_plugin_updater::UpdaterExt;
 
 /// What the shell shows in its header, rail, and main pane.
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +74,22 @@ pub fn handshake_for(data_root: &Path) -> Option<serde_json::Value> {
     agentify_proto::client::DaemonClient::new(data_root)
         .handshake()
         .ok()
+}
+
+/// The update gate: is a mutation in flight, and has every desired-running
+/// Environment been adopted and found healthy?
+pub fn readiness_for(data_root: &Path) -> Result<serde_json::Value, String> {
+    agentify_proto::client::DaemonClient::new(data_root)
+        .update_readiness()
+        .map_err(|err| err.to_string())
+}
+
+/// Ask the daemon to stop, so an update can swap its files or an uninstall can
+/// delete them.
+pub fn shutdown_for(data_root: &Path) -> Result<serde_json::Value, String> {
+    agentify_proto::client::DaemonClient::new(data_root)
+        .shutdown()
+        .map_err(|err| err.to_string())
 }
 
 /// The Environment's status snapshot, as the daemon serves it.
@@ -410,6 +427,93 @@ fn environment_action(project: String, action: String) -> ActionResult {
     environment_action_for(&data_root(), &project, &action)
 }
 
+// ---- updates and uninstall -------------------------------------------------
+//
+// The shell is a thin client here too: it asks the daemon whether an update is
+// safe, asks it to stop before files are swapped or deleted, and lets the Tauri
+// updater plugin move the bits. The daemon's startup adoption is what brings
+// running Environments back after the new daemon starts.
+
+/// The daemon's update gate, for a "check for updates" that refuses politely.
+#[tauri::command]
+fn update_readiness() -> Result<serde_json::Value, String> {
+    readiness_for(&data_root())
+}
+
+/// Stop the daemon so its sidecar can be replaced or removed.
+#[tauri::command]
+fn shutdown_daemon() -> Result<serde_json::Value, String> {
+    shutdown_for(&data_root())
+}
+
+/// The daemon sidecar, beside this shell. The installer stages all four binaries
+/// in one directory, so the shell can always start its own daemon.
+fn daemon_binary() -> std::path::PathBuf {
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("agentify-shell.exe"));
+    let dir = exe
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    dir.join(if cfg!(windows) { "agentifyd.exe" } else { "agentifyd" })
+}
+
+/// Stop the old daemon and start the one beside this shell, so an updated build
+/// takes over and adopts the runtimes it left running.
+#[tauri::command]
+fn restart_daemon() -> Result<(), String> {
+    let _ = shutdown_for(&data_root());
+    std::process::Command::new(daemon_binary())
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("starting the daemon failed: {err}"))
+}
+
+/// The update the updater knows about, or `null` when there is none.
+#[derive(Debug, Clone, Serialize)]
+struct UpdateInfo {
+    version: String,
+    body: Option<String>,
+}
+
+/// Ask the Tauri updater what is available.
+#[tauri::command]
+async fn update_check(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let updater = app.updater().map_err(|err| err.to_string())?;
+    let update = updater.check().await.map_err(|err| err.to_string())?;
+    Ok(update.map(|update| UpdateInfo {
+        version: update.version.clone(),
+        body: update.body.clone(),
+    }))
+}
+
+/// Download and install the available update, refusing while a mutation is in
+/// flight. The install restarts the shell; `restart_daemon` is what brings the
+/// daemon up on the new build afterwards.
+#[tauri::command]
+async fn update_install(app: tauri::AppHandle) -> Result<(), String> {
+    let readiness =
+        readiness_for(&data_root()).map_err(|err| format!("cannot ask the daemon: {err}"))?;
+    if readiness
+        .get("operations_in_flight")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return Err("an operation is in flight; try the update again when it finishes".to_string());
+    }
+
+    let updater = app.updater().map_err(|err| err.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "no update is available".to_string())?;
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|err| err.to_string())
+}
+
 /// Start the shell.
 pub fn run() {
     // Windows relaunches the app from the per-user `RunOnce` entry after the
@@ -425,6 +529,7 @@ pub fn run() {
     }
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             bootstrap_status,
@@ -437,7 +542,12 @@ pub fn run() {
             environment_action,
             approvals,
             activity,
-            decide_approval
+            decide_approval,
+            update_readiness,
+            shutdown_daemon,
+            restart_daemon,
+            update_check,
+            update_install
         ])
         .run(tauri::generate_context!())
         .expect("the Agentify shell failed to start");

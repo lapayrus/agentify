@@ -984,6 +984,21 @@ impl State {
         })
     }
 
+    /// Is any mutation still in flight? A running operation and an operation
+    /// waiting for a human Approval both count: neither has finished, so an
+    /// update must not apply while either is open.
+    pub fn has_running_operations(&self) -> Result<bool> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM operations WHERE state IN ('running', 'waiting_for_approval')
+                 )",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     // ---- idempotency -------------------------------------------------------
 
     pub fn idempotency(&self, key: &str) -> Result<Option<IdempotencyRecord>> {
