@@ -97,6 +97,30 @@ impl Report {
 /// Run every case against one Backend. `base` names the Environments, so two
 /// runs against the same backend do not collide.
 pub async fn run_conformance<B: Backend + ?Sized>(backend: &B, base: &str) -> Report {
+    let mut cases = lifecycle_cases(backend, base).await;
+    cases.extend(workload_cases(backend, base).await);
+    let info = backend.describe();
+    Report {
+        backend: format!("{} {}", info.name, info.version),
+        cases,
+    }
+}
+
+/// Run only the lifecycle half: provision, report, stop, and destroy. An
+/// adapter that has not implemented exec, logs, stats, or copy yet still runs
+/// the same table for the part it does serve — [crate::wsl] does exactly that
+/// until its exec and logs ticket lands.
+pub async fn run_lifecycle_conformance<B: Backend + ?Sized>(backend: &B, base: &str) -> Report {
+    let cases = lifecycle_cases(backend, base).await;
+    let info = backend.describe();
+    Report {
+        backend: format!("{} {}", info.name, info.version),
+        cases,
+    }
+}
+
+/// The cases every Backend must pass before it can host an Environment.
+async fn lifecycle_cases<B: Backend + ?Sized>(backend: &B, base: &str) -> Vec<Case> {
     let info = backend.describe();
     let mut cases = Vec::new();
 
@@ -246,6 +270,58 @@ pub async fn run_conformance<B: Backend + ?Sized>(backend: &B, base: &str) -> Re
     );
 
     cases.push(
+        run_case("unsupported_capabilities_are_typed", {
+            let env = format!("{base}-caps");
+            let info = info.clone();
+            async move {
+                // A capability the Backend does not advertise must fail with
+                // `Unsupported`, never with a generic error or a panic.
+                if !info.capabilities.checkpoint {
+                    match backend.checkpoint(&env).await {
+                        Err(BackendError::Unsupported { capability, .. }) => {
+                            if capability.trim().is_empty() {
+                                return Err("Unsupported must name the capability".to_string());
+                            }
+                        }
+                        Err(other) => {
+                            return Err(format!("an unsupported checkpoint failed with {other}"))
+                        }
+                        Ok(_) => {
+                            return Err(
+                                "the Backend claimed no checkpoint support but created one"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }
+                if !info.capabilities.events {
+                    match backend.events(&env).await {
+                        Err(BackendError::Unsupported { .. }) => {}
+                        Err(other) => return Err(format!("unsupported events failed with {other}")),
+                        Ok(_) => {
+                            return Err(
+                                "the Backend claimed no events support but opened a stream"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }
+                Ok(())
+            }
+        })
+        .await,
+    );
+
+    cases
+}
+
+/// The workload half: exec, cancellation, logs, stats, copy, and the typed
+/// `NotProvisioned` an unknown Environment earns. An adapter that has not
+/// reached this ticket returns `Unsupported` for these commands instead.
+async fn workload_cases<B: Backend + ?Sized>(backend: &B, base: &str) -> Vec<Case> {
+    let mut cases = Vec::new();
+
+    cases.push(
         run_case("exec_returns_stdout_stderr_and_exit_code", {
             let env = format!("{base}-exec");
             async move {
@@ -393,49 +469,6 @@ pub async fn run_conformance<B: Backend + ?Sized>(backend: &B, base: &str) -> Re
     );
 
     cases.push(
-        run_case("unsupported_capabilities_are_typed", {
-            let env = format!("{base}-caps");
-            let info = info.clone();
-            async move {
-                // A capability the Backend does not advertise must fail with
-                // `Unsupported`, never with a generic error or a panic.
-                if !info.capabilities.checkpoint {
-                    match backend.checkpoint(&env).await {
-                        Err(BackendError::Unsupported { capability, .. }) => {
-                            if capability.trim().is_empty() {
-                                return Err("Unsupported must name the capability".to_string());
-                            }
-                        }
-                        Err(other) => {
-                            return Err(format!("an unsupported checkpoint failed with {other}"))
-                        }
-                        Ok(_) => {
-                            return Err(
-                                "the Backend claimed no checkpoint support but created one"
-                                    .to_string(),
-                            )
-                        }
-                    }
-                }
-                if !info.capabilities.events {
-                    match backend.events(&env).await {
-                        Err(BackendError::Unsupported { .. }) => {}
-                        Err(other) => return Err(format!("unsupported events failed with {other}")),
-                        Ok(_) => {
-                            return Err(
-                                "the Backend claimed no events support but opened a stream"
-                                    .to_string(),
-                            )
-                        }
-                    }
-                }
-                Ok(())
-            }
-        })
-        .await,
-    );
-
-    cases.push(
         run_case("an_unknown_environment_is_not_provisioned", {
             let env = format!("{base}-unknown");
             async move {
@@ -494,10 +527,7 @@ pub async fn run_conformance<B: Backend + ?Sized>(backend: &B, base: &str) -> Re
         .await,
     );
 
-    Report {
-        backend: format!("{} {}", info.name, info.version),
-        cases,
-    }
+    cases
 }
 
 /// Run one case, turning a `skip` marker into [`Outcome::Skipped`].

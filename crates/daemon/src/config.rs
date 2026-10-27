@@ -65,8 +65,11 @@ pub const DEFAULT_LOG_TAIL: usize = 200;
 /// Default host port range the daemon leases from.
 pub const DEFAULT_LEASE_RANGE: PortRange = PortRange::new(40000, 40999);
 
-/// The only Backend that exists in v0.
+/// The scripted Backend: deterministic, substrate-free, and the default.\r
 pub const BACKEND_FAKE: &str = "fake";
+
+/// One WSL2 distro per Project. Windows only.\r
+pub const BACKEND_WSL: &str = "wsl";
 
 #[derive(Debug, Clone)]
 pub struct Config {
