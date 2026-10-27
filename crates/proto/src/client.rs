@@ -13,6 +13,10 @@ use serde_json::Value;
 /// Request timeout for a read.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long the liveness probe waits. This is the call a caller makes *before*
+/// it decides whether a data root is worth talking to, so it must not hang.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Mutations block until the daemon finishes: a cold start builds images and can
 /// take minutes. The daemon's own operation timeout is the real bound; this one
 /// only has to be larger than it.
@@ -199,6 +203,16 @@ impl DaemonClient {
     /// `GET /v1/whoami`.
     pub fn whoami(&self) -> Result<Value, ClientError> {
         self.get_json("/v1/whoami")
+    }
+
+    /// `GET /v1/healthz` without a token: liveness and the daemon's own build.
+    ///
+    /// The route is unauthenticated on purpose, so this works on a data root
+    /// whose token is stale — which is exactly when a caller needs to ask.
+    pub fn healthz(&self) -> Result<Value, ClientError> {
+        let discovery = self.discovery()?;
+        let url = format!("{}/v1/healthz", discovery.url);
+        parse(ureq::get(&url).timeout(PROBE_TIMEOUT).call(), &url)
     }
 
     /// `GET /v1/handshake`: the pinned versions, what the daemon found, and the

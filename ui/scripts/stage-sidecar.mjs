@@ -35,6 +35,9 @@ const profile =
   process.argv.includes("--debug") || process.env.AGENTIFY_SIDECAR_PROFILE === "debug"
     ? "debug"
     : "release";
+// Cargo's development profile is `dev`; `debug` is only its output directory
+// name, and `cargo build --profile debug` is rejected as reserved.
+const cargoProfile = profile === "debug" ? "dev" : profile;
 
 /** The host target triple: what Tauri expects in `binaries/<name>-<triple>.exe`. */
 function hostTriple() {
@@ -53,7 +56,7 @@ const targetDir = process.env.CARGO_TARGET_DIR
   ? path.resolve(repoRoot, process.env.CARGO_TARGET_DIR)
   : path.join(repoRoot, "target");
 
-const args = ["build", "--profile", profile];
+const args = ["build", "--profile", cargoProfile];
 for (const { pkg } of SIDECARS) {
   args.push("-p", pkg);
 }

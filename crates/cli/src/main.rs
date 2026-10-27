@@ -9,13 +9,14 @@ use std::process::ExitCode;
 
 use agentify_bootstrap::{Bootstrap, BootstrapState, Consent, RESUME_FLAG};
 use agentify_proto::client::DaemonClient;
+use agentify_proto::lifecycle::{Stop, SystemProcesses};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("help");
 
     match command {
-        "daemon" => run_daemon(),
+        "daemon" => run_daemon(&args[1..]),
         "whoami" => whoami(),
         "status" => status(),
         "revoke-token" => revoke_token(),
@@ -44,6 +45,8 @@ fn usage() {
 
 Usage:
   agentify daemon                     run the daemon in the foreground
+  agentify daemon stop                stop a running daemon (0 = stopped or absent;
+                                      2 = an operation is in flight)
   agentify status                     report whether the daemon is reachable
   agentify whoami                     print the daemon's whoami payload as JSON
   agentify revoke-token               revoke the discovery token (the next daemon
@@ -186,7 +189,9 @@ fn login_item(args: &[String]) -> ExitCode {
             }
         },
         other => {
-            eprintln!("agentify: unknown login-item action {other:?}; use install, status, or remove");
+            eprintln!(
+                "agentify: unknown login-item action {other:?}; use install, status, or remove"
+            );
             ExitCode::FAILURE
         }
     }
@@ -244,29 +249,64 @@ fn uninstall(args: &[String]) -> ExitCode {
     }
 }
 
-/// Ask a running daemon to shut down, then wait for its discovery file to
-/// disappear. Returns immediately when there is no daemon to stop.
+/// Ask a running daemon to stop, whatever build it is.
+///
+/// A missing or stale discovery file is "nothing to stop", never a failure: an
+/// uninstall must finish after a crash. An Operation in flight is the one
+/// refusal — swapping or deleting files underneath it would lose work.
 fn stop_daemon(data_root: &std::path::Path) -> anyhow::Result<()> {
-    let discovery_file = agentify_proto::discovery_path(data_root);
-    if !discovery_file.exists() {
-        return Ok(());
+    match agentify_proto::lifecycle::stop(data_root, &SystemProcesses) {
+        Ok(Stop::Busy { pid, found }) => anyhow::bail!(
+            "the daemon (pid {pid}, {found}) has an Operation in flight; wait for it to finish, then uninstall again"
+        ),
+        Ok(_) => Ok(()),
+        Err(err) => Err(anyhow::anyhow!("{err}")),
     }
-
-    DaemonClient::new(data_root)
-        .shutdown()
-        .map_err(|err| anyhow::anyhow!("{err}"))?;
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if !discovery_file.exists() {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    anyhow::bail!("the daemon did not stop within 5 seconds")
 }
 
-fn run_daemon() -> ExitCode {
+/// `agentify daemon stop`.
+///
+/// Exit codes: 0 when nothing was running or it stopped, 2 when an Operation is
+/// in flight, 1 on a real failure. The installer uses 2 to refuse an
+/// install-over rather than terminate work in progress.
+fn stop_daemon_command() -> ExitCode {
+    let data_root = agentify_proto::resolve_data_root();
+    match agentify_proto::lifecycle::stop(&data_root, &SystemProcesses) {
+        Ok(Stop::NotRunning) => {
+            println!("daemon: not running");
+            ExitCode::SUCCESS
+        }
+        Ok(Stop::Stopped { pid, found }) => {
+            println!(
+                "daemon: stopped pid {pid} ({})",
+                found.unwrap_or_else(|| "unknown build".to_string())
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Stop::Busy { pid, found }) => {
+            eprintln!(
+                "agentify: the daemon (pid {pid}, {found}) has an Operation in flight; wait for it to finish, then retry"
+            );
+            ExitCode::from(2)
+        }
+        Err(err) => {
+            eprintln!("agentify: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_daemon(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("stop") => return stop_daemon_command(),
+        Some(other) => {
+            eprintln!(
+                "agentify: unknown daemon action {other:?}; run `agentify daemon`, or `agentify daemon stop`"
+            );
+            return ExitCode::FAILURE;
+        }
+        None => {}
+    }
     match agentify_daemon::Config::from_env().and_then(agentify_daemon::start_in_background) {
         Ok(running) => {
             println!(
@@ -294,7 +334,10 @@ fn whoami() -> ExitCode {
     let client = DaemonClient::from_env();
     match client.whoami() {
         Ok(payload) => {
-            println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
             ExitCode::SUCCESS
         }
         Err(err) => {

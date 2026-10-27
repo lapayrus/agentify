@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use agentify_proto::lifecycle::{self, EnsureError, Stop, SystemProcesses};
 use serde::Serialize;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -33,6 +34,9 @@ pub enum DaemonStatus {
     },
     /// The daemon is not running, or its discovery file is unusable.
     Unreachable { reason: String, data_root: String },
+    /// A daemon from another build is running an Operation. The shell refused
+    /// to replace it — killing it would lose work — so it is not driving it.
+    Busy { reason: String, data_root: String },
 }
 
 /// Resolve the daemon's state for a data root.
@@ -93,7 +97,10 @@ pub fn shutdown_for(data_root: &Path) -> Result<serde_json::Value, String> {
 }
 
 /// The Environment's status snapshot, as the daemon serves it.
-pub fn environment_status_for(data_root: &Path, project: &str) -> Result<serde_json::Value, String> {
+pub fn environment_status_for(
+    data_root: &Path,
+    project: &str,
+) -> Result<serde_json::Value, String> {
     agentify_proto::client::DaemonClient::new(data_root)
         .environment_status(project, agentify_proto::DEV_ENVIRONMENT)
         .map_err(|err| err.to_string())
@@ -114,13 +121,7 @@ pub fn environment_logs_for(
     since: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     agentify_proto::client::DaemonClient::new(data_root)
-        .logs(
-            project,
-            agentify_proto::DEV_ENVIRONMENT,
-            None,
-            tail,
-            since,
-        )
+        .logs(project, agentify_proto::DEV_ENVIRONMENT, None, tail, since)
         .map_err(|err| err.to_string())
 }
 
@@ -155,7 +156,9 @@ pub fn environment_action_for(data_root: &Path, project: &str, action: &str) -> 
                 ok: false,
                 status: None,
                 code: Some("ValidationFailed".to_string()),
-                detail: Some(format!("unknown action {other:?}; start or stop an Environment")),
+                detail: Some(format!(
+                    "unknown action {other:?}; start or stop an Environment"
+                )),
                 operation_id: None,
             }
         }
@@ -222,11 +225,7 @@ pub fn bootstrap_resume_for(data_root: &Path, program: &Path) -> agentify_bootst
 fn bootstrap(data_root: &Path, program: &Path) -> agentify_bootstrap::Bootstrap {
     // The resume entry relaunches *this* app with the flag, so Windows finishes
     // the install at the next sign-in without a second prompt.
-    agentify_bootstrap::Bootstrap::system(
-        data_root,
-        program,
-        &[agentify_bootstrap::RESUME_FLAG],
-    )
+    agentify_bootstrap::Bootstrap::system(data_root, program, &[agentify_bootstrap::RESUME_FLAG])
 }
 
 /// The shell executable, which is what a `RunOnce` entry has to relaunch.
@@ -244,9 +243,7 @@ pub fn approvals_for(
     limit: Option<usize>,
 ) -> Result<serde_json::Value, String> {
     let client = agentify_proto::client::DaemonClient::new(data_root);
-    let mut payload = client
-        .approvals(state)
-        .map_err(|err| err.to_string())?;
+    let mut payload = client.approvals(state).map_err(|err| err.to_string())?;
     if let Some(limit) = limit {
         if let Some(approvals) = payload
             .get_mut("approvals")
@@ -260,10 +257,7 @@ pub fn approvals_for(
 
 /// The audit chain as the activity feed serves it: newest first, with its
 /// verdict.
-pub fn activity_for(
-    data_root: &Path,
-    limit: Option<usize>,
-) -> Result<serde_json::Value, String> {
+pub fn activity_for(data_root: &Path, limit: Option<usize>) -> Result<serde_json::Value, String> {
     agentify_proto::client::DaemonClient::new(data_root)
         .activity(limit)
         .map_err(|err| err.to_string())
@@ -344,7 +338,14 @@ pub fn decide_approval_for(
 
 #[tauri::command]
 fn daemon_status() -> DaemonStatus {
-    status_for(&data_root())
+    let root = data_root();
+    if let Some(reason) = { blocked().as_ref().cloned() } {
+        return DaemonStatus::Busy {
+            reason,
+            data_root: root.display().to_string(),
+        };
+    }
+    status_for(&root)
 }
 
 /// The first-run state, for the setup card. A read: no elevation.
@@ -450,8 +451,7 @@ fn shutdown_daemon() -> Result<serde_json::Value, String> {
 /// binary in one directory, so the shell can always find its own daemon and MCP
 /// shim.
 fn sidecar_binary(name: &str) -> PathBuf {
-    let exe =
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentify-shell.exe"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentify-shell.exe"));
     let dir = exe
         .parent()
         .map(Path::to_path_buf)
@@ -477,11 +477,17 @@ fn mcp_binary() -> PathBuf {
 /// takes over and adopts the runtimes it left running.
 #[tauri::command]
 fn restart_daemon() -> Result<(), String> {
-    let _ = shutdown_for(&data_root());
+    if let Stop::Busy { pid, found } = lifecycle::stop(&data_root(), &SystemProcesses)? {
+        return Err(format!(
+            "the daemon (pid {pid}, {found}) has an Operation in flight; wait for it to finish, then retry"
+        ));
+    }
     std::process::Command::new(daemon_binary())
         .spawn()
         .map(|_| ())
-        .map_err(|err| format!("starting the daemon failed: {err}"))
+        .map_err(|err| format!("starting the daemon failed: {err}"))?;
+    clear_blocked();
+    Ok(())
 }
 
 /// The tools the MCP shim advertises, in the order the README documents them.
@@ -608,9 +614,14 @@ async fn update_install(app: tauri::AppHandle) -> Result<(), String> {
     }
 
     // Stop the sidecar before the installer runs: a live `agentifyd.exe` holds
-    // the old file and would make the replacement fail. The restarted shell
-    // starts the new daemon from the install directory.
-    let _ = shutdown_for(&data_root());
+    // the old file and would make the replacement fail. A daemon that is gone is
+    // fine; one with an Operation in flight is not, and is reported rather than
+    // killed.
+    if let Stop::Busy { pid, found } = lifecycle::stop(&data_root(), &SystemProcesses)? {
+        return Err(format!(
+            "the daemon (pid {pid}, {found}) has an Operation in flight; try the update again when it finishes"
+        ));
+    }
 
     let updater = app.updater().map_err(|err| err.to_string())?;
     let update = updater
@@ -624,25 +635,53 @@ async fn update_install(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
-/// Start the daemon beside this shell when it is not already running.
+/// The reason the shell is not driving the daemon it found. Set only when a
+/// daemon from another build refused to be replaced because it is mid-Operation.
+static BLOCKED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn blocked() -> std::sync::MutexGuard<'static, Option<String>> {
+    BLOCKED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn clear_blocked() {
+    *blocked() = None;
+}
+
+/// Start the daemon beside this shell unless this build's daemon is already
+/// running.
 ///
-/// The login item starts it at logon, so a shell that opens later finds it
-/// already there. This covers the first launch right after install, before the
-/// next logon, and any launch where the daemon has been stopped.
+/// A discovery file is not proof: it may name a dead process, a daemon from an
+/// older build, or one the MCP shim started. The reconciliation decides, and a
+/// daemon with an Operation in flight is left alone — that is the one case the
+/// shell reports instead of fixing.
+pub fn ensure_daemon_at(
+    data_root: &Path,
+    expected_version: &str,
+    spawn: impl FnOnce() -> Result<(), String>,
+) -> Result<agentify_proto::lifecycle::Ensure, EnsureError> {
+    lifecycle::ensure(data_root, expected_version, &SystemProcesses, spawn)
+}
+
+/// Start the daemon beside this shell when this build's daemon is not already
+/// running. A no-op when it is.
 fn ensure_daemon() {
-    let discovery = agentify_proto::discovery_path(&data_root());
-    if discovery.exists() {
-        return;
-    }
-    let _ = std::process::Command::new(daemon_binary()).spawn();
-    // Give the daemon a moment to publish its discovery file before the UI's
-    // first status read, so a first launch does not flash the unreachable card.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if discovery.exists() {
-            return;
+    let outcome = ensure_daemon_at(&data_root(), env!("CARGO_PKG_VERSION"), || {
+        std::process::Command::new(daemon_binary())
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| format!("starting {} failed: {err}", daemon_binary().display()))
+    });
+    match outcome {
+        Ok(_) => clear_blocked(),
+        Err(EnsureError::Busy { pid, found }) => {
+            *blocked() = Some(format!(
+                "the running daemon (pid {pid}) is build {found} and has an Operation in flight; \
+                 wait for it to finish, then reopen Agentify"
+            ));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        Err(err) => eprintln!("agentify: {err}"),
     }
 }
 

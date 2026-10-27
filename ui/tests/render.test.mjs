@@ -217,6 +217,28 @@ test("an unreachable daemon shows a distinct connection state, not the empty sta
   assert.doesNotMatch(header, /daemon connected/);
 });
 
+test("a daemon from another build that is mid-Operation is blocked, not replaced", () => {
+  const busy = {
+    state: "busy",
+    reason:
+      "the running daemon (pid 6496) is build 0.1.2 and has an Operation in flight; wait for it to finish, then reopen Agentify",
+  };
+  const main = renderMain(busy);
+  assert.match(main, /data-state="daemon-busy"/);
+  assert.match(main, /Daemon busy/);
+  assert.match(main, /Operation in flight/);
+  assert.match(main, /reopen Agentify/);
+  assert.doesNotMatch(main, /data-action="retry"/, "there is nothing to retry until the work ends");
+  assert.doesNotMatch(main, /data-empty="projects"/);
+
+  const header = renderHeader(busy);
+  assert.match(header, /daemon blocked/);
+  assert.doesNotMatch(header, /daemon connected/);
+
+  const side = renderSide({ state: "busy", inbox });
+  assert.match(side, /once the daemon answers/);
+});
+
 test("the loading state is neither connected nor an error", () => {
   const header = renderHeader({ state: "loading" });
   assert.match(header, /connecting/);

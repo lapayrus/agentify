@@ -28,6 +28,24 @@
     DetailPrint "Agentify installs to $INSTDIR; its data root stays in $LOCALAPPDATA\${PRODUCTNAME}"
     SetOutPath $INSTDIR
   ${EndIf}
+
+  ; Stop the daemon of the version being replaced before a single sidecar is
+  ; overwritten: Windows refuses to replace an executable that is still running.
+  ; This release's CLI drains the daemon and answers 2 when an Operation is in
+  ; flight, so the install is refused rather than killing work. An installation
+  ; from an older build has a CLI without `daemon stop`; that case falls back to
+  ; terminating the image, because the old build cannot report in-flight work.
+  DetailPrint "Stopping a running Agentify daemon"
+  ExecWait '"$INSTDIR\agentify.exe" daemon stop' $0
+  DetailPrint "agentify daemon stop exited with $0"
+  ${If} $0 == 2
+    MessageBox MB_OK|MB_ICONEXCLAMATION "An Agentify operation is in flight. Let it finish, then run the installer again."
+    Abort
+  ${ElseIf} $0 != 0
+    ExecWait 'taskkill /F /IM agentifyd.exe' $1
+    DetailPrint "taskkill agentifyd exited with $1"
+    Sleep 500
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL

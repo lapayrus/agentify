@@ -17,6 +17,8 @@ function connectionLabel(status) {
       return "daemon connected";
     case "unreachable":
       return "daemon unreachable";
+    case "busy":
+      return "daemon blocked";
     default:
       return "connecting…";
   }
@@ -35,6 +37,10 @@ function dotClass(status) {
       return "dot dot-connected";
     case "unreachable":
       return "dot dot-unreachable";
+    case "busy":
+      // A daemon from another build is reachable but not usable; neutral, not
+      // an alarm: nothing is broken, work is simply in progress.
+      return "dot dot-loading";
     default:
       return "dot dot-loading";
   }
@@ -751,6 +757,11 @@ export function renderMcp(status) {
   }
 
   const connected = status?.state === "connected";
+  const daemonLabel = connected
+    ? "connected"
+    : status?.state === "busy"
+      ? "blocked by an operation in flight"
+      : "unreachable";
   const availability = info.available
     ? `<span class="pill pill-ok">shim found</span>`
     : `<span class="pill pill-warn">shim not found beside this app</span>`;
@@ -768,7 +779,7 @@ ${warning}
   <section class="card" data-card="mcp-status">
     <h2>Connector status</h2>
     <dl class="facts">
-      <div><dt>daemon</dt><dd>${connected ? "connected" : "unreachable"}</dd></div>
+      <div><dt>daemon</dt><dd>${daemonLabel}</dd></div>
       <div><dt>shim</dt><dd>${availability}</dd></div>
       <div><dt>transport</dt><dd>stdio (JSON-RPC)</dd></div>
       <div><dt>command</dt><dd><code>${escapeHtml(info.command)}</code></dd></div>
@@ -897,6 +908,19 @@ function renderUnreachable(reason) {
 </main>`;
 }
 
+/**
+ * The blocked pane: a daemon from another build is mid-Operation, so the shell
+ * refused to replace it. Replacing it would discard the work; the only useful
+ * action is to let it finish and reopen Agentify.
+ */
+function renderBlocked(reason) {
+  return `<main class="main" data-state="daemon-busy">
+  <h1>Daemon busy</h1>
+  <p class="reason">${escapeHtml(reason ?? "A daemon from another build is finishing an operation.")}</p>
+  <p class="lede">Agentify found a daemon it did not ship and did not replace it, because an Operation is in flight. Let it finish, then reopen Agentify: a fresh launch replaces the old daemon and starts the one this build ships.</p>
+</main>`;
+}
+
 function renderLoading() {
   return `<main class="main" data-state="loading">
   <h1>Connecting to the daemon</h1>
@@ -920,6 +944,9 @@ export function renderMain(status) {
   }
   if (status.state === "unreachable") {
     return renderUnreachable(status.reason);
+  }
+  if (status.state === "busy") {
+    return renderBlocked(status.reason);
   }
   return renderLoading();
 }

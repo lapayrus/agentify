@@ -4,6 +4,17 @@ A local, agent-native environment manager. It gives each Project its own isolate
 
 ## Language
 
+**Daemon**:
+The process that owns Project state, port leases, health, Checkpoints, and the `/v1` API. It is app-scoped: the
+shell or the MCP shim starts one on demand, and it stops when its owner exits. Never a login
+item, a Scheduled Task, or a Windows service.
+_Avoid_: server, backend (a Backend is the runtime substrate), service
+
+**Stray daemon**:
+A daemon a caller does not ship: a live process answering with another build's version, or a discovery file
+naming a process that is gone. A caller stops a stray daemon before starting its own, and never drives it.
+_Avoid_: orphan, zombie, stale process
+
 **Project**:
 A named workspace bound to one host directory that owns one or more Environments.
 _Avoid_: workspace, app, repo

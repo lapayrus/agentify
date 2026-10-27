@@ -12,3 +12,9 @@
 - [ ] The discovery file ACL is limited to the current user.
 - [ ] API, daemon, MCP, Caddy, and adapter versions are pinned; a mismatch returns `VersionMismatch` and refuses the Backend.
 - [ ] Installing over an existing version keeps Projects and state.
+
+## Comments
+
+- The login-item criterion above ("starts at login … works with the UI closed") is superseded by
+  [ADR-0006](../../../docs/adr/0006-daemon-lifetime-follows-the-app.md). The daemon is now app-scoped and
+  on-demand; see `.scratch/install-lifecycle/`.

@@ -15,6 +15,7 @@ mod paths;
 mod project;
 
 pub mod client;
+pub mod lifecycle;
 pub mod versions;
 
 pub use approval::{

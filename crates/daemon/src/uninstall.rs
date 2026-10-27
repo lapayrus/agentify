@@ -99,6 +99,11 @@ pub fn run(
     // Projects, their runtimes, and the state database stay in the first.
     let removed_caddy = remove_dir(root.ingress()) && remove_file(root.tools().join("caddy.exe"));
 
+    // The discovery file is runtime state, not user data: a removed app must not
+    // leave one naming a process that no longer exists. A graceful exit already
+    // removes it; a crash, a killed daemon, or a stale file does not.
+    let _ = remove_file(root.discovery_file());
+
     let mut report = UninstallReport {
         removed_trust,
         removed_login_item,
@@ -124,7 +129,6 @@ pub fn run(
             let _ = remove_dir(directory);
         }
         let _ = remove_file(root.state_db());
-        let _ = remove_file(root.discovery_file());
 
         report.removed_data_root = remove_dir(root.path().to_path_buf());
         if report.removed_data_root {
@@ -262,6 +266,10 @@ mod tests {
         assert!(data.checkpoints().exists(), "Checkpoints must survive");
         assert!(!data.ingress().exists(), "Caddy data must go");
         assert!(!data.tools().join("caddy.exe").exists(), "the staged Caddy binary must go");
+        assert!(
+            !data.discovery_file().exists(),
+            "the discovery file is runtime state, not user data: it must not outlive an uninstall"
+        );
     }
 
     #[test]
