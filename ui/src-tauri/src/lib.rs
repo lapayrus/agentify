@@ -24,6 +24,10 @@ pub enum DaemonStatus {
         /// shell does not claim there are none.
         #[serde(rename = "projectsError", skip_serializing_if = "Option::is_none")]
         projects_error: Option<String>,
+        /// The startup handshake: pinned versions, what was found, and the
+        /// refusal when an adapter is on another major. `null` when the daemon
+        /// could not be asked, which is not the same as "everything matches".
+        handshake: Option<serde_json::Value>,
         data_root: String,
     },
     /// The daemon is not running, or its discovery file is unusable.
@@ -50,6 +54,7 @@ pub fn status_for(data_root: &Path) -> DaemonStatus {
                 whoami,
                 projects,
                 projects_error,
+                handshake: handshake_for(data_root),
                 data_root: data_root.display().to_string(),
             }
         }
@@ -58,6 +63,16 @@ pub fn status_for(data_root: &Path) -> DaemonStatus {
             data_root: data_root.display().to_string(),
         },
     }
+}
+
+/// The daemon's version handshake, or `None` when it cannot be read.
+///
+/// A handshake that cannot be read is not a handshake that passed: the shell
+/// shows the absence rather than claiming the versions match.
+pub fn handshake_for(data_root: &Path) -> Option<serde_json::Value> {
+    agentify_proto::client::DaemonClient::new(data_root)
+        .handshake()
+        .ok()
 }
 
 /// The Environment's status snapshot, as the daemon serves it.
@@ -276,6 +291,17 @@ fn daemon_status() -> DaemonStatus {
     status_for(&data_root())
 }
 
+/// The daemon's version handshake on demand, for a "check again" control.
+#[tauri::command]
+fn handshake() -> Result<serde_json::Value, String> {
+    handshake_for(&data_root()).ok_or_else(|| {
+        format!(
+            "the daemon did not answer at {}; no handshake to report",
+            data_root().display()
+        )
+    })
+}
+
 #[tauri::command]
 fn approvals(state: Option<String>, limit: Option<usize>) -> Result<serde_json::Value, String> {
     approvals_for(&data_root(), state.as_deref(), limit)
@@ -331,6 +357,7 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             daemon_status,
+            handshake,
             environment_status,
             environment_stats,
             environment_logs,

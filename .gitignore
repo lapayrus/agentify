@@ -6,3 +6,5 @@ dist/
 *.log
 # Tauri generates permission schemas and capability manifests at build time.
 ui/src-tauri/gen/
+# Sidecars staged by `npm run stage:sidecar` are build outputs, not sources.
+ui/src-tauri/binaries/

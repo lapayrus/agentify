@@ -110,6 +110,9 @@ struct AppState {
     redactors: Mutex<HashMap<String, Arc<Redactor>>>,
     /// One async mutex per Environment: mutations are serialised, reads are not.
     env_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The startup handshake: what this build pins, what it found, and the
+    /// sentence to show when the two disagree.
+    handshake: crate::handshake::Handshake,
 }
 
 impl AppState {
@@ -407,6 +410,16 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
         config.backend_script.as_deref(),
         &config.data_root,
     )?;
+
+    // The handshake is taken before anything drives the Backend: a substrate
+    // this build did not pin is refused rather than half-used. A mismatch is not
+    // fatal — the daemon still serves its API, so the UI can say which component
+    // is wrong — but every lifecycle call answers `VersionMismatch`.
+    let handshake = crate::handshake::check(config, &backend);
+    if let Some(refusal) = &handshake.refusal {
+        eprintln!("agentifyd: {refusal}");
+    }
+
     let secrets = Arc::new(config.secrets());
 
     let ingress = config
@@ -438,6 +451,7 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
         ingress,
         probe_timeout: config.probe_timeout,
         exec_timeout: config.exec_timeout,
+        refusal: handshake.refusal.clone(),
     });
 
     let listener = TcpListener::bind(config.bind_addr)
@@ -461,6 +475,7 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
         secrets,
         redactors: Mutex::new(HashMap::new()),
         env_locks: Mutex::new(HashMap::new()),
+        handshake,
     };
     Ok((state, listener, discovery))
 }
@@ -469,6 +484,7 @@ fn router(state: Arc<AppState>) -> Router {
     let environments = "/v1/projects/{project}/environments/{environment}";
     let protected = Router::new()
         .route("/v1/whoami", get(whoami))
+        .route("/v1/handshake", get(handshake))
         .route("/v1/events", get(events))
         .route("/v1/projects", get(list_projects).post(create_project))
         .route(
@@ -522,12 +538,34 @@ fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> Json<serde_json::Value> {
+async fn healthz(State(app): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "daemon_version": DAEMON_VERSION,
         "api_version": API_VERSION,
+        // Unauthenticated on purpose: the shell shows a version banner before it
+        // has done anything else, and the payload carries no token or state.
+        "handshake": handshake_payload(&app),
     }))
+}
+
+/// `GET /v1/handshake`: the pinned versions, what was found, and the refusal.
+async fn handshake(State(app): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(handshake_payload(&app))
+}
+
+fn handshake_payload(app: &AppState) -> serde_json::Value {
+    let info = app.lifecycle.backend_ref();
+    serde_json::json!({
+        "ok": app.handshake.report.ok,
+        "backend": {
+            "name": info.name,
+            "version": info.version,
+            "platform": info.platform,
+        },
+        "components": app.handshake.report.components,
+        "refusal": app.handshake.refusal,
+    })
 }
 
 async fn whoami(State(app): State<Arc<AppState>>, Extension(caller): Extension<Caller>) -> Json<Whoami> {

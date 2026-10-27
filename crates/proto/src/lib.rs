@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 
 mod approval;
 mod environment;
+mod layout;
 mod paths;
 mod project;
 
 pub mod client;
+pub mod versions;
 
 pub use approval::{
     ActorIdentity, ActivityEntry, ActivityPage, ApprovalAccepted, ApprovalDecision,
@@ -27,6 +29,7 @@ pub use environment::{
     TransitionDetail, HEALTH_HEALTHY, HEALTH_UNHEALTHY, HEALTH_UNKNOWN, IDEMPOTENCY_HEADER,
     STATE_ABSENT, STATE_DEGRADED, STATE_FAILED, STATE_RUNNING, STATE_STARTING,
 };
+pub use layout::{DataRoot, CHECKPOINTS_DIR, LOGS_DIR, PROJECTS_DIR, ROOTFS_DIR, RUNTIMES_DIR, TOOLS_DIR};
 pub use paths::{resolve_data_root, APP_DIR_NAME, HOME_ENV};
 pub use project::{
     BuildView, Cost, CreateProjectRequest, EnvironmentView, HealthcheckView, PortView, Project,

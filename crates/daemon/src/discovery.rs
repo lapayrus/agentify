@@ -34,6 +34,22 @@ pub fn write(config: &Config, daemon_version: &str, token: &str, port: u16) -> R
         let _ = std::fs::remove_file(&temp);
     }
     written?;
+    // Verify rather than assume: the file carries a bearer token, so a DACL the
+    // current user does not exclusively own is a reason not to publish one.
+    let user_only = acl::assert_user_only(&path).with_context(|| {
+        format!(
+            "reading the ACL of {} to check it is user-only",
+            path.display()
+        )
+    })?;
+    if !user_only {
+        let _ = std::fs::remove_file(&path);
+        anyhow::bail!(
+            "{} is readable by more than the current OS user (grantees: {:?}); refusing to publish a token there",
+            path.display(),
+            acl::grantees(&path).unwrap_or_default()
+        );
+    }
     Ok(discovery)
 }
 

@@ -148,9 +148,26 @@ pub struct Lifecycle {
     pub probe_timeout: Duration,
     /// Upper bound the daemon puts on one `exec`.
     pub exec_timeout: Duration,
+    /// Set when the startup handshake refused this Backend: every call that
+    /// would drive the substrate answers `VersionMismatch` instead.
+    pub refusal: Option<String>,
 }
 
 impl Lifecycle {
+    /// The gate the startup handshake puts in front of the Backend.
+    ///
+    /// A mismatched adapter is not driven at all: half-working lifecycle calls
+    /// against a substrate this build does not understand are worse than a
+    /// typed refusal that names the versions.
+    fn gate(&self) -> Result<(), LifecycleError> {
+        match &self.refusal {
+            None => Ok(()),
+            Some(refusal) => Err(LifecycleError::Backend(
+                crate::handshake::refusal_error(refusal),
+            )),
+        }
+    }
+
     pub fn backend_ref(&self) -> BackendRef {
         let info = self.backend.describe();
         BackendRef {
@@ -182,6 +199,7 @@ impl Lifecycle {
         state: &State,
         record: &ProjectRecord,
     ) -> Result<EnvironmentStatus, LifecycleError> {
+        self.gate()?;
         let environment_id = record.environment.id.clone();
         state.set_environment_state(
             &environment_id,
@@ -273,6 +291,7 @@ impl Lifecycle {
         state: &State,
         record: &ProjectRecord,
     ) -> Result<EnvironmentStatus, LifecycleError> {
+        self.gate()?;
         let environment_id = record.environment.id.clone();
         if let Err(err) = self.backend.stop(&environment_id).await {
             self.mark(&state, &environment_id, STATE_STOPPED, STATE_FAILED, HEALTH_UNHEALTHY)?;
@@ -332,6 +351,7 @@ impl Lifecycle {
         state: &State,
         record: &ProjectRecord,
     ) -> Result<(), LifecycleError> {
+        self.gate()?;
         let environment_id = record.environment.id.clone();
         self.backend
             .remove(&environment_id, false)
@@ -356,6 +376,7 @@ impl Lifecycle {
         state: &State,
         record: &ProjectRecord,
     ) -> Result<EnvironmentStatus, LifecycleError> {
+        self.gate()?;
         let stored = self.stored_environment(state, record)?;
         let leases = state.leases(&record.environment.id)?;
 
@@ -407,6 +428,7 @@ impl Lifecycle {
         resource: &str,
         request: &ExecRequest,
     ) -> Result<ExecResponse, LifecycleError> {
+        self.gate()?;
         if request.command.is_empty() {
             return Err(LifecycleError::Validation {
                 path: "command".to_string(),
@@ -495,6 +517,7 @@ impl Lifecycle {
         resource: Option<&str>,
         options: &LogOptions,
     ) -> Result<LogStream, LifecycleError> {
+        self.gate()?;
         if let Some(resource) = resource {
             if !record.resources.iter().any(|known| known.name == resource) {
                 return Err(LifecycleError::NotFound(format!(
@@ -517,6 +540,7 @@ impl Lifecycle {
         state: &State,
         record: &ProjectRecord,
     ) -> Result<StatsResponse, LifecycleError> {
+        self.gate()?;
         let stored = self.stored_environment(state, record)?;
         let stats = self
             .backend

@@ -150,6 +150,57 @@ cargo check --all-targets        # shell crate
 cargo run                        # opens the window (needs a daemon for "connected")
 ```
 
+## Install (Windows, per user)
+
+The shell is also an installer. It is a per-user NSIS bundle: no administrator
+rights, no UAC prompt, and everything it writes stays inside the current user's
+profile.
+
+```sh
+cd ui
+npm ci
+npm run bundle                   # tauri build --bundles nsis
+# -> ui/src-tauri/target/release/bundle/nsis/Agentify_<version>_x64-setup.exe
+cd src-tauri && cargo test       # the shell's own suite
+```
+
+`npm run bundle` runs `stage-sidecar` first, which builds and stages the three
+binaries the installer ships beside the app: `agentifyd.exe` (the daemon), the
+`agentify-mcp.exe` MCP shim, and the `agentify.exe` CLI. Tauri strips the target
+triple and installs them next to `agentify-shell.exe`, which is where
+`login_item::daemon_binary()` looks.
+
+| What | Where |
+| --- | --- |
+| Program, sidecars, uninstaller | `%LOCALAPPDATA%\Programs\Agentify\` |
+| Data root: `state.db`, `discovery.json`, `logs\`, `checkpoints\`, `projects\`, `wsl\`, `ingress\`, `tools\` | `%LOCALAPPDATA%\Agentify\` |
+
+The two are siblings on purpose. Tauri's per-user default is
+`%LOCALAPPDATA%\<productName>`, which is exactly the data root, so
+`ui/src-tauri/installer-hooks.nsh` moves the default to `%LOCALAPPDATA%\Programs`
+(a directory the user picks is left alone). Installing over a version replaces
+the program directory only, so Projects, Checkpoints, the rootfs cache, and the
+state database survive.
+
+The same hook file registers the daemon's login item: `POSTINSTALL` runs
+`agentify login-item install`, `PREUNINSTALL` runs `agentify login-item remove`.
+That is a per-user Scheduled Task (`Agentify Daemon`) with a logon trigger, an
+interactive token at `LeastPrivilege`, a `PT0S` execution limit, and restart on
+failure — never a Windows service, so the daemon runs in the user's own session
+and `%LOCALAPPDATA%` and keeps running with the UI closed. `agentify login-item
+status` reports what the scheduler holds.
+
+The bundle is signing-ready but unsigned locally: `bundle.windows` already names
+`digestAlgorithm: sha256` and a timestamp URL, and `certificateThumbprint` is
+`null`. Set it to a certificate thumbprint in the machine's store (or switch to
+`signCommand`) and the app and installer are Authenticode-signed with no other
+change. Updater artifacts are off; turning them on also needs
+`TAURI_SIGNING_PRIVATE_KEY`.
+
+Caddy is not in the bundle yet. The daemon does not download it: ingress looks
+for `%LOCALAPPDATA%\Agentify\tools\caddy.exe` (or `AGENTIFY_CADDY`) and reports
+its typed `Missing` error until a pinned 2.10.2 binary is placed there.
+
 ## Data root and state
 
 * Default: `%LOCALAPPDATA%\Agentify\` on Windows, `~/Library/Application Support/Agentify/`
