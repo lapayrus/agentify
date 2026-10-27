@@ -52,6 +52,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentify-ingress"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "agentify-manifest"
 version = "0.1.0"
 dependencies = [
