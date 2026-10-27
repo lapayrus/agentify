@@ -1,21 +1,65 @@
 name: Test
 
+# Fast feedback for every change that can break code: any branch push and every
+# pull request. Documentation-only changes do not build, and a newer push on the
+# same ref cancels the run it superseded instead of finishing work nobody waits
+# for. Tag pushes run the Release workflow instead.
 on:
   push:
     branches: ["**"]
-    # A release tag runs its own build; it does not need the test suite twice.
     tags-ignore: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".scratch/**"
+      - "research/**"
+      - "prototype/**"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".scratch/**"
+      - "research/**"
+      - "prototype/**"
   workflow_dispatch:
 
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  test:
+  # The daemon workspace. Windows is required: the acceptance suite drives real
+  # processes, WSL detection, and the Windows credential-manager seam.
+  workspace:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-test
       - name: Run the workspace test suite
         # The default Backend is the scripted fake, and none of the WSL, Caddy,
         # or keyring gates are set, so the security acceptance suite runs here
         # without touching the host machine.
         run: cargo test --workspace
+
+  # The shell renderer is plain JavaScript: pure string production with no
+  # dependencies, so it runs on Linux in seconds instead of waiting behind the
+  # Rust build.
+  renderer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run the shell renderer tests
+        working-directory: ui
+        run: node --test

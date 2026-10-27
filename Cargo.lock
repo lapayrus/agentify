@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentify-backends"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agentify-proto",
  "futures-util",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agentify-bootstrap"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agentify-proto",
  "anyhow",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "agentify-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agentify-bootstrap",
  "agentify-daemon",
@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "agentify-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agentify-backends",
  "agentify-ingress",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "agentify-ingress"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rustls",
  "serde",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "agentify-manifest"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "agentify-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agentify-backends",
  "agentify-daemon",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "agentify-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",

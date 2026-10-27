@@ -79,10 +79,24 @@ export function selectedProject(status) {
 }
 
 // The header carries brand plus "N Projects · daemon state · api version".
-export function renderHeader(status) {
+const SECTIONS = [
+  { id: "projects", label: "Projects" },
+  { id: "mcp", label: "MCP" },
+  { id: "settings", label: "Settings" },
+];
+
+export function renderHeader(status, section = "projects") {
   const count = projectsOf(status).length;
+  const current = SECTIONS.some((item) => item.id === section) ? section : "projects";
+  const nav = SECTIONS.map(
+    (item) =>
+      `<button type="button" class="nav-item" data-nav="${item.id}" aria-current="${
+        current === item.id
+      }">${item.label}</button>`,
+  ).join("");
   return `<header class="top" data-connection="${escapeHtml(status.state)}">
   <div class="brand"><span class="mark">A</span>Agentify</div>
+  <nav class="top-nav" aria-label="Sections">${nav}</nav>
   <div class="daemon">
     <span class="${dotClass(status)}"></span>
     <span class="project-count">${plural(count, "Project")}</span>
@@ -638,6 +652,208 @@ export function renderVersionBanner(status) {
 </section>`;
 }
 
+/**
+ * The update banner: drawn only when a signed update is available, in flight, or
+ * failed. A dismissed check draws nothing; a routine "up to date" answer never
+ * interrupts the window.
+ */
+export function renderUpdateBanner(update) {
+  const state = update?.status;
+  if (update?.dismissed === true) {
+    return "";
+  }
+  if (state !== "available" && state !== "installing" && state !== "error") {
+    return "";
+  }
+  const version = update?.version ? ` ${escapeHtml(update.version)}` : "";
+
+  if (state === "installing") {
+    return `<section class="banner banner-update" data-banner="update" data-state="installing" role="status">
+  <h2>Installing Agentify${version}</h2>
+  <p class="banner-hint">The update is downloading. Agentify restarts when it is ready; running Environments are left running and the new daemon adopts them.</p>
+</section>`;
+  }
+
+  if (state === "error") {
+    return `<section class="banner banner-update" data-banner="update" data-state="error" role="status">
+  <h2>Update failed</h2>
+  <p class="banner-detail">${escapeHtml(update?.error ?? "The updater did not say why.")}</p>
+  <button type="button" class="action" data-action="check-update">Try again</button>
+</section>`;
+  }
+
+  const current = update?.currentVersion
+    ? `<p class="banner-detail">You are running ${escapeHtml(update.currentVersion)}.</p>`
+    : "";
+  const body =
+    typeof update?.body === "string" && update.body.trim()
+      ? `<p class="banner-detail update-notes">${escapeHtml(update.body)}</p>`
+      : "";
+  return `<section class="banner banner-update" data-banner="update" data-state="available" role="status">
+  <h2>Agentify${version} is available</h2>
+  ${current}
+  ${body}
+  <div class="banner-actions">
+    <button type="button" class="action" data-action="install-update">Install and restart</button>
+    <button type="button" class="action action-quiet" data-action="dismiss-update">Later</button>
+  </div>
+  <p class="banner-hint">The update is signed and applies on restart. Running Environments are left alone; the new daemon adopts them.</p>
+</section>`;
+}
+
+function bytesLabel(bytes) {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes)) {
+    return "unknown";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+/** What the update controls should say right now. */
+export function updateStateText(update) {
+  switch (update?.status) {
+    case "checking":
+      return "Checking for updates…";
+    case "available":
+      return `Version ${update.version ?? "unknown"} is available.`;
+    case "installing":
+      return `Installing ${update.version ?? "the update"}… Agentify will restart.`;
+    case "current":
+      return `Up to date${update.currentVersion ? ` (${update.currentVersion})` : ""}.`;
+    case "error":
+      return `The update check failed: ${update.error ?? "unknown error"}`;
+    default:
+      return "Automatic checks run on launch and every six hours.";
+  }
+}
+
+/**
+ * The MCP connector tab: how to register the stdio shim with an MCP client, and
+ * what the shim exposes. It reads the whole page from `shell_info`; the daemon is
+ * only named, not queried a second time.
+ */
+export function renderMcp(status) {
+  const shell = status?.shellInfo ?? null;
+  const info = shell?.mcp ?? null;
+  if (!info) {
+    return `<main class="main settings" data-section-page="mcp">
+  <h1>MCP connector</h1>
+  <p class="reason">${escapeHtml(
+    status?.shellInfoError ?? "Reading the connector details…",
+  )}</p>
+</main>`;
+  }
+
+  const connected = status?.state === "connected";
+  const availability = info.available
+    ? `<span class="pill pill-ok">shim found</span>`
+    : `<span class="pill pill-warn">shim not found beside this app</span>`;
+  const tools = (Array.isArray(info.tools) ? info.tools : [])
+    .map((tool) => `<li><code>${escapeHtml(tool)}</code></li>`)
+    .join("");
+  const warning = info.available
+    ? ""
+    : `<p class="reason" data-error="mcp-shim">The installer stages <code>agentify-mcp.exe</code> beside Agentify. A development build may not have staged it yet; run <code>npm run stage:sidecar</code> in <code>ui</code> before bundling.</p>`;
+
+  return `<main class="main settings" data-section-page="mcp">
+  <h1>MCP connector</h1>
+  <p class="lede">Point an MCP client at the Agentify shim. The shim speaks stdio and forwards every call to the daemon over the same loopback API this window uses. Nothing about an Environment is exposed outside the daemon.</p>
+${warning}
+  <section class="card" data-card="mcp-status">
+    <h2>Connector status</h2>
+    <dl class="facts">
+      <div><dt>daemon</dt><dd>${connected ? "connected" : "unreachable"}</dd></div>
+      <div><dt>shim</dt><dd>${availability}</dd></div>
+      <div><dt>transport</dt><dd>stdio (JSON-RPC)</dd></div>
+      <div><dt>command</dt><dd><code>${escapeHtml(info.command)}</code></dd></div>
+      <div><dt>data root</dt><dd><code>${escapeHtml(shell?.data_root ?? "unknown")}</code></dd></div>
+      <div><dt>discovery file</dt><dd><code>${escapeHtml(shell?.discovery_file ?? "unknown")}</code></dd></div>
+    </dl>
+  </section>
+  <section class="card" data-card="mcp-config">
+    <h2>Client configuration</h2>
+    <p class="hint">Add this to your MCP client's configuration, then restart the client. The shim starts on demand for each session.</p>
+    <pre class="code-block" data-mcp-config><code>${escapeHtml(info.config)}</code></pre>
+  </section>
+  <section class="card" data-card="mcp-tools">
+    <h2>Tools</h2>
+    <p class="hint">Destructive tools (<code>delete_project</code>, <code>reset_environment</code>) answer with an Approval and change nothing until a human decides it in this window.</p>
+    <ul class="tag-list">${tools}</ul>
+  </section>
+</main>`;
+}
+
+/** The Settings tab: what this build is, where it lives, and its update controls. */
+export function renderSettings(status) {
+  const shell = status?.shellInfo ?? null;
+  const whoami = status?.whoami ?? {};
+  const backend = whoami?.backend ?? {};
+  const update = status?.update ?? {};
+  const preferences = status?.preferences ?? {};
+  const autoUpdate = preferences.autoUpdate !== false;
+  const appVersion = shell?.app_version ?? update.currentVersion ?? "unknown";
+  const busy = update.status === "checking" || update.status === "installing";
+  const installable = update.status === "available" || update.status === "error";
+  const backendLabel = backend.name
+    ? `${backend.name}${backend.version ? ` ${backend.version}` : ""}`
+    : "unknown";
+  const disk = whoami?.disk
+    ? `${bytesLabel(whoami.disk.free_bytes)}${whoami.disk.warning ? " (low)" : ""}`
+    : "unknown";
+
+  const installButton = installable
+    ? `<button type="button" class="action" data-action="install-update">${
+        update.status === "error" ? "Retry install" : `Install ${escapeHtml(update.version ?? "update")} and restart`
+      }</button>`
+    : "";
+
+  return `<main class="main settings" data-section-page="settings">
+  <h1>Settings</h1>
+  <p class="lede">This window is a client of the daemon: it keeps no Project state of its own. These are the facts of the installation it is looking at.</p>
+  <section class="card" data-card="updates">
+    <h2>Updates</h2>
+    <p class="hint" data-update-state="${escapeHtml(update.status ?? "idle")}">${escapeHtml(
+      updateStateText(update),
+    )}</p>
+    <label class="toggle">
+      <input type="checkbox" data-setting="auto-update"${autoUpdate ? " checked" : ""} />
+      <span>Check for updates automatically</span>
+    </label>
+    <div class="card-actions">
+      <button type="button" class="action" data-action="check-update"${busy ? " disabled" : ""}>${
+        update.status === "checking" ? "Checking…" : "Check now"
+      }</button>
+      ${installButton}
+    </div>
+    <p class="hint">The stable channel is signed. One previous version is kept, an update refuses while an operation is in flight, and running Environments are adopted by the new daemon.</p>
+  </section>
+  <section class="card" data-card="about">
+    <h2>About this installation</h2>
+    <dl class="facts">
+      <div><dt>app</dt><dd>${escapeHtml(appVersion)}</dd></div>
+      <div><dt>daemon</dt><dd>${escapeHtml(whoami?.daemon_version ?? "unknown")}</dd></div>
+      <div><dt>api</dt><dd>${escapeHtml(whoami?.api_version ?? "unknown")}</dd></div>
+      <div><dt>backend</dt><dd>${escapeHtml(backendLabel)}</dd></div>
+      <div><dt>platform</dt><dd>${escapeHtml(backend.platform ?? "unknown")}</dd></div>
+      <div><dt>disk free</dt><dd>${escapeHtml(disk)}</dd></div>
+      <div><dt>data root</dt><dd><code>${escapeHtml(shell?.data_root ?? "unknown")}</code></dd></div>
+      <div><dt>discovery file</dt><dd><code>${escapeHtml(shell?.discovery_file ?? "unknown")}</code></dd></div>
+    </dl>
+  </section>
+  <section class="card" data-card="connector">
+    <h2>Agent connection</h2>
+    <p class="hint">The MCP connector tab carries the command, the client configuration, and the tools an Agent can call.</p>
+    <button type="button" class="action" data-nav="mcp">Open MCP connector</button>
+  </section>
+</main>`;
+}
+
 function renderEmptyProjects(whoami) {
   const scopes = (whoami?.scopes ?? []).join(", ") || "none";
   const capabilities = Object.entries(whoami?.capabilities ?? {})
@@ -708,17 +924,25 @@ export function renderMain(status) {
   return renderLoading();
 }
 
-// The three-zone shell: header, Project rail, main pane, and the right column
-// holding the Approval card over the activity feed.
+// The shell: header and banners over either the three-zone Project view or one
+// full-width page for the global MCP connector and Settings tabs.
 export function render(status) {
-  return `<div class="shell" data-connection="${escapeHtml(status.state)}">
-${renderHeader(status)}
-${renderBootstrapBanner(status.bootstrap)}
-${renderVersionBanner(status)}
-<div class="body">
+  const section = status?.section === "mcp" || status?.section === "settings" ? status.section : "projects";
+  const body =
+    section === "mcp"
+      ? renderMcp(status)
+      : section === "settings"
+        ? renderSettings(status)
+        : `<div class="body">
 ${renderRail(status)}
 ${renderMain(status)}
 ${renderSide(status)}
-</div>
+</div>`;
+  return `<div class="shell" data-connection="${escapeHtml(status.state)}">
+${renderHeader(status, section)}
+${renderBootstrapBanner(status.bootstrap)}
+${renderUpdateBanner(status.update)}
+${renderVersionBanner(status)}
+${body}
 </div>`;
 }

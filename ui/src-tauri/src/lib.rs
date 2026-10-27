@@ -6,7 +6,7 @@
 //! file (through `agentify_proto`) and calls the loopback API; it caches nothing
 //! and decides nothing about Projects, Environments, or Resources.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use tauri_plugin_updater::UpdaterExt;
@@ -446,16 +446,31 @@ fn shutdown_daemon() -> Result<serde_json::Value, String> {
     shutdown_for(&data_root())
 }
 
-/// The daemon sidecar, beside this shell. The installer stages all four binaries
-/// in one directory, so the shell can always start its own daemon.
-fn daemon_binary() -> std::path::PathBuf {
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from("agentify-shell.exe"));
+/// A sidecar the installer stages beside this shell. The installer puts every
+/// binary in one directory, so the shell can always find its own daemon and MCP
+/// shim.
+fn sidecar_binary(name: &str) -> PathBuf {
+    let exe =
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentify-shell.exe"));
     let dir = exe
         .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    dir.join(if cfg!(windows) { "agentifyd.exe" } else { "agentifyd" })
+        .unwrap_or_else(|| PathBuf::from("."));
+    dir.join(if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    })
+}
+
+/// The daemon sidecar, beside this shell.
+fn daemon_binary() -> PathBuf {
+    sidecar_binary("agentifyd")
+}
+
+/// The MCP stdio shim, beside this shell.
+fn mcp_binary() -> PathBuf {
+    sidecar_binary("agentify-mcp")
 }
 
 /// Stop the old daemon and start the one beside this shell, so an updated build
@@ -469,38 +484,133 @@ fn restart_daemon() -> Result<(), String> {
         .map_err(|err| format!("starting the daemon failed: {err}"))
 }
 
-/// The update the updater knows about, or `null` when there is none.
+/// The tools the MCP shim advertises, in the order the README documents them.
+const MCP_TOOLS: &[&str] = &[
+    "whoami",
+    "create_project",
+    "list_projects",
+    "get_project",
+    "start_environment",
+    "stop_environment",
+    "get_status",
+    "run_command",
+    "read_logs",
+    "get_stats",
+    "list_secrets",
+    "create_secret",
+    "update_secret",
+    "delete_secret",
+    "wait_for_operation",
+];
+
+/// How to point an MCP client at the shim beside this shell.
+#[derive(Debug, Clone, Serialize)]
+struct McpInfo {
+    /// Absolute path of `agentify-mcp`.
+    command: String,
+    /// True when the shim is actually installed beside the shell.
+    available: bool,
+    /// A copy-paste client configuration for the stdio transport.
+    config: String,
+    /// Every tool the shim advertises.
+    tools: Vec<&'static str>,
+}
+
+/// The shell's own facts for the Settings and MCP tabs: the build it is, where
+/// its data lives, and how to register the MCP connector.
+#[derive(Debug, Clone, Serialize)]
+struct ShellInfo {
+    app_version: String,
+    data_root: String,
+    discovery_file: String,
+    mcp: McpInfo,
+}
+
+/// What this shell is, where it keeps its data, and how to register the MCP
+/// shim. A read: it neither starts nor stops anything.
+#[tauri::command]
+fn shell_info() -> ShellInfo {
+    let root = data_root();
+    let root_text = root.display().to_string();
+    let command = mcp_binary();
+    let command_text = command.display().to_string();
+    // Carry the data root explicitly: an MCP client is often launched by the
+    // desktop rather than by this shell, so it would otherwise resolve the
+    // default root instead of the one this app is using.
+    let config = serde_json::json!({
+        "mcpServers": {
+            "agentify": {
+                "command": command_text.clone(),
+                "env": { "AGENTIFY_HOME": root_text.clone() }
+            }
+        }
+    });
+    ShellInfo {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        data_root: root_text,
+        discovery_file: agentify_proto::discovery_path(&root).display().to_string(),
+        mcp: McpInfo {
+            available: command.exists(),
+            command: command_text,
+            config: serde_json::to_string_pretty(&config).unwrap_or_default(),
+            tools: MCP_TOOLS.to_vec(),
+        },
+    }
+}
+
+/// The update the updater knows about.
 #[derive(Debug, Clone, Serialize)]
 struct UpdateInfo {
     version: String,
     body: Option<String>,
 }
 
-/// Ask the Tauri updater what is available.
-#[tauri::command]
-async fn update_check(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
-    let updater = app.updater().map_err(|err| err.to_string())?;
-    let update = updater.check().await.map_err(|err| err.to_string())?;
-    Ok(update.map(|update| UpdateInfo {
-        version: update.version.clone(),
-        body: update.body.clone(),
-    }))
+/// The pending update, if any, and the version this build is.
+#[derive(Debug, Clone, Serialize)]
+struct UpdateCheck {
+    current_version: String,
+    update: Option<UpdateInfo>,
 }
 
-/// Download and install the available update, refusing while a mutation is in
-/// flight. The install restarts the shell; `restart_daemon` is what brings the
-/// daemon up on the new build afterwards.
+/// Ask the Tauri updater what is available. The current version is always
+/// reported, so the shell can show it even when the endpoint cannot be reached.
+#[tauri::command]
+async fn update_check(app: tauri::AppHandle) -> Result<UpdateCheck, String> {
+    let current_version = app.package_info().version.to_string();
+    let updater = app.updater().map_err(|err| err.to_string())?;
+    let update = updater.check().await.map_err(|err| err.to_string())?;
+    Ok(UpdateCheck {
+        current_version,
+        update: update.map(|update| UpdateInfo {
+            version: update.version.clone(),
+            body: update.body.clone(),
+        }),
+    })
+}
+
+/// Download and install the available update, refusing only while a mutation is
+/// in flight. The install restarts the shell; `restart_daemon` is what brings the
+/// daemon up on the new build when the updater does not restart it itself.
 #[tauri::command]
 async fn update_install(app: tauri::AppHandle) -> Result<(), String> {
-    let readiness =
-        readiness_for(&data_root()).map_err(|err| format!("cannot ask the daemon: {err}"))?;
-    if readiness
-        .get("operations_in_flight")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
-    {
-        return Err("an operation is in flight; try the update again when it finishes".to_string());
+    // A daemon that is not running has no operations, so an unreachable daemon
+    // must not block the update. Only a daemon that answers can refuse it.
+    if let Ok(readiness) = readiness_for(&data_root()) {
+        if readiness
+            .get("operations_in_flight")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            return Err(
+                "an operation is in flight; try the update again when it finishes".to_string(),
+            );
+        }
     }
+
+    // Stop the sidecar before the installer runs: a live `agentifyd.exe` holds
+    // the old file and would make the replacement fail. The restarted shell
+    // starts the new daemon from the install directory.
+    let _ = shutdown_for(&data_root());
 
     let updater = app.updater().map_err(|err| err.to_string())?;
     let update = updater
@@ -568,6 +678,7 @@ pub fn run() {
             activity,
             decide_approval,
             update_readiness,
+            shell_info,
             shutdown_daemon,
             restart_daemon,
             update_check,

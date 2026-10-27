@@ -18,6 +18,10 @@ import {
   renderSide,
   renderVersionBanner,
   renderBootstrapBanner,
+  renderUpdateBanner,
+  renderMcp,
+  renderSettings,
+  updateStateText,
   renderApprovals,
   renderApprovalCard,
   renderActivity,
@@ -903,5 +907,190 @@ test("bootstrap text is escaped, never injected", () => {
   assert.doesNotMatch(banner, /<script>/);
   assert.match(banner, /&lt;img/);
   assert.match(banner, /&lt;script&gt;/);
+});
+
+// ---------------------------------------------------------------------------
+// Updates, the MCP connector, and Settings.
+//
+// The shell never decides whether an update exists: it repeats what the updater
+// answered. The MCP and Settings tabs are global, so they read `shell_info`
+// rather than a Project snapshot.
+// ---------------------------------------------------------------------------
+
+/** What `shell_info` returns for an installed build. */
+const shellInfo = {
+  app_version: "0.1.2",
+  data_root: "C:\\data\\agentify",
+  discovery_file: "C:\\data\\agentify\\discovery.json",
+  mcp: {
+    command: "C:\\Program Files\\Agentify\\agentify-mcp.exe",
+    available: true,
+    config:
+      '{\n  "mcpServers": {\n    "agentify": {\n      "command": "C:\\\\Program Files\\\\Agentify\\\\agentify-mcp.exe"\n    }\n  }\n}',
+    tools: ["whoami", "create_project", "delete_project"],
+  },
+};
+
+const settingsWhoami = {
+  ...whoami,
+  backend: { name: "fake", version: "0.1.0", platform: "scripted" },
+  disk: { free_bytes: 1073741824, warning: false },
+};
+
+test("the header carries Projects, MCP, and Settings tabs and marks the active one", () => {
+  const header = renderHeader(connected, "settings");
+  assert.match(header, /data-nav="projects"/);
+  assert.match(header, /data-nav="mcp"/);
+  assert.match(header, /data-nav="settings" aria-current="true"/);
+  assert.equal((header.match(/aria-current="true"/g) ?? []).length, 1);
+  assert.match(renderHeader(connected), /data-nav="projects" aria-current="true"/);
+});
+
+test("an available update draws a banner with install and later", () => {
+  const banner = renderUpdateBanner({
+    status: "available",
+    currentVersion: "0.1.1",
+    version: "0.1.2",
+    body: "Fixes and a Settings tab.",
+  });
+  assert.match(banner, /data-banner="update"/);
+  assert.match(banner, /data-state="available"/);
+  assert.match(banner, /Agentify 0\.1\.2 is available/);
+  assert.match(banner, /You are running 0\.1\.1/);
+  assert.match(banner, /Fixes and a Settings tab\./);
+  assert.match(banner, /data-action="install-update"/);
+  assert.match(banner, /data-action="dismiss-update"/);
+});
+
+test("no update banner is drawn for a routine or dismissed check", () => {
+  assert.equal(renderUpdateBanner({ status: "current", currentVersion: "0.1.2" }), "");
+  assert.equal(renderUpdateBanner({ status: "idle" }), "");
+  assert.equal(
+    renderUpdateBanner({ status: "available", version: "0.1.2", dismissed: true }),
+    "",
+  );
+  assert.equal(renderUpdateBanner(undefined), "");
+});
+
+test("an install in flight and a failed check say what is happening", () => {
+  const installing = renderUpdateBanner({ status: "installing", version: "0.1.2" });
+  assert.match(installing, /data-state="installing"/);
+  assert.match(installing, /Installing Agentify 0\.1\.2/);
+  assert.doesNotMatch(installing, /data-action="install-update"/);
+
+  const failed = renderUpdateBanner({ status: "error", error: "the endpoint is offline" });
+  assert.match(failed, /data-state="error"/);
+  assert.match(failed, /Update failed/);
+  assert.match(failed, /the endpoint is offline/);
+  assert.match(failed, /data-action="check-update"/);
+});
+
+test("update notes are escaped, never injected", () => {
+  const banner = renderUpdateBanner({
+    status: "available",
+    version: "0.1.2",
+    body: '<img src=x onerror="alert(1)">',
+  });
+  assert.doesNotMatch(banner, /<img/);
+  assert.match(banner, /&lt;img/);
+});
+
+test("the settings update line reflects the check state", () => {
+  assert.match(updateStateText({ status: "available", version: "0.2.0" }), /0\.2\.0 is available/);
+  assert.match(
+    updateStateText({ status: "current", currentVersion: "0.1.2" }),
+    /Up to date \(0\.1\.2\)/,
+  );
+  assert.match(updateStateText({ status: "error", error: "offline" }), /offline/);
+  assert.match(updateStateText(undefined), /Automatic checks/);
+});
+
+test("the MCP tab shows the shim command, client configuration, and tools", () => {
+  const page = renderMcp({ state: "connected", shellInfo });
+  assert.match(page, /data-section-page="mcp"/);
+  assert.match(page, /MCP connector/);
+  assert.match(page, /shim found/);
+  assert.match(page, /agentify-mcp\.exe/);
+  assert.match(page, /data-mcp-config/);
+  assert.match(page, /mcpServers/);
+  assert.match(page, /whoami/);
+  assert.match(page, /create_project/);
+  assert.match(page, /delete_project/);
+  assert.match(page, /Approval/, "the destructive tools say a human decides");
+});
+
+test("the MCP tab names a missing shim and a failed read instead of rendering blank", () => {
+  const missing = renderMcp({
+    state: "connected",
+    shellInfo: { ...shellInfo, mcp: { ...shellInfo.mcp, available: false } },
+  });
+  assert.match(missing, /shim not found beside this app/);
+  assert.match(missing, /data-error="mcp-shim"/);
+
+  const failed = renderMcp({ state: "connected", shellInfoError: "shell_info refused" });
+  assert.match(failed, /shell_info refused/);
+});
+
+test("Settings shows the build, paths, update controls, and the connector link", () => {
+  const page = renderSettings({
+    state: "connected",
+    whoami: settingsWhoami,
+    shellInfo,
+    preferences: { autoUpdate: true },
+    update: { status: "available", currentVersion: "0.1.1", version: "0.1.2" },
+  });
+  assert.match(page, /data-section-page="settings"/);
+  assert.match(page, /data-card="updates"/);
+  assert.match(page, /0\.1\.2 is available/);
+  assert.match(page, /data-action="check-update"/);
+  assert.match(page, /data-action="install-update"/);
+  assert.match(page, /data-setting="auto-update" checked/);
+  assert.match(page, /data-card="about"/);
+  assert.match(page, /0\.1\.0/, "the daemon version is shown");
+  assert.match(page, /fake/, "the backend is named");
+  assert.match(page, /C:\\data\\agentify/, "the data root is shown");
+  assert.match(page, /data-nav="mcp"/, "the connector tab is one click away");
+});
+
+test("Settings can turn automatic checks off without losing the manual check", () => {
+  const page = renderSettings({
+    state: "connected",
+    whoami: settingsWhoami,
+    shellInfo,
+    preferences: { autoUpdate: false },
+    update: { status: "idle" },
+  });
+  assert.doesNotMatch(page, /data-setting="auto-update" checked/);
+  assert.match(page, /data-action="check-update"/);
+});
+
+test("the global tabs replace the three-zone body, and Projects restores it", () => {
+  const mcp = render({ ...connected, section: "mcp", shellInfo });
+  assert.match(mcp, /data-nav="mcp" aria-current="true"/);
+  assert.match(mcp, /data-section-page="mcp"/);
+  assert.doesNotMatch(mcp, /data-rail="projects"/);
+
+  const settings = render({ ...connected, section: "settings", shellInfo });
+  assert.match(settings, /data-nav="settings" aria-current="true"/);
+  assert.match(settings, /data-section-page="settings"/);
+  assert.doesNotMatch(settings, /data-rail="inbox"/);
+
+  const projects = render(connected);
+  assert.match(projects, /data-rail="projects"/);
+  assert.match(projects, /data-rail="inbox"/);
+});
+
+test("the update banner sits above the body on every section", () => {
+  const html = render({
+    ...connected,
+    section: "settings",
+    shellInfo,
+    update: { status: "available", version: "0.1.2", currentVersion: "0.1.1" },
+  });
+  assert.ok(html.indexOf('data-banner="update"') > 0);
+  assert.ok(
+    html.indexOf('data-banner="update"') < html.indexOf('data-section-page="settings"'),
+    "the notification is not buried inside the tab",
+  );
 });
 
