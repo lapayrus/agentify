@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentify_backends::{
-    run_conformance, Backend, BackendError, EnvironmentSpec, FakeBackend, FakeFault, FakeScript,
+    run_conformance, run_lifecycle_conformance, Backend, BackendError, EnvironmentSpec, FakeBackend, FakeFault, FakeScript,
     Outcome,
 };
 
@@ -22,6 +22,33 @@ async fn the_fake_backend_passes_the_whole_conformance_suite() {
     );
     assert_eq!(report.passed(), 13, "every case runs:\n{}", report.summary());
     assert_eq!(report.skipped(), 0, "nothing is skipped:\n{}", report.summary());
+}
+
+#[tokio::test]
+async fn the_lifecycle_half_runs_on_its_own() {
+    // A Backend that only serves the lifecycle (the WSL adapter before its exec,
+    // logs, and stats ticket) still proves the lifecycle through the same table.
+    let report = run_lifecycle_conformance(&FakeBackend::default(), "life").await;
+    assert!(report.is_ok(), "{}", report.summary());
+    let names: Vec<&str> = report.cases.iter().map(|case| case.name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "describe_reports_name_version_platform",
+            "start_is_idempotent_and_reports_running",
+            "leased_ports_are_bound_while_running",
+            "stop_is_idempotent",
+            "status_is_readable_before_any_start",
+            "start_converges_after_remove",
+            "unsupported_capabilities_are_typed",
+        ],
+        "the lifecycle half is exactly the cases a lifecycle-only adapter can serve"
+    );
+    assert_eq!(report.passed(), 7, "{}", report.summary());
+    assert!(
+        !names.contains(&"exec_returns_stdout_stderr_and_exit_code"),
+        "exec is not part of the lifecycle half"
+    );
 }
 
 #[tokio::test]

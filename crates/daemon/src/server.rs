@@ -245,7 +245,11 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
     let instance = state.instance()?;
     let token = state.issue_agent_token()?;
 
-    let backend = backends::select(&config.backend, config.backend_script.as_deref())?;
+    let backend = backends::select(
+        &config.backend,
+        config.backend_script.as_deref(),
+        &config.data_root,
+    )?;
     let lifecycle = Arc::new(Lifecycle {
         backend,
         ports: crate::ports::PortRegistry::new(config.lease_range),
