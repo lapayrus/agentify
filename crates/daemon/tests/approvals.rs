@@ -5,8 +5,8 @@
 //! speak HTTP. Nothing here reaches into daemon internals, and no test can open
 //! a real OS prompt: the consent gesture is always a scripted verifier.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::Duration;
 
 use agentify_daemon::consent::ConsentMode;
 use agentify_daemon::ports::PortRange;
@@ -16,7 +16,6 @@ use serde_json::{json, Value};
 /// A daemon booted by a test, shut down on drop.
 struct Daemon {
     inner: Option<agentify_daemon::RunningDaemon>,
-    home: PathBuf,
 }
 
 impl Daemon {
@@ -31,10 +30,8 @@ impl Daemon {
     }
 
     fn boot(config: Config) -> Daemon {
-        let home = config.data_root.clone();
         Daemon {
             inner: Some(agentify_daemon::start_in_background(config).expect("boot daemon")),
-            home,
         }
     }
 
@@ -230,7 +227,7 @@ fn activity(daemon: &Daemon) -> Value {
 #[test]
 fn deleting_a_project_returns_202_with_ids_and_changes_nothing() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut daemon = Daemon::granting(temp.path());
+    let daemon = Daemon::granting(temp.path());
     create_fixture(&daemon);
     start(&daemon, "hello-pg");
     let ports = leased_ports(&daemon, "hello-pg");
