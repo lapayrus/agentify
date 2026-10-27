@@ -23,7 +23,9 @@ serde_json = { workspace = true }
 ureq = { workspace = true }
 
 [dev-dependencies]
+agentify-backends = { path = "../backends" }
 agentify-daemon = { path = "../daemon" }
+agentify-ingress = { path = "../ingress" }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 ureq = { workspace = true }

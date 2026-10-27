@@ -66,6 +66,13 @@ libc = "0.2"
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 ureq = { workspace = true }
+# The slice test reads `https://web.<project>.localhost` with Caddy's own root
+# pinned: it never installs trust in this machine's certificate store.
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+] }
 # `test-support` exposes the fake Caddy admin endpoint and the fake trust
 # installer, so an API-seam test can substitute Caddy without substituting the
 # daemon's ingress code.

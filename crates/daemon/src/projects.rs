@@ -361,23 +361,17 @@ pub fn declared_routes(record: &ProjectRecord) -> Result<Vec<DeclaredRoute>> {
 /// The guest ports this Project declares, as `(resource, guest port)` pairs the
 /// daemon leases host ports for.
 ///
-/// An app declares its ports in the Manifest. A Postgres database does not: it
-/// listens on 5432, so that is what the daemon leases and probes.
+/// Only declared ports are leased. A database has no host port: it is reached
+/// by `exec` inside its own Environment, never through the Windows loopback.
 pub fn port_requests(record: &ProjectRecord) -> Result<Vec<(String, u16)>> {
     let spec = stored_spec(record)?;
     let mut requests = Vec::new();
     for resource in record.resources.iter() {
-        let stored = spec.resources.get(&resource.name);
-        match stored {
-            Some(stored) if !stored.ports.is_empty() => {
-                for port in &stored.ports {
-                    requests.push((resource.name.clone(), port.port));
-                }
-            }
-            Some(stored) if stored.kind == "database" && stored.engine.as_deref() == Some("postgres") => {
-                requests.push((resource.name.clone(), 5432));
-            }
-            _ => {}
+        let Some(stored) = spec.resources.get(&resource.name) else {
+            continue;
+        };
+        for port in &stored.ports {
+            requests.push((resource.name.clone(), port.port));
         }
     }
     Ok(requests)

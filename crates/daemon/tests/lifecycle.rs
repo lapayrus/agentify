@@ -267,7 +267,7 @@ fn start_is_idempotent_and_reuses_the_same_leases() {
 
     let (_, first) = start(&daemon, "hello-pg");
     let ports = leased_ports(&first);
-    assert_eq!(ports.len(), 2, "web:3000 and db:5432 are leased: {first}");
+    assert_eq!(ports.len(), 1, "web:3000 is leased: {first}");
 
     let (status_code, second) = start(&daemon, "hello-pg");
     assert_eq!(status_code, 200, "start is idempotent: {second}");
@@ -381,7 +381,11 @@ fn health_is_decided_by_the_daemon_and_reports_degraded() {
     let web = resources.iter().find(|r| r["name"] == "web").expect("web");
     let db = resources.iter().find(|r| r["name"] == "db").expect("db");
     assert_eq!(web["health"], "unhealthy", "{web}");
-    assert_eq!(db["health"], "healthy", "{db}");
+    assert_eq!(
+        db["health"], "unknown",
+        "a database has no host port to probe: {db}"
+    );
+    assert_eq!(db["state"], "running", "{db}");
 
     // The same answer on a read, because health is observed, not remembered.
     let (_, again) = status(&daemon, "hello-pg");
@@ -783,7 +787,7 @@ fn state_survives_a_daemon_restart_and_start_converges_again() {
     let (code, started) = first.call("POST", "/v1/projects/hello-pg/environments/dev/start", Some("{}"));
     assert_eq!(code, 200, "{started}");
     let ports = leased_ports(&started);
-    assert_eq!(ports.len(), 2);
+    assert_eq!(ports.len(), 1, "only the app is published: {started}");
     first.kill();
 
     // A new daemon: same data root, new process, no runtime.

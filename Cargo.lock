@@ -10,6 +10,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2",
  "time",
  "tokio",
@@ -43,6 +44,7 @@ dependencies = [
  "keyring",
  "libc",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -78,7 +80,9 @@ dependencies = [
 name = "agentify-mcp"
 version = "0.1.0"
 dependencies = [
+ "agentify-backends",
  "agentify-daemon",
+ "agentify-ingress",
  "agentify-proto",
  "anyhow",
  "serde",

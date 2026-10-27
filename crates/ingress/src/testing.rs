@@ -120,6 +120,12 @@ impl Drop for FakeAdmin {
 
 fn handle(mut stream: TcpStream, recorded: &Arc<Mutex<Recorded>>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    // On Windows an accepted socket inherits the listening socket's non-blocking
+    // mode, so a request head that has not landed yet reads as `WouldBlock`
+    // rather than blocking. Treating that as end-of-request drops a connection
+    // the client is still writing to — intermittently, and more often the busier
+    // the machine is — so wait for it, with a bound.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut raw = Vec::new();
     let mut buffer = [0u8; 4096];
     let split = loop {
@@ -130,6 +136,12 @@ fn handle(mut stream: TcpStream, recorded: &Arc<Mutex<Recorded>>) {
                 if let Some(position) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
                     break Some(position);
                 }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(_) => break None,
         }
@@ -156,6 +168,12 @@ fn handle(mut stream: TcpStream, recorded: &Arc<Mutex<Recorded>>) {
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => body.extend_from_slice(&buffer[..read]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             Err(_) => break,
         }
     }

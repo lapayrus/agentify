@@ -36,6 +36,15 @@ if [ "${AGENTIFY_ENGINE:-0}" = "1" ]; then
   else
     echo "agentify-prepare: the container engine could not be installed; this distro runs without one" >&2
   fi
+
+  # Compose is what runs the Project's Resources. Two package names ship it, and
+  # a distro with either is fine: the supervisor asks `docker compose` first and
+  # falls back to the standalone binary.
+  if ! apt-get install -y -qq --no-install-recommends docker-compose-v2; then
+    echo "agentify-prepare: docker-compose-v2 is not in this archive; trying the standalone binary" >&2
+    apt-get install -y -qq --no-install-recommends docker-compose || \
+      echo "agentify-prepare: no Compose is installed; this distro can hold leases but not run workloads" >&2
+  fi
 fi
 
 # A WSL distro imported from a tar has no launcher executable, so the only way

@@ -4,8 +4,11 @@
 //! installed binary needs no repository paths: creating a Project from `hello-pg`
 //! copies the embedded files into the Project's daemon-owned workspace.
 //!
-//! Ticket 09 turns this into a real vertical slice (migrations, a Postgres-backed
-//! page, a health endpoint); ticket 02 only needs the build context to exist.
+//! `hello-pg` is the vertical slice: a Node 22 app that reads a row from Postgres
+//! 16, a migration an Agent runs through `exec`, and a health endpoint the daemon
+//! probes. `hello` is the same Project under the shorter name, so the URL the
+//! spec's acceptance check names — `https://web.hello.localhost` — exists without
+//! a second copy of the source.
 
 /// A fixture: a Manifest plus the files that make up its build context.
 pub struct Fixture {
@@ -30,23 +33,58 @@ const HELLO_PG: Fixture = Fixture {
             include_str!("../../../fixtures/hello-pg/Dockerfile"),
         ),
         (
+            "package.json",
+            include_str!("../../../fixtures/hello-pg/package.json"),
+        ),
+        (
             "server.js",
             include_str!("../../../fixtures/hello-pg/server.js"),
+        ),
+        (
+            "migrate.js",
+            include_str!("../../../fixtures/hello-pg/migrate.js"),
         ),
     ],
 };
 
+/// The same slice under the Project name `hello`.
+///
+/// It is one `project:` line away from [`HELLO_PG`], and it exists because the
+/// acceptance check names `https://web.hello.localhost`: a fixture whose name and
+/// whose Project name are allowed to differ is the honest way to have both
+/// without a second copy of the app that could drift from this one.
+fn hello() -> &'static Fixture {
+    static HELLO: std::sync::OnceLock<Fixture> = std::sync::OnceLock::new();
+    HELLO.get_or_init(|| {
+        let renamed = HELLO_PG.manifest.replace("project: hello-pg", "project: hello");
+        assert_ne!(
+            renamed, HELLO_PG.manifest,
+            "the fixture's Manifest names its Project, or the rename above is a no-op"
+        );
+        let manifest: &'static str = Box::leak(renamed.into_boxed_str());
+        let mut files = HELLO_PG.files.to_vec();
+        files[0].1 = manifest;
+        Fixture {
+            name: "hello",
+            manifest,
+            files: Box::leak(files.into_boxed_slice()),
+        }
+    })
+}
+
 /// Every bundled fixture.
-const FIXTURES: &[Fixture] = &[HELLO_PG];
+fn all() -> Vec<&'static Fixture> {
+    vec![&HELLO_PG, hello()]
+}
 
 /// Look up a bundled fixture by name.
 pub fn get(name: &str) -> Option<&'static Fixture> {
-    FIXTURES.iter().find(|fixture| fixture.name == name)
+    all().into_iter().find(|fixture| fixture.name == name)
 }
 
 /// Names of the bundled fixtures, for error messages.
 pub fn names() -> Vec<&'static str> {
-    FIXTURES.iter().map(|fixture| fixture.name).collect()
+    all().iter().map(|fixture| fixture.name).collect()
 }
 
 #[cfg(test)]
@@ -58,13 +96,48 @@ mod tests {
         let fixture = get("hello-pg").expect("hello-pg is bundled");
         let manifest = agentify_manifest::parse(fixture.manifest).expect("the fixture parses");
         assert_eq!(manifest.project, "hello-pg");
-        assert!(
-            fixture
+        for required in ["Dockerfile", "server.js", "migrate.js", "package.json", "agentify.yaml"] {
+            assert!(
+                fixture.files.iter().any(|(path, _)| *path == required),
+                "{required} is part of the fixture's build context"
+            );
+        }
+        assert!(get("nope").is_none());
+    }
+
+    #[test]
+    fn the_slice_runs_under_the_name_the_acceptance_check_uses() {
+        let fixture = get("hello").expect("hello is bundled");
+        let manifest = agentify_manifest::parse(fixture.manifest).expect("the fixture parses");
+        assert_eq!(manifest.project, "hello", "https://web.hello.localhost");
+        let web = manifest.resources.get("web").expect("the web Resource");
+        match &web.kind {
+            agentify_manifest::ResourceKind::App(app) => assert_eq!(
+                app.ports.first().map(|port| port.url(&manifest.project)),
+                Some("https://web.hello.localhost".to_string())
+            ),
+            other => panic!("web is an app, not {other:?}"),
+        }
+        let db = manifest.resources.get("db").expect("the db Resource");
+        assert_eq!(db.kind_label(), "database");
+        assert_eq!(
+            manifest.routes().first().map(|route| route.url.as_str()),
+            Some("https://web.hello.localhost")
+        );
+        // The same source as `hello-pg`: one app, two names.
+        let sibling = get("hello-pg").expect("hello-pg");
+        for (path, contents) in fixture.files {
+            if *path == "agentify.yaml" {
+                continue;
+            }
+            let original = sibling
                 .files
                 .iter()
-                .any(|(path, _)| *path == "Dockerfile"),
-            "a `build` Resource needs a Dockerfile in the workspace"
-        );
-        assert!(get("nope").is_none());
+                .find(|(other, _)| other == path)
+                .map(|(_, contents)| *contents)
+                .expect("the same file list");
+            assert_eq!(*contents, original, "{path} is the same file in both fixtures");
+        }
+        assert_eq!(names(), vec!["hello-pg", "hello"]);
     }
 }
