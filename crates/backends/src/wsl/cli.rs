@@ -13,7 +13,7 @@
 //! * `wsl --shutdown` is never run. It kills every distro on the machine,
 //!   including the user's own; this module has no function for it.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
@@ -382,6 +382,31 @@ impl Wsl {
         })
     }
 
+    /// Start a command in a distro and hand back the *live* child: its stdout and
+    /// stderr are separate pipes the caller reads as the command produces output.
+    ///
+    /// This is `exec`. `spawn_foreground` is for the supervisor, which must stay
+    /// alive for the life of the Environment; this one is for a bounded command,
+    /// whose streams end when the command does.
+    pub fn spawn_streaming(&self, distro: &str, argv: &[String]) -> Result<Child> {
+        if !is_supported() {
+            return Err(unsupported());
+        }
+        let mut command = Command::new(WSL_EXE);
+        command
+            .arg("-d")
+            .arg(distro)
+            .arg("--")
+            .args(argv)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        hide_console(&mut command);
+        command.spawn().map_err(|err| BackendError::BackendUnavailable {
+            detail: format!("cannot run a command in {distro}: {err}"),
+        })
+    }
+
     fn raw(&self, args: &[String]) -> Result<Output> {
         self.raw_in(None, args)
     }
@@ -524,27 +549,6 @@ pub fn parse_supervisor_line(line: &str) -> SupervisorLine {
         }
         _ => SupervisorLine::Other(line.to_string()),
     }
-}
-
-/// Drain a child's stdout on a background thread, so the pipe never fills and
-/// the daemon can read the protocol as it arrives.
-pub fn drain_lines<R: Read + Send + 'static>(
-    reader: R,
-    sink: std::sync::mpsc::Sender<String>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    if sink.send(line).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    })
 }
 
 #[cfg(test)]
