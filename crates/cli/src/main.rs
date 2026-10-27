@@ -62,8 +62,10 @@ Usage:
   agentify path install               put this install directory on the user PATH
   agentify path remove                take it out again
   agentify path status                is it on the user PATH?
-  agentify uninstall                  remove login item, trust, and Caddy data
-  agentify uninstall --purge          also remove runtimes and the data root
+  agentify uninstall                  remove login item, PATH entry, trust, and Caddy data
+  agentify uninstall --purge          also remove the data root (Projects and runtimes)
+  agentify uninstall --keep-machine   keep the machine-level additions
+  agentify uninstall --force          proceed even if an MCP client is connected
 
   `agentify bootstrap` on its own only reports: it never installs WSL, enables a
   Windows feature, or asks for an administrator token. Consenting is a human
@@ -271,14 +273,35 @@ fn path_command(args: &[String]) -> ExitCode {
     }
 }
 
-/// `agentify uninstall [--purge]`.
+/// `agentify uninstall [--purge] [--keep-machine] [--force]`.
 ///
-/// Non-destructive by default: it removes the login item, the trusted root, and
-/// Caddy data, and leaves Projects and the state database. `--purge` is the
-/// explicit, confirmed removal that also deletes runtimes and the data root.
+/// Non-destructive by default: it removes the login item, the PATH entry, the
+/// trusted root, and Caddy data, and leaves Projects and the state database.
+/// `--purge` is the explicit, confirmed removal that also deletes runtimes and
+/// the data root. `--keep-machine` answers no to the first uninstall question;
+/// `--force` proceeds while an MCP client still holds the shim open.
 fn uninstall(args: &[String]) -> ExitCode {
     let purge = args.iter().any(|arg| arg == "--purge");
+    let machine = !args.iter().any(|arg| arg == "--keep-machine");
+    let force = args.iter().any(|arg| arg == "--force");
     let data_root = agentify_proto::resolve_data_root();
+
+    // An MCP client holds `agentify-mcp.exe` open, and Windows will not delete a
+    // running executable. Name the process instead of failing halfway.
+    if !force {
+        let shims = running_shims();
+        if !shims.is_empty() {
+            let pids = shims
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "agentify: an MCP client is still using this install (agentify-mcp pid {pids}); close it and retry, or pass --force"
+            );
+            return ExitCode::from(3);
+        }
+    }
 
     // A running daemon holds state.db and its Caddy; stop it first so those files
     // can be removed. Absence is not an error: there may be nothing to stop.
@@ -287,7 +310,7 @@ fn uninstall(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match agentify_daemon::uninstall::run_system(&data_root, purge) {
+    match agentify_daemon::uninstall::run_system(&data_root, purge, machine) {
         Ok(report) => {
             if purge {
                 println!("uninstall: purge complete");
@@ -302,6 +325,9 @@ fn uninstall(args: &[String]) -> ExitCode {
             }
             if report.removed_caddy {
                 println!("  Caddy data removed");
+            }
+            if report.removed_path_entry {
+                println!("  PATH entry removed");
             }
             for distro in &report.removed_runtimes {
                 println!("  removed runtime {distro}");
@@ -435,6 +461,55 @@ fn revoke_token() -> ExitCode {
             eprintln!("agentify: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// MCP shims currently running: a client holds one open per session.
+#[cfg(windows)]
+fn running_shims() -> Vec<u32> {
+    let output = std::process::Command::new("tasklist.exe")
+        .args(["/FI", "IMAGENAME eq agentify-mcp.exe", "/FO", "CSV", "/NH"])
+        .output();
+    match output {
+        Ok(output) => parse_shim_pids(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(not(windows))]
+fn running_shims() -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn parse_shim_pids(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('"') {
+                return None;
+            }
+            let mut fields = line.split("\",\"");
+            let image = fields.next()?.trim_start_matches('"');
+            if !image.eq_ignore_ascii_case("agentify-mcp.exe") {
+                return None;
+            }
+            fields.next()?.trim_matches('"').parse().ok()
+        })
+        .collect()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::parse_shim_pids;
+
+    #[test]
+    fn shim_rows_are_parsed_by_pid() {
+        let output = "\"agentify-mcp.exe\",\"4242\",\"Console\",\"1\",\"4,500 K\"\r\n";
+        assert_eq!(parse_shim_pids(output), vec![4242]);
+        assert!(parse_shim_pids("INFO: No tasks are running.\r\n").is_empty());
+        assert!(parse_shim_pids("\"agentify.exe\",\"7\",\"Console\",\"1\",\"1 K\"\r\n").is_empty());
     }
 }
 

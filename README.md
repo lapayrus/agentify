@@ -246,13 +246,17 @@ adopt as degraded (`GET /v1/system/update_readiness` is the same gate).
 
 ### Uninstall
 
-Uninstalling the app removes the login item, the trusted root, and Caddy data,
-and leaves Projects and `state.db` untouched. The confirmed, destructive removal
-is a separate command:
+Uninstalling asks two questions and honours both: whether to remove Agentify's
+machine-level additions (logon task left by v0.1.x, PATH entry, trusted root,
+Caddy data, caches), and whether to delete Projects and their runtimes. The
+second defaults to No. The confirmed, destructive removal is also available as a
+command:
 
 ```sh
-agentify uninstall            # non-destructive; Projects and state survive
-agentify uninstall --purge    # also delete runtimes, Checkpoints, and the data root
+agentify uninstall                     # machine-level additions only
+agentify uninstall --purge             # also the data root: Projects and runtimes
+agentify uninstall --keep-machine      # data root only, keep the machine additions
+agentify uninstall --force             # proceed while an MCP client is connected
 ```
 
 ## Data root and state

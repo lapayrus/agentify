@@ -61,13 +61,45 @@
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  DetailPrint "Removing $INSTDIR from the user PATH"
-  ExecWait '"$INSTDIR\agentify.exe" path remove' $0
-  DetailPrint "agentify path remove exited with $0"
-  DetailPrint "Removing the Agentify daemon login item"
-  ExecWait '"$INSTDIR\agentify.exe" login-item remove' $0
-  DetailPrint "agentify login-item remove exited with $0"
-  DetailPrint "Removing the trusted root and Caddy data; Projects are left in place"
-  ExecWait '"$INSTDIR\agentify.exe" uninstall' $0
+  ; Stop the daemon before any file is deleted. An Operation in flight is the one
+  ; refusal: `daemon stop` answers 2, and the uninstall is abandoned.
+  ExecWait '"$INSTDIR\agentify.exe" daemon stop' $0
+  DetailPrint "agentify daemon stop exited with $0"
+  ${If} $0 == 2
+    MessageBox MB_OK|MB_ICONEXCLAMATION "An Agentify operation is in flight. Let it finish, then uninstall again."
+    Abort
+  ${EndIf}
+
+  ; Question 1, default yes: what belongs to this installation rather than to
+  ; its Projects.
+  StrCpy $2 "1"
+  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON1 /SD IDYES "Remove Agentify's daemon registrations, PATH entry, certificate trust, and caches?$\n$\nChoose No to keep them." IDYES machine_done
+  StrCpy $2 "0"
+  machine_done:
+
+  ; Question 2, default no: Projects and their runtimes.
+  StrCpy $3 "0"
+  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 /SD IDNO "Delete your Projects and their runtimes?$\n$\nThis removes the state database, Project workspaces, WSL runtimes, and Checkpoints. Choose No to keep them." IDYES projects_yes
+  Goto projects_done
+  projects_yes:
+    StrCpy $3 "1"
+  projects_done:
+
+  ; The CLI owns the inventory of what was installed; the prompts only choose
+  ; among its two answers.
+  ${If} $2 == "1"
+  ${AndIf} $3 == "1"
+    ExecWait '"$INSTDIR\agentify.exe" uninstall --purge' $0
+  ${ElseIf} $2 == "1"
+    ExecWait '"$INSTDIR\agentify.exe" uninstall' $0
+  ${ElseIf} $3 == "1"
+    ExecWait '"$INSTDIR\agentify.exe" uninstall --purge --keep-machine' $0
+  ${Else}
+    DetailPrint "Machine-level additions and Projects were kept"
+  ${EndIf}
   DetailPrint "agentify uninstall exited with $0"
+  ${If} $0 == 3
+    MessageBox MB_OK|MB_ICONEXCLAMATION "Close any MCP clients connected to Agentify, then uninstall again."
+    Abort
+  ${EndIf}
 !macroend
