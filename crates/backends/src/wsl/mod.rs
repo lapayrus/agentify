@@ -7,13 +7,26 @@
 //! `remove` unregisters the distro, deletes its data, and verifies that neither
 //! the distro nor its leases remain.
 //!
+//! The operational surface rides on that same distro and never on a host mount:
+//!
+//! * [`exec`](exec) runs a command as its own process group, keeps stdout and
+//!   stderr apart, reports the exit code, and can terminate the group — and every
+//!   process carrying the exec's marker — when the call is cancelled;
+//! * [`log`] keeps the supervisor's output as a per-Environment log on the
+//!   daemon's disk, so `tail`, `since`, and `follow` are exact and a slow reader
+//!   cannot block the workload;
+//! * [`stats`] reports what the distro can prove — CPU, memory, and disk from
+//!   `/proc` and `df`, per-Resource figures from `docker stats` when the engine
+//!   is there;
+//! * [`transfer`] moves single files in and out through the launcher's pipes,
+//!   after [`paths`] refuses a traversal or a host path the daemon does not own.
+//!
 //! What it deliberately does not do:
 //!
 //! * it never runs `wsl --shutdown` and never terminates or unregisters a distro
 //!   whose name it did not mint, so the user's `Ubuntu` and `docker-desktop`
 //!   are untouchable;
-//! * it does not claim exec, logs, stats, events, or copy: those are the next
-//!   ticket, and they answer [`BackendError::Unsupported`] until then;
+//! * it does not claim `events`, `pty`, `mount`, or `checkpoint`;
 //! * it reports what the machine actually says. `status` reads `wsl -l -v` and
 //!   probes the leased ports; a distro that died is `stopped`, not `running`.
 //!
@@ -23,13 +36,18 @@
 //! See `research/windows-wsl-per-project.md`.
 
 pub mod cli;
+pub mod exec;
+pub mod log;
+pub mod paths;
 pub mod rootfs;
+pub mod stats;
 pub mod template;
+pub mod transfer;
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,14 +56,15 @@ use agentify_proto::Capabilities;
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{
-    Backend, BackendInfo, BackendStatus, BoxFuture, CheckpointId, EventStream,
-    ExecSession, ExecSpec, LogOptions, LogStream, ResourceStatus, Stats, STATE_ABSENT,
-    STATE_DEGRADED, STATE_RUNNING, STATE_STOPPED,
+    Backend, BackendInfo, BackendStatus, BoxFuture, CheckpointId, EventStream, ExecSession,
+    ExecSpec, LogOptions, LogStream, ResourceStatus, Stats, STATE_ABSENT, STATE_DEGRADED,
+    STATE_RUNNING, STATE_STOPPED,
 };
 use crate::error::{BackendError, Result};
 use crate::spec::EnvironmentSpec;
 
 use cli::{Distro, SupervisorLine, Wsl};
+use log::LogSink;
 pub use rootfs::RootfsSource;
 
 /// Adapter name reported by [`WslBackend::describe`].
@@ -67,6 +86,13 @@ pub const SUPERVISE_SCRIPT: &str = include_str!("scripts/supervise.sh");
 pub fn unix_script(source: &str) -> String {
     source.replace("\r\n", "\n")
 }
+
+/// The `resource` field of a line the supervisor itself wrote.
+///
+/// The Environment's log is the supervisor's output, which is not any one
+/// Resource's: labelling it honestly is what lets a caller filter by Resource and
+/// get nothing, instead of getting somebody else's lines under the wrong name.
+pub const SUPERVISOR_LOG_RESOURCE: &str = "supervisor";
 
 /// Environment variable pointing at a local rootfs tar instead of the pinned
 /// download. Tests use it; a machine on a slow link may too.
@@ -105,13 +131,20 @@ pub struct WslConfig {
     pub start_timeout: Duration,
     pub stop_timeout: Duration,
     pub remove_timeout: Duration,
+    /// The only host directory a `copyIn`/`copyOut` may name. `Some(data_root)`
+    /// in production: the daemon owns every host path it hands a Backend, and
+    /// this is the adapter's half of that promise. `None` accepts any absolute,
+    /// non-climbing path, which only a test wants.
+    pub host_transfer_root: Option<PathBuf>,
 }
 
 impl WslConfig {
     /// Production defaults for one data root.
     pub fn new(data_root: impl Into<PathBuf>) -> Self {
+        let data_root = data_root.into();
         Self {
-            data_root: data_root.into(),
+            host_transfer_root: Some(data_root.clone()),
+            data_root,
             distro_prefix: "agentify".to_string(),
             rootfs: RootfsSource::Pinned,
             engine: true,
@@ -167,6 +200,13 @@ impl WslConfig {
         self
     }
 
+    /// Where a transfer's host path is allowed to live. `None` lifts the
+    /// daemon-owned root, which is only ever right in a test.
+    pub fn with_host_transfer_root(mut self, root: Option<PathBuf>) -> Self {
+        self.host_transfer_root = root;
+        self
+    }
+
     /// Everything this adapter writes lives under `<data_root>/wsl/`.
     pub fn wsl_dir(&self) -> PathBuf {
         self.data_root.join("wsl")
@@ -192,6 +232,13 @@ impl WslConfig {
         self.wsl_dir()
             .join("env")
             .join(format!("{}.json", sanitize(environment)))
+    }
+
+    /// The daemon-read log for one Environment: the supervisor's own output.
+    pub fn log_path(&self, environment: &str) -> PathBuf {
+        self.wsl_dir()
+            .join("env")
+            .join(format!("{}.log", sanitize(environment)))
     }
 
     /// `agentify-<id>`: unique, lower-case, and recognisably ours.
@@ -264,6 +311,9 @@ struct Supervisor {
     ports: Vec<u16>,
     /// Everything the supervisor said that was not protocol, for diagnostics.
     chatter: Vec<String>,
+    /// The Environment's log, shared with the tee threads and with exec, so a
+    /// cancellation that did not take is written down where a human will see it.
+    log: Arc<Mutex<LogSink>>,
 }
 
 impl Supervisor {
@@ -378,12 +428,16 @@ impl Backend for WslBackend {
             version: BACKEND_VERSION.to_string(),
             platform: PLATFORM.to_string(),
             capabilities: Capabilities {
+                // v0 has no interactive terminal: a command gets pipes.
                 pty: false,
+                // Data lives on ext4 inside the distro; there is no host mount.
                 mount: false,
                 checkpoint: false,
                 events: false,
-                resource_stats: false,
-                log_since: false,
+                // Per-Resource figures come from the container engine when the
+                // distro has one, and the log honours a `since` cursor.
+                resource_stats: true,
+                log_since: true,
             },
         }
     }
@@ -416,44 +470,105 @@ impl Backend for WslBackend {
 
     fn exec<'a>(
         &'a self,
-        _environment: &'a str,
-        _target: Option<&'a str>,
-        _spec: &'a ExecSpec,
+        environment: &'a str,
+        target: Option<&'a str>,
+        spec: &'a ExecSpec,
     ) -> BoxFuture<'a, Result<ExecSession>> {
-        Box::pin(async move { Err(BackendError::unsupported("exec")) })
+        let environment = environment.to_string();
+        let target = target.map(str::to_string);
+        let spec = spec.clone();
+        Box::pin(async move {
+            let inner = self.inner.clone();
+            tokio::task::spawn_blocking(move || exec_environment(&inner, &environment, target.as_deref(), &spec))
+                .await
+                .map_err(|err| BackendError::BackendUnavailable {
+                    detail: format!("the WSL exec worker did not finish: {err}"),
+                })?
+        })
     }
 
     fn logs<'a>(
         &'a self,
-        _environment: &'a str,
-        _target: Option<&'a str>,
-        _options: &'a LogOptions,
+        environment: &'a str,
+        target: Option<&'a str>,
+        options: &'a LogOptions,
     ) -> BoxFuture<'a, Result<LogStream>> {
-        Box::pin(async move { Err(BackendError::unsupported("logs")) })
+        let environment = environment.to_string();
+        let target = target.map(str::to_string);
+        let options = options.clone();
+        Box::pin(async move {
+            let inner = self.inner.clone();
+            tokio::task::spawn_blocking(move || {
+                open_log(&inner, &environment, target.as_deref(), &options)
+            })
+            .await
+            .map_err(|err| BackendError::BackendUnavailable {
+                detail: format!("the WSL log worker did not finish: {err}"),
+            })?
+        })
     }
 
-    fn stats<'a>(&'a self, _environment: &'a str) -> BoxFuture<'a, Result<Stats>> {
-        Box::pin(async move { Err(BackendError::unsupported("stats")) })
+    fn stats<'a>(&'a self, environment: &'a str) -> BoxFuture<'a, Result<Stats>> {
+        let environment = environment.to_string();
+        self.blocking(move |inner| environment_stats(&inner, &environment))
     }
 
     fn copy_in<'a>(
         &'a self,
-        _environment: &'a str,
-        _target: Option<&'a str>,
-        _host_path: &'a Path,
-        _guest_path: &'a str,
+        environment: &'a str,
+        target: Option<&'a str>,
+        host_path: &'a Path,
+        guest_path: &'a str,
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { Err(BackendError::unsupported("copyIn")) })
+        let environment = environment.to_string();
+        let target = target.map(str::to_string);
+        let host_path = host_path.to_path_buf();
+        let guest_path = guest_path.to_string();
+        self.blocking(move |inner| {
+            // The boundary check first: a traversal is refused before the runtime
+            // is asked whether it exists at all.
+            transfer::check_paths(
+                &host_path,
+                &guest_path,
+                inner.config.host_transfer_root.as_deref(),
+            )?;
+            let (distro, _) = require_running(&inner, &environment, target.as_deref(), "copy into")?;
+            transfer::copy_in(
+                &inner.wsl,
+                &distro,
+                &host_path,
+                &guest_path,
+                inner.config.host_transfer_root.as_deref(),
+            )
+        })
     }
 
     fn copy_out<'a>(
         &'a self,
-        _environment: &'a str,
-        _target: Option<&'a str>,
-        _guest_path: &'a str,
-        _host_path: &'a Path,
+        environment: &'a str,
+        target: Option<&'a str>,
+        guest_path: &'a str,
+        host_path: &'a Path,
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { Err(BackendError::unsupported("copyOut")) })
+        let environment = environment.to_string();
+        let target = target.map(str::to_string);
+        let guest_path = guest_path.to_string();
+        let host_path = host_path.to_path_buf();
+        self.blocking(move |inner| {
+            transfer::check_paths(
+                &host_path,
+                &guest_path,
+                inner.config.host_transfer_root.as_deref(),
+            )?;
+            let (distro, _) = require_running(&inner, &environment, target.as_deref(), "copy out of")?;
+            transfer::copy_out(
+                &inner.wsl,
+                &distro,
+                &guest_path,
+                &host_path,
+                inner.config.host_transfer_root.as_deref(),
+            )
+        })
     }
 
     fn checkpoint<'a>(&'a self, _environment: &'a str) -> BoxFuture<'a, Result<CheckpointId>> {
@@ -485,6 +600,110 @@ fn require_supported() -> Result<()> {
             detail: "the WSL Backend only runs on Windows".to_string(),
         })
     }
+}
+
+// -- the operational surface, in blocking form --------------------------------
+
+/// The distro an operational call runs against, or a typed `NotProvisioned`.
+///
+/// `target` is the Resource the caller named. v0 runs one distro per Environment
+/// and no containers of its own, so a command runs in the distro; the name is
+/// still checked, because a typo deserves `NotProvisioned` and not a mystery.
+fn require_running(
+    inner: &Inner,
+    environment: &str,
+    target: Option<&str>,
+    what: &str,
+) -> Result<(String, EnvRecord)> {
+    require_supported()?;
+    let config = &inner.config;
+    let distro = config.distro_name(environment);
+    if !inner.wsl.is_running(&distro)? {
+        return Err(BackendError::NotProvisioned {
+            detail: format!(
+                "no running runtime exists for Environment {environment}; start it before you {what}"
+            ),
+        });
+    }
+    let record = EnvRecord::read(config, environment).unwrap_or_else(|| EnvRecord {
+        environment: environment.to_string(),
+        distro: distro.clone(),
+        resources: Vec::new(),
+        ports: Vec::new(),
+        started_at: String::new(),
+    });
+    if let Some(target) = target {
+        if !record.resources.is_empty() && !record.resources.iter().any(|name| name == target) {
+            return Err(BackendError::NotProvisioned {
+                detail: format!(
+                    "Environment {environment} has no Resource named {target:?}; it has: {}",
+                    record.resources.join(", ")
+                ),
+            });
+        }
+    }
+    Ok((distro, record))
+}
+
+fn exec_environment(
+    inner: &Inner,
+    environment: &str,
+    target: Option<&str>,
+    spec: &ExecSpec,
+) -> Result<ExecSession> {
+    let (distro, _) = require_running(inner, environment, target, "run a command in it")?;
+    let marker = exec::marker(environment);
+    let log = inner
+        .running
+        .lock()
+        .expect("wsl running lock")
+        .get(environment)
+        .map(|supervisor| supervisor.log.clone());
+    exec::start(&inner.wsl, &distro, spec, &marker, log)
+}
+
+/// Read one Environment's log. A stopped Environment keeps its log, so this
+/// answers as long as the file is there: the point of keeping it is to read it
+/// after the runtime has gone.
+fn open_log(
+    inner: &Inner,
+    environment: &str,
+    target: Option<&str>,
+    options: &LogOptions,
+) -> Result<LogStream> {
+    require_supported()?;
+    let path = inner.config.log_path(environment);
+    if !path.is_file() {
+        return Err(BackendError::NotProvisioned {
+            detail: format!(
+                "no log exists for Environment {environment}; start it first"
+            ),
+        });
+    }
+    if options.follow {
+        return log::follow(&path, target, options);
+    }
+    let lines = log::read(&path, target, options)?;
+    Ok(crate::contract::stream_of(
+        lines.into_iter().map(Ok).collect(),
+    ))
+}
+
+/// Environment-level figures. A runtime that is not running has none, and this
+/// reports its state rather than an error: "stopped, nothing used" is an answer.
+fn environment_stats(inner: &Inner, environment: &str) -> Result<Stats> {
+    require_supported()?;
+    let distro = inner.config.distro_name(environment);
+    if inner.wsl.is_running(&distro)? {
+        let figures = stats::measure(&inner.wsl, &distro)?;
+        return Ok(figures.stats(environment, STATE_RUNNING));
+    }
+    let state = if inner.wsl.find(&distro)?.is_some() {
+        STATE_STOPPED
+    } else {
+        STATE_ABSENT
+    };
+    Ok(stats::stopped(environment, state))
 }
 
 // -- the lifecycle, in blocking form -----------------------------------------
@@ -524,11 +743,24 @@ fn start_environment(inner: &Inner, spec: &EnvironmentSpec) -> Result<()> {
         running.remove(environment);
     }
 
-    // Keep the in-distro helper in step with this binary: it is written on every
-    // start, so a daemon upgrade cannot leave an old supervisor behind.
-    inner
-        .wsl
-        .write_file(&distro, SUPERVISE_PATH, unix_script(SUPERVISE_SCRIPT).as_bytes(), "0755")?;
+    // Keep the in-distro helpers in step with this binary: they are written on
+    // every start, so a daemon upgrade cannot leave an old copy behind.
+    inner.wsl.write_file(
+        &distro,
+        SUPERVISE_PATH,
+        unix_script(SUPERVISE_SCRIPT).as_bytes(),
+        "0755",
+    )?;
+    inner.wsl.write_file(
+        &distro,
+        exec::EXEC_PATH,
+        unix_script(exec::EXEC_SCRIPT).as_bytes(),
+        "0755",
+    )?;
+
+    // The Environment's log: one append-only file per Environment, written by
+    // dedicated threads, so nothing a follower does can slow the supervisor.
+    let sink = Arc::new(Mutex::new(LogSink::open(&config.log_path(environment))?));
 
     let argv: Vec<String> = std::iter::once(SUPERVISE_PATH.to_string())
         .chain(ports.iter().map(u16::to_string))
@@ -536,7 +768,7 @@ fn start_environment(inner: &Inner, spec: &EnvironmentSpec) -> Result<()> {
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let child = inner.wsl.spawn_foreground(&distro, &argv_refs)?;
 
-    match await_ready(child, &ports, config.start_timeout) {
+    match await_ready(child, &ports, config.start_timeout, sink) {
         Ok(supervisor) => {
             let record = EnvRecord {
                 environment: environment.clone(),
@@ -565,26 +797,38 @@ fn start_environment(inner: &Inner, spec: &EnvironmentSpec) -> Result<()> {
 /// Wait for the supervisor to say it bound everything, and for the host to be
 /// able to reach it. The daemon decides health; `start` only guarantees that a
 /// probe *can* succeed.
+///
+/// Both of the supervisor's pipes are drained by tee threads for the whole life
+/// of the child: they append to the Environment's log and, until readiness is
+/// settled, forward each line here. That is what makes the log complete and what
+/// keeps a full pipe from ever stalling the workload.
 fn await_ready(
     mut child: Child,
     ports: &[u16],
     timeout: Duration,
+    sink: Arc<Mutex<LogSink>>,
 ) -> Result<Supervisor> {
     let (sender, lines) = std::sync::mpsc::channel();
-    let mut chatter = Vec::new();
+    let forward = Arc::new(AtomicBool::new(true));
     if let Some(stdout) = child.stdout.take() {
-        cli::drain_lines(stdout, sender.clone());
+        log::spawn_tee(
+            stdout,
+            sink.clone(),
+            "stdout",
+            SUPERVISOR_LOG_RESOURCE,
+            forward.clone(),
+            Some(sender.clone()),
+        );
     }
     if let Some(stderr) = child.stderr.take() {
-        let sink = sender.clone();
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            let mut pipe = stderr;
-            let _ = pipe.read_to_string(&mut text);
-            for line in text.lines() {
-                let _ = sink.send(format!("stderr: {line}"));
-            }
-        });
+        log::spawn_tee(
+            stderr,
+            sink.clone(),
+            "stderr",
+            SUPERVISOR_LOG_RESOURCE,
+            forward.clone(),
+            Some(sender),
+        );
     }
 
     let deadline = Instant::now() + timeout;
@@ -593,22 +837,25 @@ fn await_ready(
         lines,
         ports: ports.to_vec(),
         chatter: Vec::new(),
+        log: sink,
     };
     loop {
         while let Ok(line) = supervisor.lines.try_recv() {
             match cli::parse_supervisor_line(&line) {
                 SupervisorLine::Failed(port, reason) => {
+                    forward.store(false, Ordering::SeqCst);
                     return Err(BackendError::PortUnavailable {
                         port,
                         holder: format!("the distro could not bind 127.0.0.1:{port}: {reason}"),
                     });
                 }
-                SupervisorLine::Other(text) => chatter.push(text),
+                SupervisorLine::Other(text) => supervisor.chatter.push(text),
                 SupervisorLine::Bound(_) | SupervisorLine::Ready => {}
             }
         }
 
         if !supervisor.alive() {
+            forward.store(false, Ordering::SeqCst);
             let reason = supervisor
                 .chatter
                 .last()
@@ -620,11 +867,14 @@ fn await_ready(
         }
 
         if ports.iter().all(|port| probe(*port)) {
-            supervisor.chatter = chatter;
+            // Readiness is settled: from here on the log is the only consumer, and
+            // the tee threads stop paying for a forward nobody reads.
+            forward.store(false, Ordering::SeqCst);
             return Ok(supervisor);
         }
 
         if Instant::now() >= deadline {
+            forward.store(false, Ordering::SeqCst);
             return Err(BackendError::Timeout {
                 detail: format!(
                     "the runtime did not bind {} leased port(s) within {} s",
@@ -733,6 +983,7 @@ fn remove_environment(inner: &Inner, environment: &str, keep_volumes: bool) -> R
         })?;
     }
     EnvRecord::delete(config, environment);
+    let _ = std::fs::remove_file(config.log_path(environment));
 
     if dir.exists() {
         return Err(BackendError::BackendUnavailable {
@@ -906,58 +1157,81 @@ mod tests {
         assert!(!info.capabilities.pty, "v0 has no PTY");
         assert!(!info.capabilities.checkpoint);
         assert!(!info.capabilities.events);
+        assert!(!info.capabilities.mount, "there is no host mount");
         assert!(
-            !info.capabilities.resource_stats,
-            "stats arrive with the exec and logs ticket"
+            info.capabilities.resource_stats,
+            "stats come from the container engine, or from /proc and df"
         );
-        assert!(!info.capabilities.mount);
-        assert_eq!(unix_script("a
-b\r\nc"), "a
-b\nc");
+        assert!(
+            info.capabilities.log_since,
+            "the Environment log honours a `since` cursor"
+        );
+        assert_eq!(unix_script("a\nb\r\nc"), "a\nb\nc");
     }
 
     #[tokio::test]
-    async fn the_commands_this_ticket_does_not_serve_are_typed_unsupported() {
+    async fn the_commands_this_adapter_does_not_serve_are_typed_unsupported() {
         let backend = WslBackend::new(WslConfig::new("C:/data"));
         let environment = "env-caps";
 
-        match backend.exec(environment, None, &ExecSpec::default()).await {
-            Err(BackendError::Unsupported { capability, .. }) => assert_eq!(capability, "exec"),
-            other => panic!("exec must be unsupported, got {other:?}"),
-        }
-        match backend.logs(environment, None, &LogOptions::default()).await {
-            Err(BackendError::Unsupported { capability, .. }) => assert_eq!(capability, "logs"),
-            other => panic!("logs must be unsupported, got {:?}", other.map(|_| ())),
-        }
-        match backend.stats(environment).await {
-            Err(BackendError::Unsupported { capability, .. }) => assert_eq!(capability, "stats"),
-            other => panic!("stats must be unsupported, got {other:?}"),
-        }
         match backend.checkpoint(environment).await {
             Err(BackendError::Unsupported { capability, .. }) => {
                 assert_eq!(capability, "checkpoint")
             }
             other => panic!("checkpoint must be unsupported, got {other:?}"),
         }
-        let dir = std::env::temp_dir();
-        match backend
-            .copy_in(environment, None, &dir, "/tmp/x")
-            .await
-        {
-            Err(BackendError::Unsupported { capability, .. }) => assert_eq!(capability, "copyIn"),
-            other => panic!("copyIn must be unsupported, got {other:?}"),
-        }
-        match backend
-            .copy_out(environment, None, "/tmp/x", &dir)
-            .await
-        {
-            Err(BackendError::Unsupported { capability, .. }) => assert_eq!(capability, "copyOut"),
-            other => panic!("copyOut must be unsupported, got {other:?}"),
-        }
         match backend.events(environment).await {
             Err(BackendError::Unsupported { capability, .. }) => assert_eq!(capability, "events"),
             other => panic!("events must be unsupported, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[tokio::test]
+    async fn the_operational_calls_refuse_an_environment_that_was_never_started() {
+        // A data root nothing has ever provisioned: no runtime, so every
+        // operational call is `NotProvisioned` rather than a raw substrate error.
+        let root = std::env::temp_dir().join(format!("agentify-wsl-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backend = WslBackend::new(WslConfig::new(&root));
+        let environment = "env-never-started";
+
+        match backend
+            .exec(
+                environment,
+                None,
+                &ExecSpec {
+                    command: vec!["echo".into(), "hi".into()],
+                    ..ExecSpec::default()
+                },
+            )
+            .await
+        {
+            Err(BackendError::NotProvisioned { .. }) | Err(BackendError::BackendUnavailable { .. }) => {}
+            other => panic!("exec on an unstarted Environment answered {other:?}"),
+        }
+
+        let logs = backend.logs(environment, None, &LogOptions::default()).await;
+        assert!(
+            logs.is_err(),
+            "an Environment with no runtime has no log to read"
+        );
+
+        // Both path rules are enforced *before* the runtime is asked anything, so
+        // this is a refusal and not "no such distro".
+        let dir = std::env::temp_dir();
+        let err = backend
+            .copy_in(environment, None, &dir, "/../etc/passwd")
+            .await
+            .expect_err("a traversal is refused");
+        assert!(!matches!(err, BackendError::Unsupported { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_transfer_host_root_defaults_to_the_daemon_data_root() {
+        let config = WslConfig::new("C:/data");
+        assert_eq!(config.host_transfer_root, Some(PathBuf::from("C:/data")));
+        let relaxed = config.clone().with_host_transfer_root(None);
+        assert_eq!(relaxed.host_transfer_root, None);
     }
 
     #[test]

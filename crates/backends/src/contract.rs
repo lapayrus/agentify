@@ -169,7 +169,11 @@ impl std::fmt::Debug for ExecSession {
 }
 
 /// One line of Resource output.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` exist so an adapter can keep a log on disk in
+/// exactly the shape it streams: the WSL adapter writes one JSON object per
+/// line and reads the same struct back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogLine {
     /// Monotonic per Environment. A `since` cursor that is a bare number is a
     /// sequence number, which makes tails exact even within one millisecond.

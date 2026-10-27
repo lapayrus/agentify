@@ -786,6 +786,11 @@ struct Plan {
 /// * `fail 3` → stderr `fake: command failed\n`, exit 3 (default 1)
 /// * `sleep 5000` → no output, waits, exit 0
 /// * `env` → sorted `KEY=VALUE` lines, exit 0
+/// * `sh -c '<statements>'` → the fake is not a shell, but it reads the small
+///   portable subset the conformance suite and the daemon's tests use: `echo
+///   TEXT`, `echo TEXT 1>&2` / `echo TEXT >&2`, and `exit N`, separated by `;`
+///   or newlines. That is what makes one table of cases usable against a real
+///   substrate too, where the same script runs in a real `/bin/sh`.
 /// * anything else → stdout `fake: <command line>\n`, exit 0
 fn plan(command: &[String]) -> Result<Plan> {
     let Some(first) = command.first() else {
@@ -800,6 +805,10 @@ fn plan(command: &[String]) -> Result<Plan> {
             chunks: vec![("stdout", format!("{}\n", rest.join(" ")))],
             exit: 0,
             pause_ms: 0,
+        },
+        "sh" if rest.first().map(String::as_str) == Some("-c") => match rest.get(1) {
+            Some(script) => shell(script).unwrap_or_else(|| unknown(command)),
+            None => unknown(command),
         },
         "fail" => Plan {
             chunks: vec![("stderr", "fake: command failed\n".to_string())],
@@ -825,12 +834,54 @@ fn plan(command: &[String]) -> Result<Plan> {
             exit: 0,
             pause_ms: 0,
         },
-        other => Plan {
-            chunks: vec![("stdout", format!("fake: {}\n", command.join(" ")))],
-            exit: if other.is_empty() { 2 } else { 0 },
-            pause_ms: 0,
-        },
+        _ => unknown(command),
     })
+}
+
+/// The command the fake does not recognise: it says so on stdout and succeeds,
+/// exactly as a shell echoing the line would.
+fn unknown(command: &[String]) -> Plan {
+    let empty = command.first().is_none_or(|first| first.is_empty());
+    Plan {
+        chunks: vec![("stdout", format!("fake: {}\n", command.join(" ")))],
+        exit: if empty { 2 } else { 0 },
+        pause_ms: 0,
+    }
+}
+
+/// Interpret the small shell subset described on [`plan`]. `None` means the fake
+/// does not understand the script, and the caller falls back to echoing it.
+fn shell(script: &str) -> Option<Plan> {
+    let mut plan = Plan {
+        chunks: Vec::new(),
+        exit: 0,
+        pause_ms: 0,
+    };
+    for statement in script.split([';', '\n']) {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        let mut words: Vec<&str> = statement.split_whitespace().collect();
+        match words.first().copied()? {
+            "echo" => {
+                words.remove(0);
+                let to_stderr = words
+                    .last()
+                    .is_some_and(|last| matches!(*last, ">&2" | "1>&2"));
+                if to_stderr {
+                    words.pop();
+                }
+                let stream = if to_stderr { "stderr" } else { "stdout" };
+                plan.chunks.push((stream, format!("{}\n", words.join(" "))));
+            }
+            "exit" => {
+                plan.exit = words.get(1)?.parse::<i32>().ok()?;
+            }
+            _ => return None,
+        }
+    }
+    Some(plan)
 }
 
 fn rest_to_lines(vars: BTreeMap<String, String>) -> String {

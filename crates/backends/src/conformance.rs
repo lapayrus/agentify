@@ -336,12 +336,27 @@ async fn workload_cases<B: Backend + ?Sized>(backend: &B, base: &str) -> Vec<Cas
                     return Err(format!("echo exited {}, expected 0", ok.2));
                 }
 
-                let failed = exec(&env, backend, Some("web"), &["fail", "3"]).await?;
+                // The non-zero case uses a script every substrate can run, not a
+                // word only one adapter understands: what is under test is that
+                // the two streams stay apart and the exit code survives.
+                let failed = exec(
+                    &env,
+                    backend,
+                    Some("web"),
+                    &["sh", "-c", FAILING_COMMAND],
+                )
+                .await?;
                 if failed.2 != 3 {
-                    return Err(format!("`fail 3` exited {}, expected 3", failed.2));
+                    return Err(format!("the failing command exited {}, expected 3", failed.2));
                 }
                 if failed.1.is_empty() {
-                    return Err("`fail 3` wrote nothing to stderr".to_string());
+                    return Err("the failing command wrote nothing to stderr".to_string());
+                }
+                if !failed.0.is_empty() {
+                    return Err(format!(
+                        "stderr leaked into stdout: {:?}",
+                        failed.0
+                    ));
                 }
 
                 backend.stop(&env).await.map_err(err)?;
@@ -580,6 +595,11 @@ fn spec(environment: &str) -> EnvironmentSpec {
     });
     spec
 }
+
+/// The one command the suite uses to prove a non-zero exit with output on
+/// stderr. It is `sh -c` on purpose: every substrate that hosts real work has a
+/// shell, and `fail 3` would only mean something to one adapter.
+pub const FAILING_COMMAND: &str = "echo conformance-boom 1>&2; exit 3";
 
 /// A free loopback port. The suite leases nothing itself: it borrows a port the
 /// OS says is free, exactly as the daemon would.
