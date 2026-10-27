@@ -732,6 +732,11 @@ fn the_vertical_slice_runs_end_to_end_on_the_real_substrate() {
     // ---- 5. Restart the daemon: the row and the URL survive ----------------
     let web_lease = leases(&daemon.status(PROJECT), "web")[0].1;
     let project_id = project["id"].as_str().expect("the Project id").to_string();
+    let (_, before_whoami) = daemon.get("/v1/whoami");
+    let agent_before = before_whoami["actor"]["id"]
+        .as_str()
+        .expect("the Agent token before the restart")
+        .to_string();
     daemon.shutdown();
     let mut daemon = Daemon::boot_after_restart();
     // Right after a restart the daemon reports what it observed, not what it
@@ -1052,14 +1057,23 @@ client
         ("exec", format!("{OTHER}/dev/web"), other_id.clone(), "succeeded"),
         ("exec", format!("{OTHER}/dev/db"), other_id.clone(), "succeeded"),
     ];
+    // A daemon restart rotates the Agent token by design, so entries from the
+    // first run carry the first token and entries after it carry the second.
+    let mut seen_before = false;
+    let mut seen_after = false;
     for (operation, target, project, result) in &expected {
         let entry = audited(&feed, *operation, target.as_str(), result);
         assert_eq!(entry["actor"]["kind"], "agent", "{entry}");
-        assert_eq!(
-            entry["actor"]["id"].as_str(),
-            Some(agent.as_str()),
+        let actor_id = entry["actor"]["id"].as_str().unwrap_or_default();
+        assert!(
+            actor_id == agent_before || actor_id == agent,
             "the token that made the call is the actor: {entry}"
         );
+        if actor_id == agent_before {
+            seen_before = true;
+        } else {
+            seen_after = true;
+        }
         assert_eq!(
             entry["projectId"].as_str(),
             Some(project.as_str()),
@@ -1070,6 +1084,10 @@ client
             "every entry is hashed: {entry}"
         );
     }
+    assert!(
+        seen_before && seen_after,
+        "the feed covers both daemon runs (before={seen_before}, after={seen_after})"
+    );
 
     // ---- 7. Delete, on the scripted consent, and nothing remains -----------
     let (accepted, asked) = daemon.delete(&format!("/v1/projects/{PROJECT}"));

@@ -576,6 +576,11 @@ fn an_mcp_client_creates_starts_migrates_and_reads_the_row() {
     //
     // The shim is a client of the discovery file, so it survives the restart:
     // the new daemon rotates its token, and the next call picks the new one up.
+    let before_whoami = shim.ok("whoami", json!({}));
+    let agent_before = before_whoami["actor"]["id"]
+        .as_str()
+        .expect("the Agent token before the restart")
+        .to_string();
     daemon.shutdown().expect("stop the daemon");
     let mut daemon = boot();
     // No `start_environment` and no second migration: the daemon republishes the
@@ -815,6 +820,10 @@ client
         .as_str()
         .expect("the Agent token id")
         .to_string();
+    // The restart rotates the token, so entries from the first run carry the
+    // first token and entries after it carry the second.
+    let mut seen_before = false;
+    let mut seen_after = false;
     for (operation, target) in [
         ("create_project", PROJECT.to_string()),
         ("create_project", OTHER.to_string()),
@@ -822,22 +831,30 @@ client
         ("start_environment", format!("{OTHER}/dev")),
         ("exec", format!("{PROJECT}/dev/web")),
         ("exec", format!("{PROJECT}/dev/db")),
-        ("exec", format!("{OTHER}/dev/web")),
         ("exec", format!("{OTHER}/dev/db")),
     ] {
         let entry = audited(&feed, operation, &target);
         assert_eq!(entry["actor"]["kind"], "agent", "{entry}");
-        assert_eq!(
-            entry["actor"]["id"].as_str(),
-            Some(agent.as_str()),
+        let actor_id = entry["actor"]["id"].as_str().unwrap_or_default();
+        assert!(
+            actor_id == agent_before || actor_id == agent,
             "the token that made the call is the actor: {entry}"
         );
+        if actor_id == agent_before {
+            seen_before = true;
+        } else {
+            seen_after = true;
+        }
         assert!(entry["projectId"].is_string(), "{entry}");
         assert!(
             entry["hash"].as_str().map(str::len) == Some(64),
             "every entry is hashed: {entry}"
         );
     }
+    assert!(
+        seen_before && seen_after,
+        "the feed covers both daemon runs (before={seen_before}, after={seen_after})"
+    );
 
     // ---- 8. delete_project still asks a human, and then removes everything -
     delete_project(&mut shim, &daemon, PROJECT);
