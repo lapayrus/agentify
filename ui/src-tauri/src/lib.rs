@@ -477,6 +477,17 @@ fn mcp_binary() -> PathBuf {
     sidecar_binary("agentify-mcp")
 }
 
+/// Is this directory on the PATH this process was started with?
+///
+/// The installer broadcasts `WM_SETTINGCHANGE`, so a shell started after the
+/// install sees the new entry; a shell that was already running keeps the
+/// absolute path until it restarts.
+fn on_path(directory: &Path) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|entry| entry == directory))
+        .unwrap_or(false)
+}
+
 /// Stop the old daemon and start the one beside this shell, so an updated build
 /// takes over and adopts the runtimes it left running.
 #[tauri::command]
@@ -548,7 +559,14 @@ fn shell_info() -> ShellInfo {
     let root = data_root();
     let root_text = root.display().to_string();
     let command = mcp_binary();
-    let command_text = command.display().to_string();
+    let absolute = command.display().to_string();
+    // Once the installer has put the program directory on PATH, the connector
+    // can name the shim. A development build keeps the absolute path, because
+    // `target/debug` is not on anyone's PATH.
+    let command_text = match command.parent() {
+        Some(directory) if on_path(directory) => "agentify-mcp".to_string(),
+        _ => absolute,
+    };
     // Carry the data root explicitly: an MCP client is often launched by the
     // desktop rather than by this shell, so it would otherwise resolve the
     // default root instead of the one this app is using.

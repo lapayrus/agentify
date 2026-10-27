@@ -21,6 +21,7 @@ pub mod ingress;
 pub mod lifecycle;
 pub mod logfile;
 pub mod login_item;
+pub mod path_entry;
 pub mod ports;
 pub mod projects;
 pub mod redact;

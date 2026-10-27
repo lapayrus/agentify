@@ -55,9 +55,15 @@
 
 !macro NSIS_HOOK_POSTINSTALL
   DetailPrint "Agentify does not register a logon task; the daemon starts and stops with the app"
+  DetailPrint "Putting $INSTDIR on the user PATH"
+  ExecWait '"$INSTDIR\agentify.exe" path install' $0
+  DetailPrint "agentify path install exited with $0"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  DetailPrint "Removing $INSTDIR from the user PATH"
+  ExecWait '"$INSTDIR\agentify.exe" path remove' $0
+  DetailPrint "agentify path remove exited with $0"
   DetailPrint "Removing the Agentify daemon login item"
   ExecWait '"$INSTDIR\agentify.exe" login-item remove' $0
   DetailPrint "agentify login-item remove exited with $0"

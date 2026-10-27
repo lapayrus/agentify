@@ -127,6 +127,10 @@ Tools: `whoami`, `create_project`, `list_projects`, `get_project`,
 `read_logs`, `get_stats`, `list_secrets`, `create_secret`, `update_secret`,
 `delete_secret`, `wait_for_operation`. `environment` defaults to `dev`.
 
+The installer puts its program directory on the per-user `PATH`, so an installed
+build is configured with `"command": "agentify-mcp"`; a development build keeps
+the absolute path. Uninstall removes the entry it added.
+
 Secrets are metadata over MCP: a list carries names and provenance, never a
 value, and `delete_secret` refuses (`SecretInUse`) while the Manifest still
 references the name. Reading a value is human-only, through the OS gesture, and

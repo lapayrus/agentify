@@ -5,6 +5,7 @@
 //! for a human to agree to the one Windows step first run needs.
 //! Token issuing, secret reveal, and diagnostics arrive with later tickets.
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use agentify_bootstrap::{Bootstrap, BootstrapState, Consent, RESUME_FLAG};
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
         "revoke-token" => revoke_token(),
         "bootstrap" => bootstrap(&args[1..]),
         "login-item" => login_item(&args[1..]),
+        "path" => path_command(&args[1..]),
         "uninstall" => uninstall(&args[1..]),
         "help" | "--help" | "-h" => {
             usage();
@@ -57,6 +59,9 @@ Usage:
   agentify login-item install         start the daemon at logon (per-user task)
   agentify login-item status          is the login item registered?
   agentify login-item remove          take the login item out again
+  agentify path install               put this install directory on the user PATH
+  agentify path remove                take it out again
+  agentify path status                is it on the user PATH?
   agentify uninstall                  remove login item, trust, and Caddy data
   agentify uninstall --purge          also remove runtimes and the data root
 
@@ -192,6 +197,75 @@ fn login_item(args: &[String]) -> ExitCode {
             eprintln!(
                 "agentify: unknown login-item action {other:?}; use install, status, or remove"
             );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `agentify path install|remove|status`.
+///
+/// The installer puts its program directory on the user PATH so an MCP client
+/// can be configured with `agentify-mcp` instead of an absolute path. Removal
+/// takes out exactly the entry the installer added.
+fn path_command(args: &[String]) -> ExitCode {
+    let action = args.first().map(String::as_str).unwrap_or("status");
+    let program_dir = match std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        Some(directory) => directory,
+        None => {
+            eprintln!("agentify: could not locate this executable's directory");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match action {
+        "install" => match agentify_daemon::path_entry::install(&program_dir) {
+            Ok(true) => {
+                println!("path: added {}", program_dir.display());
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                println!(
+                    "path: {} is already on the user PATH",
+                    program_dir.display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("agentify: {err:#}");
+                ExitCode::FAILURE
+            }
+        },
+        "remove" => match agentify_daemon::path_entry::remove(&program_dir) {
+            Ok(true) => {
+                println!("path: removed {}", program_dir.display());
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                println!(
+                    "path: {} was not on the user PATH",
+                    program_dir.display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("agentify: {err:#}");
+                ExitCode::FAILURE
+            }
+        },
+        "status" => {
+            if agentify_daemon::path_entry::contains(&program_dir) {
+                println!("path: {} is on the user PATH", program_dir.display());
+                ExitCode::SUCCESS
+            } else {
+                println!("path: {} is not on the user PATH", program_dir.display());
+                ExitCode::FAILURE
+            }
+        }
+        other => {
+            eprintln!("agentify: unknown path action {other:?}; use install, remove, or status");
             ExitCode::FAILURE
         }
     }
