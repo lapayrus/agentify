@@ -70,6 +70,12 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// How long a replayed mutation stays replayable.
 pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How many times startup tries to republish the routes, and how long it waits
+/// between tries. A restart's own previous Caddy releases 80 and 443 a moment
+/// after it is killed, and a route must not be lost to that race.
+const REPUBLISH_ATTEMPTS: u32 = 20;
+const REPUBLISH_PAUSE: Duration = Duration::from_millis(500);
+
 /// Identity the auth middleware attaches to an authenticated request.
 #[derive(Debug, Clone)]
 pub struct Caller {
@@ -277,6 +283,29 @@ async fn serve(
     // Either way the daemon reports what it observed instead of claiming health.
     if let Err(err) = state.lifecycle.reconcile(&state.state).await {
         eprintln!("agentifyd: reconciling Environments failed: {err:#}");
+    }
+
+    // Then the routes: a restart must not change what this machine serves, so
+    // every Environment's route is recomputed from the database and loaded into
+    // Caddy again. The previous ingress may still be letting go of 80 and 443 —
+    // a stopped daemon kills its Caddy, and the OS releases the sockets a moment
+    // later — so this is allowed a few tries before it is reported.
+    let mut republished = state.lifecycle.republish(&state.state);
+    for _ in 1..REPUBLISH_ATTEMPTS {
+        if republished.is_ok() {
+            break;
+        }
+        tokio::time::sleep(REPUBLISH_PAUSE).await;
+        republished = state.lifecycle.republish(&state.state);
+    }
+    if let Err(err) = republished {
+        // Ingress is not the API: a machine whose 80 or 443 is held by somebody
+        // else still gets a daemon that answers, and the next start republishes.
+        eprintln!(
+            "agentifyd: republishing the routes at startup failed: {} ({})",
+            err.code(),
+            err.detail()
+        );
     }
 
     let published = discovery.clone();
