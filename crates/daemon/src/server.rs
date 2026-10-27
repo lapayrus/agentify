@@ -27,18 +27,19 @@ use agentify_backends::LogOptions;
 use agentify_proto::{
     ActivityPage, Actor, ApprovalAccepted, ApprovalDecision as ApprovalDecisionView,
     ApprovalDecisionRequest, ApprovalList, Capabilities, CreateProjectRequest, DaemonInfo,
-    Discovery, ExecRequest, ExecResponse, LogsResponse, OperationView, Problem, ProjectList,
+    Discovery, ExecRequest, ExecResponse, LogLineView, LogsResponse, OperationView, Problem,
+    ProjectList,
     StatsResponse, Whoami, API_VERSION, APPROVAL_APPROVED, APPROVAL_DENIED, APPROVAL_EXPIRED,
     APPROVAL_PENDING, DEV_ENVIRONMENT, OPERATION_WAITING_FOR_APPROVAL,
 };
 use anyhow::{Context, Result};
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Extension, Json, Router};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -56,8 +57,11 @@ use crate::consent::{self, ConsentOutcome, ConsentVerifier};
 use crate::discovery;
 use crate::lifecycle::{self, Lifecycle, LifecycleError};
 use crate::projects::{self, CreateError};
+use crate::redact::Redactor;
+use crate::secrets::{self, Secrets};
 use crate::state::{
-    ActorRecord, ApprovalRecord, IdempotencyRecord, OperationRecord, ProjectRecord, State as StateStore,
+    ActorRecord, ApprovalRecord, IdempotencyRecord, OperationRecord, ProjectRecord, SecretRecord,
+    State as StateStore,
 };
 
 /// Version of this daemon build.
@@ -91,6 +95,13 @@ struct AppState {
     approval_ttl: Duration,
     /// The human gate every Approval passes through.
     consent: Arc<dyn ConsentVerifier>,
+    /// Where Project secret values live, and where `fromEnv` imports read from.
+    secrets: Arc<Secrets>,
+    /// One redactor per Project, built on first use and dropped when that
+    /// Project's secrets change. Values are read from the store, so this cache
+    /// holds plaintext in memory only for as long as the daemon runs — which is
+    /// exactly as long as the injected values are live anyway.
+    redactors: Mutex<HashMap<String, Arc<Redactor>>>,
     /// One async mutex per Environment: mutations are serialised, reads are not.
     env_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -116,6 +127,42 @@ impl AppState {
             id: caller.token_id.clone(),
             token_id: Some(caller.token_id.clone()),
         }
+    }
+
+    /// Everything a Project's secrets currently contain, ready to be stripped
+    /// out of whatever the daemon is about to emit. Cached until the Project's
+    /// secrets change, because every response and every audit entry asks.
+    fn redactor(&self, project_id: &str) -> Arc<Redactor> {
+        if let Some(hit) = self
+            .redactors
+            .lock()
+            .expect("the redactor cache")
+            .get(project_id)
+        {
+            return hit.clone();
+        }
+        let redactor = match self.state.secrets(project_id) {
+            Ok(secrets) => self
+                .secrets
+                .redactor(project_id, secrets.iter().map(|secret| secret.name.as_str())),
+            // A store that cannot be read is not a reason to refuse the request:
+            // the value is already out of reach, so there is nothing to redact.
+            Err(_) => Redactor::empty(),
+        };
+        let redactor = Arc::new(redactor);
+        self.redactors
+            .lock()
+            .expect("the redactor cache")
+            .insert(project_id.to_string(), redactor.clone());
+        redactor
+    }
+
+    /// Drop a cached redactor: the Project's secrets changed.
+    fn forget_redaction(&self, project_id: &str) {
+        self.redactors
+            .lock()
+            .expect("the redactor cache")
+            .remove(project_id);
     }
 }
 
@@ -274,9 +321,11 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
         config.backend_script.as_deref(),
         &config.data_root,
     )?;
+    let secrets = Arc::new(config.secrets());
     let lifecycle = Arc::new(Lifecycle {
         backend,
         ports: crate::ports::PortRegistry::new(config.lease_range),
+        secrets: secrets.clone(),
         probe_timeout: config.probe_timeout,
         exec_timeout: config.exec_timeout,
     });
@@ -299,6 +348,8 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
         log_tail: config.log_tail,
         approval_ttl: config.approval_ttl,
         consent: config.consent.verifier(),
+        secrets,
+        redactors: Mutex::new(HashMap::new()),
         env_locks: Mutex::new(HashMap::new()),
     };
     Ok((state, listener, discovery))
@@ -313,6 +364,18 @@ fn router(state: Arc<AppState>) -> Router {
         .route(
             "/v1/projects/{project}",
             get(get_project).delete(delete_project),
+        )
+        .route(
+            "/v1/projects/{project}/secrets",
+            get(list_secrets).post(create_secret),
+        )
+        .route(
+            "/v1/projects/{project}/secrets/{name}",
+            patch(update_secret).delete(delete_secret),
+        )
+        .route(
+            "/v1/projects/{project}/secrets/{name}/reveal",
+            post(reveal_secret),
         )
         .route(
             &format!("{environments}/start"),
@@ -336,7 +399,11 @@ fn router(state: Arc<AppState>) -> Router {
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_agent_token,
-        ));
+        ))
+        // Outermost: no response body leaves the daemon before the Project's
+        // known secret values are stripped out of it. The human reveal is the
+        // single deliberate exception, and it says so in its own path.
+        .route_layer(middleware::from_fn_with_state(state.clone(), redact_plaintext));
 
     Router::new()
         .route("/v1/healthz", get(healthz))
@@ -419,7 +486,7 @@ async fn create_project(
         }
     };
 
-    match projects::create(&app.state, &app.data_root, request) {
+    match projects::create(&app.state, &app.data_root, &app.secrets, request) {
         Ok(project) => {
             record_audit(
                 &app,
@@ -432,6 +499,22 @@ async fn create_project(
                 },
             );
             (StatusCode::CREATED, Json(project)).into_response()
+        }
+        Err(CreateError::SecretSourceMissing(detail)) => {
+            record_failure(
+                &app,
+                &caller,
+                &request_id,
+                "create_project",
+                None,
+                "SecretSourceMissing",
+                started,
+            );
+            problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "SecretSourceMissing",
+                Some(detail),
+            )
         }
         Err(CreateError::Validation { path, detail }) => {
             record_failure(
@@ -907,21 +990,39 @@ async fn environment_logs(
         return Json(LogsResponse { lines, next_since }).into_response();
     }
 
-    let events = stream.map(|item| {
+    // A stream is not buffered through the response redactor, so its lines are
+    // redacted here, where each one is made.
+    let redactor = app.redactor(&record.id);
+    let events = stream.map(move |item| {
         let event = match item {
             Ok(line) => Event::default()
                 .event("log")
                 .id(line.seq.to_string())
                 .data(
-                    serde_json::to_string(&lifecycle::log_line_view(&line)).unwrap_or_default(),
+                    serde_json::to_string(&redact_log_line(&redactor, &line))
+                        .unwrap_or_default(),
                 ),
             Err(err) => Event::default().event("error").data(
-                serde_json::json!({ "code": err.code(), "detail": err.to_string() }).to_string(),
+                serde_json::json!({
+                    "code": err.code(),
+                    "detail": redactor.redact(&err.to_string()),
+                })
+                .to_string(),
             ),
         };
         Ok::<Event, Infallible>(event)
     });
     Sse::new(events).into_response()
+}
+
+/// One log line with the Project's known secret values removed.
+fn redact_log_line(
+    redactor: &Redactor,
+    line: &agentify_backends::LogLine,
+) -> LogLineView {
+    let mut view = lifecycle::log_line_view(line);
+    view.line = redactor.redact(&view.line);
+    view
 }
 
 /// `GET .../stats`.
@@ -1664,7 +1765,27 @@ async fn run_delete(
     }
 
     app.state.release_leases(&environment_id)?;
+
+    // A deleted Project takes its secret values with it: leaving them in the
+    // credential manager would keep credentials alive for a Project that no
+    // longer exists. The names are read before the rows cascade away.
+    let secret_names: Vec<String> = app
+        .state
+        .secrets(&project_id)?
+        .into_iter()
+        .map(|secret| secret.name)
+        .collect();
+
     app.state.delete_project(&project_id)?;
+
+    for name in &secret_names {
+        if let Err(err) = app.secrets.delete(&project_id, name) {
+            // Reported, not hidden: the Project is gone either way, and a note is
+            // what a person needs to clean up by hand.
+            notes.push(format!("secret {name:?}: {err}"));
+        }
+    }
+    app.forget_redaction(&project_id);
 
     let workspace = match &project {
         Some(record) => PathBuf::from(&record.workspace_path),
@@ -1797,6 +1918,645 @@ async fn activity(
     }
 }
 
+// ---- secrets ---------------------------------------------------------------
+
+/// A secret as the API reports it. Metadata only, by construction: there is no
+/// field a value could be put in, so no read path can leak one.
+#[derive(Debug, serde::Serialize)]
+struct SecretView {
+    name: String,
+    /// `generate`, `fromEnv`, or `literal`.
+    source: String,
+    /// The host variable a `fromEnv` import came from.
+    #[serde(rename = "sourceRef", skip_serializing_if = "Option::is_none")]
+    source_ref: Option<String>,
+    /// Whether the Manifest still references it, which is what decides whether
+    /// it can be deleted.
+    referenced: bool,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "updatedAt")]
+    updated_at: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SecretList {
+    secrets: Vec<SecretView>,
+}
+
+fn secret_view(record: &ProjectRecord, secret: &SecretRecord) -> SecretView {
+    SecretView {
+        name: secret.name.clone(),
+        source: secret.source_kind.clone(),
+        source_ref: secret.source_ref.clone(),
+        referenced: projects::is_referenced(record, &secret.name),
+        created_at: secret.created_at.clone(),
+        updated_at: secret.updated_at.clone(),
+    }
+}
+
+/// The Project a secrets route names, or a typed `NotFound`.
+fn project_of(app: &AppState, reference: &str) -> std::result::Result<ProjectRecord, Response> {
+    match app.state.find_project(reference) {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => Err(problem(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            Some(format!("no Project named or identified by {reference:?}")),
+        )),
+        Err(err) => Err(problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            Some(format!("{err:#}")),
+        )),
+    }
+}
+
+/// `GET /v1/projects/{project}/secrets`: names and provenance, never values.
+async fn list_secrets(
+    State(app): State<Arc<AppState>>,
+    Path(project): Path<String>,
+) -> Response {
+    let record = match project_of(&app, &project) {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    match app.state.secrets(&record.id) {
+        Ok(secrets) => Json(SecretList {
+            secrets: secrets
+                .iter()
+                .map(|secret| secret_view(&record, secret))
+                .collect(),
+        })
+        .into_response(),
+        Err(err) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            Some(format!("{err:#}")),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSecretRequest {
+    name: Option<String>,
+    generate: Option<String>,
+    #[serde(rename = "fromEnv")]
+    from_env: Option<String>,
+    value: Option<String>,
+}
+
+/// `POST /v1/projects/{project}/secrets`: an Agent supplies a value, or asks the
+/// daemon to mint one. The response is metadata; the value is never echoed.
+async fn create_secret(
+    State(app): State<Arc<AppState>>,
+    Path(project): Path<String>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = std::time::Instant::now();
+    let request_id = request_id(&headers);
+    let record = match project_of(&app, &project) {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    let request: CreateSecretRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            return problem_at(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationFailed",
+                Some(format!("the request body is not a create_secret payload: {err}")),
+                Some(String::new()),
+            )
+        }
+    };
+
+    let name = match request.name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            return problem_at(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationFailed",
+                Some("a secret needs a `name`".to_string()),
+                Some("name".to_string()),
+            )
+        }
+    };
+    if let Err(detail) = secrets::validate_name(&name) {
+        return problem_at(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationFailed",
+            Some(detail),
+            Some("name".to_string()),
+        );
+    }
+
+    let (source_kind, value) = match (&request.generate, &request.from_env, &request.value) {
+        (Some(kind), None, None) => match kind.trim() {
+            "password" | "token" => match secrets::generate() {
+                Ok(value) => (secrets::SOURCE_GENERATE, value),
+                Err(err) => {
+                    return problem(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "SecretSourceMissing",
+                        Some(format!("{err}")),
+                    )
+                }
+            },
+            other => {
+                return problem_at(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ValidationFailed",
+                    Some(format!(
+                        "unsupported secret kind {other:?}; use `password` or `token`"
+                    )),
+                    Some("generate".to_string()),
+                )
+            }
+        },
+        (None, None, Some(value)) if !value.is_empty() => (secrets::SOURCE_LITERAL, value.clone()),
+        (None, Some(_), None) => {
+            return problem_at(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationFailed",
+                Some(
+                    "a `fromEnv` secret is imported once, when the Project is created; \
+                     declare it in the Manifest instead"
+                        .to_string(),
+                ),
+                Some("fromEnv".to_string()),
+            )
+        }
+        _ => {
+            return problem_at(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationFailed",
+                Some("a secret needs exactly one of `generate` or `value`".to_string()),
+                Some("generate".to_string()),
+            )
+        }
+    };
+
+    let now = clock::now_rfc3339();
+    let secret = SecretRecord {
+        project_id: record.id.clone(),
+        name: name.clone(),
+        source_kind: source_kind.to_string(),
+        source_ref: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    match app.state.insert_secret(&secret) {
+        Ok(true) => {}
+        Ok(false) => {
+            return problem(
+                StatusCode::CONFLICT,
+                "AlreadyExists",
+                Some(format!(
+                    "Project {:?} already has a secret named {name:?}",
+                    record.name
+                )),
+            )
+        }
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                Some(format!("{err:#}")),
+            )
+        }
+    }
+    if let Err(err) = app.secrets.put(&record.id, &name, &value) {
+        let _ = app.state.delete_secret(&record.id, &name);
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SecretStoreUnavailable",
+            Some(format!("{err}")),
+        );
+    }
+    app.forget_redaction(&record.id);
+
+    record_audit(
+        &app,
+        audit::Append {
+            project_id: Some(&record.id),
+            operation: "create_secret",
+            target: Some(&format!("{}/{name}", record.name)),
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+            ..audit::Append::done(AppState::actor(&caller), "create_secret", &request_id)
+        },
+    );
+    (StatusCode::CREATED, Json(secret_view(&record, &secret))).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSecretRequest {
+    generate: Option<String>,
+    value: Option<String>,
+}
+
+/// `PATCH /v1/projects/{project}/secrets/{name}`: replace a value. A `fromEnv`
+/// import is final — it was imported once, from the host, and rewriting it would
+/// make the Project's provenance a lie.
+async fn update_secret(
+    State(app): State<Arc<AppState>>,
+    Path((project, name)): Path<(String, String)>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = std::time::Instant::now();
+    let request_id = request_id(&headers);
+    let record = match project_of(&app, &project) {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    let existing = match app.state.find_secret(&record.id, &name) {
+        Ok(Some(secret)) => secret,
+        Ok(None) => return unknown_secret(&record, &name),
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                Some(format!("{err:#}")),
+            )
+        }
+    };
+    let request: UpdateSecretRequest = if body.is_empty() {
+        UpdateSecretRequest {
+            generate: None,
+            value: None,
+        }
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(err) => {
+                return problem_at(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ValidationFailed",
+                    Some(format!(
+                        "the request body is not an update_secret payload: {err}"
+                    )),
+                    Some(String::new()),
+                )
+            }
+        }
+    };
+
+    if existing.source_kind == secrets::SOURCE_FROM_ENV {
+        return problem(
+            StatusCode::CONFLICT,
+            "SecretImmutable",
+            Some(format!(
+                "the secret {name:?} was imported from the environment variable {} when the \
+                 Project was created; an import happens once",
+                existing.source_ref.as_deref().unwrap_or("(unknown)")
+            )),
+        );
+    }
+
+    let (source_kind, value) = match (&request.generate, &request.value) {
+        (Some(kind), None) => match kind.trim() {
+            "password" | "token" => match secrets::generate() {
+                Ok(value) => (secrets::SOURCE_GENERATE, value),
+                Err(err) => {
+                    return problem(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "SecretSourceMissing",
+                        Some(format!("{err}")),
+                    )
+                }
+            },
+            other => {
+                return problem_at(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ValidationFailed",
+                    Some(format!(
+                        "unsupported secret kind {other:?}; use `password` or `token`"
+                    )),
+                    Some("generate".to_string()),
+                )
+            }
+        },
+        (None, Some(value)) if !value.is_empty() => (secrets::SOURCE_LITERAL, value.clone()),
+        _ => {
+            return problem_at(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationFailed",
+                Some("a secret update needs exactly one of `generate` or `value`".to_string()),
+                Some("value".to_string()),
+            )
+        }
+    };
+
+    if let Err(err) = app.secrets.put(&record.id, &name, &value) {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SecretStoreUnavailable",
+            Some(format!("{err}")),
+        );
+    }
+    let updated = SecretRecord {
+        source_kind: source_kind.to_string(),
+        source_ref: None,
+        updated_at: clock::now_rfc3339(),
+        ..existing
+    };
+    if let Err(err) = app.state.update_secret(&updated) {
+        return problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            Some(format!("{err:#}")),
+        );
+    }
+    app.forget_redaction(&record.id);
+
+    record_audit(
+        &app,
+        audit::Append {
+            project_id: Some(&record.id),
+            operation: "update_secret",
+            target: Some(&format!("{}/{name}", record.name)),
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+            ..audit::Append::done(AppState::actor(&caller), "update_secret", &request_id)
+        },
+    );
+    Json(secret_view(&record, &updated)).into_response()
+}
+
+/// `DELETE /v1/projects/{project}/secrets/{name}`: only a secret the Manifest no
+/// longer references. Deleting a referenced one would silently break the next
+/// start, so it is refused.
+async fn delete_secret(
+    State(app): State<Arc<AppState>>,
+    Path((project, name)): Path<(String, String)>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+) -> Response {
+    let started = std::time::Instant::now();
+    let request_id = request_id(&headers);
+    let record = match project_of(&app, &project) {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    match app.state.find_secret(&record.id, &name) {
+        Ok(Some(_)) => {}
+        Ok(None) => return unknown_secret(&record, &name),
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                Some(format!("{err:#}")),
+            )
+        }
+    }
+    if projects::is_referenced(&record, &name) {
+        return problem(
+            StatusCode::CONFLICT,
+            "SecretInUse",
+            Some(format!(
+                "the Manifest of Project {:?} references the secret {name:?}; \
+                 remove the reference and create the Project again before deleting it",
+                record.name
+            )),
+        );
+    }
+
+    // Metadata first: a value with no row would be unreachable and unforgettable.
+    if let Err(err) = app.state.delete_secret(&record.id, &name) {
+        return problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            Some(format!("{err:#}")),
+        );
+    }
+    if let Err(err) = app.secrets.delete(&record.id, &name) {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SecretStoreUnavailable",
+            Some(format!("{err}")),
+        );
+    }
+    app.forget_redaction(&record.id);
+
+    record_audit(
+        &app,
+        audit::Append {
+            project_id: Some(&record.id),
+            operation: "delete_secret",
+            target: Some(&format!("{}/{name}", record.name)),
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+            ..audit::Append::done(AppState::actor(&caller), "delete_secret", &request_id)
+        },
+    );
+    Json(serde_json::json!({ "name": name, "deleted": true })).into_response()
+}
+
+/// `POST /v1/projects/{project}/secrets/{name}/reveal`: the one path that returns
+/// a value, and only to a person who passes the OS gesture. Audited without it.
+async fn reveal_secret(
+    State(app): State<Arc<AppState>>,
+    Path((project, name)): Path<(String, String)>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+) -> Response {
+    let started = std::time::Instant::now();
+    let request_id = request_id(&headers);
+    let record = match project_of(&app, &project) {
+        Ok(record) => record,
+        Err(response) => return response,
+    };
+    match app.state.find_secret(&record.id, &name) {
+        Ok(Some(_)) => {}
+        Ok(None) => return unknown_secret(&record, &name),
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                Some(format!("{err:#}")),
+            )
+        }
+    }
+
+    let message = format!(
+        "Agentify: reveal the secret \"{name}\" of Project \"{}\"?",
+        record.name
+    );
+    let outcome = ask_for_gesture(&app, message).await;
+    let audit = |result: &'static str, code: Option<&'static str>, by: ActorRecord| {
+        record_audit(
+            &app,
+            audit::Append {
+                project_id: Some(&record.id),
+                operation: "reveal_secret",
+                target: Some(&format!("{}/{name}", record.name)),
+                result,
+                error_code: code,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                ..audit::Append::done(by, "reveal_secret", &request_id)
+            },
+        );
+    };
+
+    let by = match outcome {
+        ConsentOutcome::Verified => ActorRecord {
+            kind: "human".to_string(),
+            id: consent::os_account(),
+            token_id: Some(caller.token_id.clone()),
+        },
+        ConsentOutcome::Declined(detail) => {
+            audit(
+                "failed",
+                Some("ApprovalRequired"),
+                AppState::actor(&caller),
+            );
+            return problem(StatusCode::FORBIDDEN, "ApprovalRequired", Some(detail));
+        }
+        ConsentOutcome::Unavailable(detail) => {
+            audit(
+                "failed",
+                Some("ConsentUnavailable"),
+                AppState::actor(&caller),
+            );
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ConsentUnavailable",
+                Some(detail),
+            );
+        }
+    };
+
+    match app.secrets.get(&record.id, &name) {
+        Ok(Some(value)) => {
+            // The audit records the reveal, who made it, and which secret — never
+            // the value.
+            audit("succeeded", None, by.clone());
+            Json(serde_json::json!({
+                "project": record.name,
+                "name": name,
+                "value": value,
+                "revealedAt": clock::now_rfc3339(),
+                "actor": { "kind": by.kind, "id": by.id },
+            }))
+            .into_response()
+        }
+        Ok(None) => {
+            audit("failed", Some("SecretSourceMissing"), by);
+            problem(
+                StatusCode::CONFLICT,
+                "SecretSourceMissing",
+                Some(format!(
+                    "the secret {name:?} has no value in the credential manager"
+                )),
+            )
+        }
+        Err(err) => {
+            audit("failed", Some("SecretStoreUnavailable"), by);
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SecretStoreUnavailable",
+                Some(format!("{err}")),
+            )
+        }
+    }
+}
+
+fn unknown_secret(record: &ProjectRecord, name: &str) -> Response {
+    problem(
+        StatusCode::NOT_FOUND,
+        "NotFound",
+        Some(format!(
+            "Project {:?} has no secret named {name:?}",
+            record.name
+        )),
+    )
+}
+
+/// Ask the injected verifier for the interactive gesture, off the async workers.
+async fn ask_for_gesture(app: &AppState, message: String) -> ConsentOutcome {
+    let verifier = app.consent.clone();
+    match tokio::task::spawn_blocking(move || verifier.verify(&message)).await {
+        Ok(outcome) => outcome,
+        Err(err) => ConsentOutcome::Unavailable(format!("the consent prompt failed: {err}")),
+    }
+}
+
+// ---- redaction -------------------------------------------------------------
+
+/// The Project a path names, if it names one: `/v1/projects/{project}/...`.
+fn project_in_path(path: &str) -> Option<String> {
+    let mut segments = path.split('/');
+    if segments.next() != Some("") || segments.next() != Some("v1") {
+        return None;
+    }
+    if segments.next() != Some("projects") {
+        return None;
+    }
+    let project = segments.next()?;
+    if project.is_empty() {
+        None
+    } else {
+        Some(project.to_string())
+    }
+}
+
+/// Strip a Project's known secret values — and their percent-encoded forms — out
+/// of every JSON response body before it leaves the daemon.
+///
+/// One seam rather than a rule every handler has to remember: status, errors,
+/// exec output, activity, and anything added later all pass through here. The
+/// human reveal is the single exception, and it is named: a body is only left
+/// alone when the path ends in `/reveal`, where a value is the point.
+async fn redact_plaintext(
+    State(app): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    let reveal = path.ends_with("/reveal");
+    let reference = project_in_path(&path);
+    let response = next.run(request).await;
+    if reveal {
+        return response;
+    }
+    let Some(reference) = reference else {
+        return response;
+    };
+    let Ok(Some(record)) = app.state.find_project(&reference) else {
+        return response;
+    };
+    let redactor = app.redactor(&record.id);
+    if redactor.is_empty() {
+        return response;
+    }
+    let json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("application/json") || value.starts_with("application/problem+json"))
+        .unwrap_or(false);
+    // An SSE stream is not buffered: its lines are redacted where they are made.
+    if !json {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("agentifyd: reading a response body to redact it failed: {err}");
+            return Response::from_parts(parts, Body::empty());
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let redacted = redactor.redact(&text);
+    let mut response = Response::from_parts(parts, Body::from(redacted));
+    response.headers_mut().remove(header::CONTENT_LENGTH);
+    response
+}
+
 // ---- audit helpers ---------------------------------------------------------
 
 /// The id a mutation is recorded under, so a support question can be traced
@@ -1811,9 +2571,27 @@ fn request_id(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
-/// Append one audit entry. A failure to audit is loud but not fatal: the
-/// mutation already happened, and losing the caller's response would be worse.
+/// Append one audit entry, with the Project's known secret values stripped out.
+///
+/// The audit never records a value by design; this is the guarantee, not the
+/// hope: an operation whose target or error text happened to contain one is
+/// masked before it is hashed and stored.
 fn record_audit(app: &AppState, entry: audit::Append<'_>) {
+    let redactor = entry.project_id.map(|project_id| app.redactor(project_id));
+    let target;
+    let operation;
+    let entry = match &redactor {
+        Some(redactor) if !redactor.is_empty() => {
+            target = redactor.redact_opt(entry.target);
+            operation = redactor.redact(entry.operation);
+            audit::Append {
+                target: target.as_deref(),
+                operation: &operation,
+                ..entry
+            }
+        }
+        _ => entry,
+    };
     if let Err(err) = audit::append(&app.state, entry) {
         eprintln!("agentifyd: recording an audit entry failed: {err:#}");
     }

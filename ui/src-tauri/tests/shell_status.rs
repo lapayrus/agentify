@@ -3,10 +3,20 @@
 
 use agentify_shell::{status_for, DaemonStatus};
 
+/// The value the bundled fixture imports for its `api-token`. A test supplies it
+/// explicitly, so the shell's suite depends on no shell variable on this machine.
+const FIXTURE_API_TOKEN: &str = "fixture-api-token-from-the-host";
+
+/// A daemon for these tests: the in-memory secret store, and the fixture's
+/// imported value, so no test touches this machine's credential manager.
+fn config(home: &std::path::Path) -> agentify_daemon::Config {
+    agentify_daemon::Config::new(home).with_secret_env([("HELLO_API_TOKEN", FIXTURE_API_TOKEN)])
+}
+
 #[test]
 fn a_running_daemon_is_reported_as_connected_with_the_whoami_payload() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+    let mut daemon = agentify_daemon::start_in_background(config(temp.path()))
         .expect("boot daemon");
 
     match status_for(temp.path()) {
@@ -32,7 +42,7 @@ fn a_running_daemon_is_reported_as_connected_with_the_whoami_payload() {
 #[test]
 fn a_created_project_reaches_the_shell_with_its_environment_resources_and_urls() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+    let mut daemon = agentify_daemon::start_in_background(config(temp.path()))
         .expect("boot daemon");
 
     ureq::post(&format!("{}/v1/projects", daemon.base_url()))
@@ -86,7 +96,7 @@ fn start_and_stop_from_the_shell_go_through_the_same_api() {
     };
 
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+    let mut daemon = agentify_daemon::start_in_background(config(temp.path()))
         .expect("boot daemon");
     ureq::post(&format!("{}/v1/projects", daemon.base_url()))
         .set("Authorization", &format!("Bearer {}", daemon.token()))
@@ -141,7 +151,7 @@ fn the_shell_shows_the_approval_inbox_and_decides_through_the_same_api() {
     use agentify_shell::{activity_for, approvals_for, decide_approval_for};
 
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+    let mut daemon = agentify_daemon::start_in_background(config(temp.path()))
         .expect("boot daemon");
     ureq::post(&format!("{}/v1/projects", daemon.base_url()))
         .set("Authorization", &format!("Bearer {}", daemon.token()))

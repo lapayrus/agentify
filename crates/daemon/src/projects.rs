@@ -18,7 +18,9 @@ use serde::Deserialize;
 
 use crate::clock;
 use crate::fixtures;
-use crate::state::{NewProject, ProjectRecord, State};
+use crate::lifecycle::LifecycleError;
+use crate::secrets::Secrets;
+use crate::state::{NewProject, NewSecret, ProjectRecord, State};
 
 /// Directory, inside the data root, holding one directory per Project.
 pub const PROJECTS_DIR: &str = "projects";
@@ -35,6 +37,8 @@ pub enum CreateError {
     Validation { path: String, detail: String },
     /// The source the Manifest needs is not available on this machine.
     SourceMissing(String),
+    /// A `fromEnv` secret has no value on this machine. Nothing was created.
+    SecretSourceMissing(String),
     /// A Project with this name already exists.
     AlreadyExists(String),
     /// The state database failed.
@@ -52,10 +56,16 @@ impl CreateError {
 
 /// Create a Project from exactly one of a bundled fixture or an inline
 /// Manifest, copy its source into a daemon-owned workspace, and persist it with
-/// its `dev` Environment and Resources.
+/// its `dev` Environment, its Resources, and its secrets' metadata.
+///
+/// Every secret is resolved — generated or imported — before anything is
+/// written, so a `SecretSourceMissing` refusal leaves no row, no directory, and
+/// no credential behind. The values go to the secret store; the metadata goes to
+/// SQLite in the same transaction as the Project.
 pub fn create(
     state: &State,
     data_root: &Path,
+    secrets: &Secrets,
     request: CreateProjectRequest,
 ) -> std::result::Result<Project, CreateError> {
     let (source, source_name, manifest_text, fixture) = match (
@@ -126,6 +136,14 @@ pub fn create(
         )));
     }
 
+    // Every declared secret is resolved here — generated, or imported from the
+    // host — before anything is written. A missing source refuses the whole
+    // creation, so a failed create leaves no row, no directory, and no
+    // credential behind.
+    let planned = secrets
+        .plan(&manifest.secrets)
+        .map_err(|missing| CreateError::SecretSourceMissing(missing.detail()))?;
+
     let id = uuid::Uuid::new_v4().to_string();
     let project_dir = data_root.join(PROJECTS_DIR).join(&id);
     let workspace = project_dir.join(WORKSPACE_DIR);
@@ -166,6 +184,14 @@ pub fn create(
         environment_id: uuid::Uuid::new_v4().to_string(),
         environment_name: DEV_ENVIRONMENT.to_string(),
         resources,
+        secrets: planned
+            .iter()
+            .map(|secret| NewSecret {
+                name: secret.name.clone(),
+                source_kind: secret.source_kind.to_string(),
+                source_ref: secret.source_ref.clone(),
+            })
+            .collect(),
     };
 
     match state.create_project(record) {
@@ -181,6 +207,25 @@ pub fn create(
             discard(&project_dir);
             return Err(CreateError::Store(err));
         }
+    }
+
+    // Only now do the values reach the store: a row without a value is
+    // recoverable, a value with no row is not. A failure here puts everything
+    // back the way it was.
+    let mut written: Vec<&str> = Vec::new();
+    for secret in &planned {
+        if let Err(err) = secrets.put(&id, &secret.name, &secret.value) {
+            for name in &written {
+                let _ = secrets.delete(&id, name);
+            }
+            let _ = state.delete_project(&id);
+            discard(&project_dir);
+            return Err(CreateError::Store(anyhow::anyhow!(
+                "storing the secret {:?} failed: {err}",
+                secret.name
+            )));
+        }
+        written.push(&secret.name);
     }
 
     let stored = state
@@ -303,13 +348,23 @@ pub fn port_requests(record: &ProjectRecord) -> Result<Vec<(String, u16)>> {
 }
 
 /// The spec a Backend is handed, before the daemon adds its port leases.
-pub fn environment_spec(record: &ProjectRecord) -> Result<agentify_backends::EnvironmentSpec> {
+///
+/// Every `${secret:name}` the Manifest left in an env value or in a database's
+/// credentials is resolved here, so the spec the Backend receives carries values
+/// and the daemon's own stored spec never does. A Resource's environment is the
+/// only place a value is injected: nothing else about the Project changes.
+pub fn environment_spec(
+    record: &ProjectRecord,
+    secrets: &Secrets,
+) -> std::result::Result<agentify_backends::EnvironmentSpec, LifecycleError> {
     let spec = stored_spec(record)?;
     let mut environment = agentify_backends::EnvironmentSpec::new(
         record.environment.id.clone(),
         record.name.clone(),
     );
     environment.workspace = PathBuf::from(&record.workspace_path);
+
+    let values = secret_values(record, &spec, secrets)?;
 
     for resource in record.resources.iter() {
         let stored = spec.resources.get(&resource.name).cloned().unwrap_or_default();
@@ -318,6 +373,36 @@ pub fn environment_spec(record: &ProjectRecord) -> Result<agentify_backends::Env
         } else {
             stored.kind.clone()
         };
+
+        let mut env = BTreeMap::new();
+        for (key, raw) in &stored.env {
+            env.insert(
+                key.clone(),
+                resolve(&resource.name, key, raw, &values)?,
+            );
+        }
+        // A database's password is a secret reference too. The engine's own
+        // variables are how it reaches the Resource, so the daemon resolves the
+        // reference and passes it as `POSTGRES_PASSWORD` rather than inventing a
+        // second mechanism.
+        if kind == "database" {
+            if let Some(credentials) = &stored.credentials {
+                if let Some(username) = &credentials.username {
+                    env.insert("POSTGRES_USER".to_string(), username.clone());
+                }
+                if let Some(secret_name) = &credentials.password_secret {
+                    let value = values.get(secret_name).ok_or_else(|| {
+                        LifecycleError::Secret(format!(
+                            "database Resource {:?} takes its password from the secret {:?}, \
+                             which this Project does not have",
+                            resource.name, secret_name
+                        ))
+                    })?;
+                    env.insert("POSTGRES_PASSWORD".to_string(), value.clone());
+                }
+            }
+        }
+
         environment.with_resource(agentify_backends::ResourceSpec {
             name: resource.name.clone(),
             kind,
@@ -327,7 +412,7 @@ pub fn environment_spec(record: &ProjectRecord) -> Result<agentify_backends::Env
                 dockerfile: build.dockerfile.clone(),
             }),
             command: stored.command.clone(),
-            env: stored.env.clone(),
+            env,
             ports: stored.ports.iter().map(|port| port.port).collect(),
             depends_on: stored.depends_on.clone(),
             healthcheck: stored.healthcheck.as_ref().map(|check| {
@@ -345,6 +430,65 @@ pub fn environment_spec(record: &ProjectRecord) -> Result<agentify_backends::Env
     Ok(environment)
 }
 
+/// The values of the secrets this Project's Manifest declares, by name.
+///
+/// A declared secret with no value in the store is a typed failure, not an empty
+/// string: starting a Resource with a blank password would be worse than
+/// refusing.
+fn secret_values(
+    record: &ProjectRecord,
+    spec: &StoredSpec,
+    secrets: &Secrets,
+) -> std::result::Result<BTreeMap<String, String>, LifecycleError> {
+    let mut values = BTreeMap::new();
+    for name in spec.secrets.keys() {
+        let value = secrets
+            .get(&record.id, name)
+            .map_err(|err| LifecycleError::Store(anyhow::anyhow!("{err}")))?
+            .ok_or_else(|| {
+                LifecycleError::Secret(format!(
+                    "the secret {name:?} has no value in the credential manager; \
+                     recreate it before starting the Environment"
+                ))
+            })?;
+        values.insert(name.clone(), value);
+    }
+    Ok(values)
+}
+
+/// Replace every `${secret:name}` in one env value.
+fn resolve(
+    resource: &str,
+    key: &str,
+    raw: &str,
+    values: &BTreeMap<String, String>,
+) -> std::result::Result<String, LifecycleError> {
+    const OPEN: &str = "${secret:";
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + OPEN.len()..];
+        let Some(end) = after.find('}') else {
+            return Err(LifecycleError::Validation {
+                path: format!("resources.{resource}.env.{key}"),
+                detail: format!("unterminated ${{secret:...}} in {raw:?}"),
+            });
+        };
+        let name = &after[..end];
+        let value = values.get(name).ok_or_else(|| {
+            LifecycleError::Secret(format!(
+                "resources.{resource}.env.{key} references the secret {name:?}, \
+                 which this Project does not have"
+            ))
+        })?;
+        out.push_str(value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 fn stored_spec(record: &ProjectRecord) -> Result<StoredSpec> {
     serde_json::from_str(&record.spec_json).with_context(|| {
         format!(
@@ -358,6 +502,9 @@ fn stored_spec(record: &ProjectRecord) -> Result<StoredSpec> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct StoredSpec {
+    /// The secrets the Manifest declared, by name. Declarations only: no value
+    /// is ever stored here.
+    secrets: BTreeMap<String, agentify_manifest::Secret>,
     resources: BTreeMap<String, StoredResource>,
     routes: Vec<RouteView>,
 }
@@ -384,6 +531,9 @@ struct StoredResource {
 #[serde(default)]
 struct StoredCredentials {
     username: Option<String>,
+    /// The secret the database's password comes from. A name, never a value.
+    #[serde(rename = "passwordSecret")]
+    password_secret: Option<String>,
 }
 
 impl StoredResource {
@@ -412,4 +562,13 @@ impl StoredResource {
             kind,
         }
     }
+}
+
+/// Whether a Manifest still references a secret by name. A declared secret is
+/// part of the Project's desired state, so deleting its value would break the
+/// next start.
+pub fn is_referenced(record: &ProjectRecord, name: &str) -> bool {
+    stored_spec(record)
+        .map(|spec| spec.secrets.contains_key(name))
+        .unwrap_or(false)
 }

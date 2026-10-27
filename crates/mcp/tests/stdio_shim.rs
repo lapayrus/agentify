@@ -70,6 +70,16 @@ impl Drop for Shim {
     }
 }
 
+/// The value the bundled fixture imports for its `api-token`. A test supplies it
+/// explicitly, so the suite does not depend on how the machine's shell is set up.
+const FIXTURE_API_TOKEN: &str = "fixture-api-token-from-the-host";
+
+/// A daemon for these tests: the memory secret store, and the fixture's imported
+/// value, so no test touches this machine's credential manager.
+fn config(home: &Path) -> agentify_daemon::Config {
+    agentify_daemon::Config::new(home).with_secret_env([("HELLO_API_TOKEN", FIXTURE_API_TOKEN)])
+}
+
 fn initialize() -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -86,7 +96,7 @@ fn initialize() -> Value {
 #[test]
 fn initialize_lists_tools_and_whoami_returns_the_http_payload() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+    let mut daemon = agentify_daemon::start_in_background(config(temp.path()))
         .expect("boot daemon");
 
     let whoami_url = format!("{}/v1/whoami", daemon.base_url());
@@ -156,7 +166,7 @@ fn initialize_lists_tools_and_whoami_returns_the_http_payload() {
 #[test]
 fn project_tools_create_list_and_get_through_the_same_api() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+    let mut daemon = agentify_daemon::start_in_background(config(temp.path()))
         .expect("boot daemon");
     let mut shim = Shim::spawn(temp.path());
 
@@ -348,7 +358,7 @@ fn unknown_methods_and_tools_are_json_rpc_errors() {
 #[test]
 fn environment_tools_drive_the_whole_lifecycle_over_the_same_api() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+    let mut daemon = agentify_daemon::start_in_background(config(temp.path()))
         .expect("boot daemon");
     let mut shim = Shim::spawn(temp.path());
 
@@ -623,7 +633,7 @@ fn destructive_tools_answer_202_and_wait_for_an_approval() {
 
     let temp = tempfile::tempdir().expect("temp dir");
     let mut daemon = agentify_daemon::start_in_background(
-        agentify_daemon::Config::new(temp.path()).with_consent(ConsentMode::Granted),
+        config(temp.path()).with_consent(ConsentMode::Granted),
     )
     .expect("boot daemon");
     let mut shim = Shim::spawn(temp.path());
@@ -860,6 +870,164 @@ fn destructive_tools_answer_202_and_wait_for_an_approval() {
     }));
     let missing = shim.read();
     assert_eq!(missing["error"]["data"]["code"], "NotFound", "{missing}");
+
+    daemon.shutdown().expect("stop daemon");
+}
+
+/// Call one tool and return its JSON-RPC response.
+fn call(shim: &mut Shim, id: u64, tool: &str, arguments: Value) -> Value {
+    shim.send(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments }
+    }));
+    shim.read()
+}
+
+/// The four secret tools: metadata in, values never out.
+#[test]
+fn secret_tools_list_create_update_and_delete_through_the_same_api() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut daemon = agentify_daemon::start_in_background(config(temp.path())).expect("boot daemon");
+    let mut shim = Shim::spawn(temp.path());
+
+    shim.send(initialize());
+    shim.read();
+
+    // All four are advertised, addressed by Project and name.
+    shim.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+    let listed = shim.read();
+    let tools = listed["result"]["tools"].as_array().expect("tools");
+    for name in [
+        "list_secrets",
+        "create_secret",
+        "update_secret",
+        "delete_secret",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} tool in {listed}"));
+        assert_eq!(tool["inputSchema"]["type"], "object", "{name} needs a schema");
+        assert_eq!(
+            tool["inputSchema"]["properties"]["project"]["type"], "string",
+            "{name} takes a project: {tool}"
+        );
+        assert!(
+            tool["description"].as_str().unwrap_or_default().len() > 40,
+            "{name} needs a description an Agent can act on"
+        );
+    }
+    let create = tools
+        .iter()
+        .find(|tool| tool["name"] == "create_secret")
+        .expect("create_secret");
+    for field in ["name", "generate", "value"] {
+        assert_eq!(
+            create["inputSchema"]["properties"][field]["type"], "string",
+            "create_secret takes {field}: {create}"
+        );
+    }
+
+    // A Project with two declared secrets.
+    let created = call(&mut shim, 3, "create_project", json!({ "fixture": "hello-pg" }));
+    assert_eq!(created["result"]["isError"], false, "{created}");
+
+    let listed_secrets = call(&mut shim, 4, "list_secrets", json!({ "project": "hello-pg" }));
+    assert_eq!(
+        listed_secrets["result"]["isError"], false,
+        "{listed_secrets}"
+    );
+    let secrets = listed_secrets["result"]["structuredContent"]["secrets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let names: Vec<&str> = secrets
+        .iter()
+        .filter_map(|secret| secret["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["api-token", "pg-password"], "{listed_secrets}");
+    for secret in &secrets {
+        assert!(
+            secret.get("value").is_none(),
+            "a listed secret is metadata only: {secret}"
+        );
+        assert_eq!(secret["referenced"], true, "{secret}");
+    }
+    assert!(
+        !listed_secrets.to_string().contains(FIXTURE_API_TOKEN),
+        "the imported value never travels: {listed_secrets}"
+    );
+
+    // An Agent mints a secret, then replaces it with one it chose. Neither call
+    // echoes a value back.
+    let minted = call(
+        &mut shim,
+        5,
+        "create_secret",
+        json!({ "project": "hello-pg", "name": "session-key", "generate": "token" }),
+    );
+    assert_eq!(minted["result"]["isError"], false, "{minted}");
+    assert_eq!(minted["result"]["structuredContent"]["name"], "session-key");
+    assert_eq!(minted["result"]["structuredContent"]["source"], "generate");
+    let supplied = "value-from-the-agent-over-mcp";
+    let updated = call(
+        &mut shim,
+        6,
+        "update_secret",
+        json!({ "project": "hello-pg", "name": "session-key", "value": supplied }),
+    );
+    assert_eq!(updated["result"]["isError"], false, "{updated}");
+    assert_eq!(updated["result"]["structuredContent"]["source"], "literal");
+    assert!(
+        !updated.to_string().contains(supplied),
+        "an update never echoes the value: {updated}"
+    );
+
+    // A secret the Manifest still references cannot be deleted: the next start
+    // would have nothing to inject.
+    let refused = call(
+        &mut shim,
+        7,
+        "delete_secret",
+        json!({ "project": "hello-pg", "name": "api-token" }),
+    );
+    assert_eq!(refused["error"]["data"]["code"], "SecretInUse", "{refused}");
+    assert!(
+        !refused.to_string().contains(FIXTURE_API_TOKEN),
+        "the refusal carries no plaintext: {refused}"
+    );
+
+    // The one the Agent made is unreferenced, so it goes.
+    let deleted = call(
+        &mut shim,
+        8,
+        "delete_secret",
+        json!({ "project": "hello-pg", "name": "session-key" }),
+    );
+    assert_eq!(deleted["result"]["isError"], false, "{deleted}");
+    assert_eq!(deleted["result"]["structuredContent"]["deleted"], true);
+
+    let after = call(&mut shim, 9, "list_secrets", json!({ "project": "hello-pg" }));
+    let remaining: Vec<String> = after["result"]["structuredContent"]["secrets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|secret| secret["name"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(remaining, vec!["api-token", "pg-password"], "{after}");
+
+    // A bad payload is a typed validation failure, not a panic or a leaked value.
+    let invalid = call(
+        &mut shim,
+        10,
+        "create_secret",
+        json!({ "project": "hello-pg", "name": "two-sources", "generate": "token", "value": "x" }),
+    );
+    assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    assert_eq!(invalid["error"]["data"]["code"], "ValidationFailed");
 
     daemon.shutdown().expect("stop daemon");
 }

@@ -18,6 +18,8 @@ pub mod health;
 pub mod lifecycle;
 pub mod ports;
 pub mod projects;
+pub mod redact;
+pub mod secrets;
 pub mod server;
 pub mod state;
 

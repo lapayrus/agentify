@@ -60,6 +60,8 @@ pass before the API has to learn about it.
 | `AGENTIFY_EXEC_TIMEOUT_MS` | `60000` | Upper bound on one `exec` |
 | `AGENTIFY_LOG_TAIL` | `200` | Default log tail |
 | `AGENTIFY_HEARTBEAT_MS` | `15000` | SSE heartbeat period |
+| `AGENTIFY_SECRET_STORE` | `keyring` | Where secret values live: `keyring` (the OS credential manager) or `memory` (a test-only store) |
+| `AGENTIFY_SECRET_SERVICE` | `agentify-v0` | Keyring service name the values are filed under |
 
 ## Run it
 
@@ -102,13 +104,23 @@ byte-for-byte the payload of the matching HTTP route:
 {"name": "run_command", "arguments": {"project": "hello-pg", "resource": "web", "command": ["node", "--version"]}}
 {"name": "read_logs", "arguments": {"project": "hello-pg", "resource": "web", "tail": 50}}
 {"name": "get_stats", "arguments": {"project": "hello-pg"}}
+{"name": "list_secrets", "arguments": {"project": "hello-pg"}}
+{"name": "create_secret", "arguments": {"project": "hello-pg", "name": "session-key", "generate": "token"}}
+{"name": "update_secret", "arguments": {"project": "hello-pg", "name": "session-key", "value": "<new value>"}}
+{"name": "delete_secret", "arguments": {"project": "hello-pg", "name": "session-key"}}
 {"name": "wait_for_operation", "arguments": {"operationId": "<id from a timed-out mutation>"}}
 {"name": "stop_environment", "arguments": {"project": "hello-pg"}}
 ```
 
 Tools: `whoami`, `create_project`, `list_projects`, `get_project`,
 `start_environment`, `stop_environment`, `get_status`, `run_command`,
-`read_logs`, `get_stats`, `wait_for_operation`. `environment` defaults to `dev`.
+`read_logs`, `get_stats`, `list_secrets`, `create_secret`, `update_secret`,
+`delete_secret`, `wait_for_operation`. `environment` defaults to `dev`.
+
+Secrets are metadata over MCP: a list carries names and provenance, never a
+value, and `delete_secret` refuses (`SecretInUse`) while the Manifest still
+references the name. Reading a value is human-only, through the OS gesture, and
+has no MCP tool.
 
 A tool failure is a JSON-RPC error whose `data` carries the same stable `code`
 the API returns (`ValidationFailed`, `AlreadyExists`, `SourceMissing`,
@@ -142,6 +154,13 @@ cargo run                        # opens the window (needs a daemon for "connect
 * `projects/<project-id>/workspace/` — the daemon-owned source directory for a
   Project. A bundled fixture is copied here from inside the binary, so an
   installed daemon needs no repository paths.
+* Secret **values** never touch the data root: they live in the OS credential
+  manager (Windows Credential Manager, Keychain, Secret Service), filed under the
+  service name in `AGENTIFY_SECRET_SERVICE`. `state.db` holds metadata only —
+  name, provenance, timestamps — in `secrets_metadata`, so the database is safe to
+  copy. A test-configured daemon (`AGENTIFY_SECRET_STORE=memory`) mirrors its
+  store to `test-secret-store.json` so a restart test keeps its values; the
+  shipped daemon never writes that file.
 * `discovery.json` — the loopback port, URL, and an Agent-scoped token. Written
   atomically and readable only by the current OS user (on Windows the DACL is
   replaced with a single ACE for that user). Never contains a human-capable token.
@@ -170,6 +189,11 @@ next `start` converges it back on the same leases.
 | `POST /v1/projects/{project}/environments/dev/resources/{resource}/exec` | Agent token | `{"command": [...], "timeoutMs": 5000}` → `{stdout, stderr, exitCode, durationMs}` |
 | `GET /v1/projects/{project}/environments/dev/logs` | Agent token | bounded `tail`, optional `since` and `resource`; `follow=1` is SSE |
 | `GET /v1/projects/{project}/environments/dev/stats` | Agent token | environment-level cpu/memory/disk |
+| `GET /v1/projects/{project}/secrets` | Agent token | metadata only: name, provenance (`generate`, `fromEnv`, `literal`), whether the Manifest references it |
+| `POST /v1/projects/{project}/secrets` | Agent token | `{"name": "...", "generate": "password"\|"token"}` or `{"name": "...", "value": "..."}`; the value is stored and never echoed |
+| `PATCH /v1/projects/{project}/secrets/{name}` | Agent token | replace a value; an imported (`fromEnv`) secret is `SecretImmutable` |
+| `DELETE /v1/projects/{project}/secrets/{name}` | Agent token | refused with `SecretInUse` while the Manifest references it |
+| `POST /v1/projects/{project}/secrets/{name}/reveal` | Agent token + OS gesture | the one route that returns a value; audited without it |
 | `GET /v1/operations/{id}` | Agent token | a mutation's operation |
 | `GET /v1/operations/{id}/wait` | Agent token | block until it finishes (`?timeoutMs=`) |
 
@@ -186,8 +210,13 @@ it probes the host ports it leased.
 Errors are `application/problem+json` with a stable `code`: the Backend enum
 (`Unsupported`, `VersionMismatch`, `NotProvisioned`, `AlreadyExists`,
 `PortUnavailable`, `ExecutionFailed`, `BackendUnavailable`, `Timeout`,
-`Cancelled`) plus `NotFound` and `ValidationFailed` (with a `path`). Everything
-binds to `127.0.0.1` only.
+`Cancelled`) plus `NotFound`, `ValidationFailed` (with a `path`),
+`SecretSourceMissing`, `SecretInUse`, `SecretImmutable`, and `ApprovalRequired`.
+Everything binds to `127.0.0.1` only.
+
+A Project's known secret values, and their percent-encoded forms, are redacted
+from every response body, log line, exec output, and audit entry — the reveal
+route is the single deliberate exception.
 
 ## Manifest v0
 
@@ -207,6 +236,15 @@ cargo test --workspace     # Backend conformance, manifest unit tests, and daemo
 cargo build --workspace
 cd ui && npm test          # renderer states: header, rail, detail, status bar, Start/Stop, logs, empty, unreachable
 cd ui/src-tauri && cargo check --all-targets && cargo test
+```
+
+No automated test touches this machine's real credentials: the daemon's secret
+store is a seam, and every suite runs it against the in-memory one. The real OS
+credential manager is exercised by one opt-in test, which uses a per-run service
+name and deletes what it writes:
+
+```sh
+AGENTIFY_TEST_KEYRING=1 cargo test -p agentify-daemon --lib secrets
 ```
 
 Two seams, as the spec agreed:

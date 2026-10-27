@@ -3,6 +3,7 @@
 //! The data root layout lives in `agentify_proto` because every process needs
 //! it; this module adds the daemon's own knobs.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use anyhow::{Context, Result};
 
 use crate::consent::{self, ConsentMode};
 use crate::ports::PortRange;
+use crate::secrets::{self, SecretEnv, SecretStoreKind, Secrets};
 
 /// Environment variable that shortens the events heartbeat (milliseconds).
 pub const HEARTBEAT_ENV: &str = "AGENTIFY_HEARTBEAT_MS";
@@ -43,6 +45,15 @@ pub const CONSENT_ENV: &str = "AGENTIFY_CONSENT";
 
 /// Environment variable shortening an Approval's lifetime (milliseconds).
 pub const APPROVAL_TTL_ENV: &str = "AGENTIFY_APPROVAL_TTL_MS";
+
+/// Environment variable selecting where secret values are kept: `keyring` (the
+/// OS credential manager, the default for the shipped daemon) or `memory` (an
+/// in-process store, for tests).
+pub const SECRET_STORE_ENV: &str = "AGENTIFY_SECRET_STORE";
+
+/// Environment variable naming the keyring service Agentify's credentials live
+/// under. A test that exercises the real credential manager uses its own name.
+pub const SECRET_SERVICE_ENV: &str = "AGENTIFY_SECRET_SERVICE";
 
 /// Default heartbeat period for `GET /v1/events`.
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
@@ -103,6 +114,16 @@ pub struct Config {
     pub approval_ttl: Duration,
     /// How the interactive consent gesture is answered.
     pub consent: ConsentMode,
+    /// Where Project secret values live. The shipped daemon uses the OS
+    /// credential manager; a test-config daemon uses an in-process store so no
+    /// suite can read or write the developer's real credentials.
+    pub secret_store: SecretStoreKind,
+    /// Keyring service name. One per installation keeps Agentify's credentials
+    /// apart from every other application's.
+    pub secret_service: String,
+    /// Where a `fromEnv` import reads from. A test-config daemon is hermetic: an
+    /// empty map, so a developer's shell cannot change what a test sees.
+    pub secret_env: SecretEnv,
 }
 
 impl Config {
@@ -124,6 +145,12 @@ impl Config {
             // A test-config daemon must never open an OS prompt: the gesture is
             // scripted, and refused unless a test asks for it.
             consent: ConsentMode::Declined,
+            // Same rule for secrets: an in-process store and an empty host
+            // environment, so a test cannot touch this machine's credentials or
+            // depend on how the developer's shell is set up.
+            secret_store: SecretStoreKind::Memory,
+            secret_service: secrets::DEFAULT_SERVICE.to_string(),
+            secret_env: SecretEnv::Fixed(BTreeMap::new()),
         }
     }
 
@@ -176,6 +203,21 @@ impl Config {
             },
             Err(_) => consent::default_mode(),
         };
+        // The shipped daemon keeps secret values in the OS credential manager and
+        // imports `fromEnv` from its own environment, falling back to the user's.
+        match std::env::var(SECRET_STORE_ENV) {
+            Ok(raw) => match SecretStoreKind::parse(&raw) {
+                Some(kind) => config.secret_store = kind,
+                None => anyhow::bail!("{SECRET_STORE_ENV}={raw} is not one of keyring, memory"),
+            },
+            Err(_) => config.secret_store = SecretStoreKind::Keyring,
+        }
+        if let Ok(raw) = std::env::var(SECRET_SERVICE_ENV) {
+            if !raw.trim().is_empty() {
+                config.secret_service = raw.trim().to_string();
+            }
+        }
+        config.secret_env = SecretEnv::Process;
         Ok(config)
     }
 
@@ -184,6 +226,45 @@ impl Config {
     pub fn with_consent(mut self, mode: ConsentMode) -> Self {
         self.consent = mode;
         self
+    }
+
+    /// Keep secret values in a chosen store. A test names the in-memory one; the
+    /// shipped daemon picks the credential manager from the environment.
+    pub fn with_secret_store(mut self, kind: SecretStoreKind) -> Self {
+        self.secret_store = kind;
+        self
+    }
+
+    /// Name the keyring service, so a test uses its own and can clean up after
+    /// itself.
+    pub fn with_secret_service(mut self, service: impl Into<String>) -> Self {
+        self.secret_service = service.into();
+        self
+    }
+
+    /// Read `fromEnv` imports from an explicit map instead of this process's
+    /// environment. Tests use this so a machine's shell cannot change the result.
+    pub fn with_secret_env<I, K, V>(mut self, pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.secret_env = SecretEnv::Fixed(
+            pairs
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        );
+        self
+    }
+
+    /// The secret machinery this configuration describes.
+    pub fn secrets(&self) -> Secrets {
+        Secrets::new(
+            self.secret_store.store(&self.secret_service, &self.data_root),
+            self.secret_env.clone(),
+        )
     }
 
     /// Shorten an Approval's lifetime, so expiry can be tested without waiting

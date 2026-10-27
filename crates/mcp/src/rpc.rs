@@ -22,7 +22,11 @@ Environment up (idempotent: retrying is safe), `run_command` runs a bounded comm
 mutation takes too long the error carries an operation id: finish it with `wait_for_operation` instead \
 of retrying blindly. `delete_project` and `reset_environment` are destructive: they answer 202 with an \
 `approvalId` and an `operationId` and change nothing until a human approves, so watch `wait_for_operation` \
-rather than retrying. `whoami` reports scopes, versions, the active Backend, and its capabilities.";
+rather than retrying. `list_secrets` shows a Project's secrets as metadata (names and provenance, never \
+values); `create_secret` and `update_secret` set a value the daemon stores in the OS credential manager, and \
+`delete_secret` removes one the Manifest no longer references — a referenced one is refused with \
+`SecretInUse`. Reading a value is human-only and has no tool. `whoami` reports scopes, versions, the active \
+Backend, and its capabilities.";
 
 /// Handle one line of input. Returns the response to write, or `None` for
 /// notifications (which must not be answered).
@@ -309,6 +313,95 @@ of GET .../stats.",
             }
         },
         {
+            "name": "list_secrets",
+            "title": "List Project secrets",
+            "description": "List a Project's secrets: each name, where its value came from (`generate`, \
+`fromEnv`, or `literal`), whether the Manifest still references it, and when it was written. This is \
+metadata only: the API has no path that returns a value to an Agent, so a list can never leak one. Returns \
+exactly the payload of GET /v1/projects/{project}/secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Project name or id." }
+                },
+                "required": ["project"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "create_secret",
+            "title": "Create a secret",
+            "description": "Add a secret to a Project, with exactly one source: `generate` (the daemon mints \
+a value; use `password` or `token`) or `value` (one you supply). The value goes to the OS credential manager \
+and is never echoed in the response. A `fromEnv` import happens once, when the Project is created, so it is \
+declared in the Manifest rather than created here. Returns exactly the payload of \
+POST /v1/projects/{project}/secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Project name or id." },
+                    "name": {
+                        "type": "string",
+                        "description": "Lower-case kebab-case name, referenced as ${secret:name}."
+                    },
+                    "generate": {
+                        "type": "string",
+                        "enum": ["password", "token"],
+                        "description": "Ask the daemon to mint the value."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Supply the value yourself. Stored, never returned."
+                    }
+                },
+                "required": ["project", "name"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "update_secret",
+            "title": "Update a secret",
+            "description": "Replace a secret's value, with exactly one of `generate` (mint a fresh one) or \
+`value` (supply it). An imported (`fromEnv`) secret cannot be updated: it was imported once from the host \
+environment when the Project was created. The response is metadata; the value is never returned. Returns \
+exactly the payload of PATCH /v1/projects/{project}/secrets/{name}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Project name or id." },
+                    "name": { "type": "string", "description": "The secret's name." },
+                    "generate": {
+                        "type": "string",
+                        "enum": ["password", "token"],
+                        "description": "Ask the daemon to mint a fresh value."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The replacement value. Stored, never returned."
+                    }
+                },
+                "required": ["project", "name"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "delete_secret",
+            "title": "Delete a secret",
+            "description": "Delete a secret and its value. Refused with `SecretInUse` while the Project's \
+Manifest still references the name, because the next start would have no value to inject: remove the \
+reference and create the Project again first. Returns exactly the payload of \
+DELETE /v1/projects/{project}/secrets/{name}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Project name or id." },
+                    "name": { "type": "string", "description": "The secret's name." }
+                },
+                "required": ["project", "name"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "wait_for_operation",
             "title": "Wait for an operation",
             "description": "Wait for a long mutation to finish and return the operation, including the \
@@ -391,6 +484,22 @@ fn call_tool(id: Value, params: Value, client: &DaemonClient) -> Value {
         },
         "get_stats" => match environment_arguments(&arguments) {
             Ok((project, environment)) => client.stats(&project, &environment),
+            Err(message) => return invalid_arguments(id, &message),
+        },
+        "list_secrets" => match required_string(&arguments, "project") {
+            Ok(project) => client.list_secrets(&project),
+            Err(message) => return invalid_arguments(id, &message),
+        },
+        "create_secret" => match create_secret_arguments(&arguments) {
+            Ok((project, body)) => client.create_secret(&project, &body),
+            Err(message) => return invalid_arguments(id, &message),
+        },
+        "update_secret" => match update_secret_arguments(&arguments) {
+            Ok((project, name, body)) => client.update_secret(&project, &name, &body),
+            Err(message) => return invalid_arguments(id, &message),
+        },
+        "delete_secret" => match secret_arguments(&arguments) {
+            Ok((project, name)) => client.delete_secret(&project, &name),
             Err(message) => return invalid_arguments(id, &message),
         },
         "wait_for_operation" => match wait_arguments(&arguments) {
@@ -511,6 +620,46 @@ fn wait_arguments(arguments: &Value) -> std::result::Result<(String, Option<u64>
     let operation_id = required_string(arguments, "operationId")?;
     let timeout_ms = optional_count(arguments, "timeoutMs")?;
     Ok((operation_id, timeout_ms))
+}
+
+/// `(project, name)`: the two a secret route always needs.
+fn secret_arguments(arguments: &Value) -> std::result::Result<(String, String), String> {
+    let project = required_string(arguments, "project")?;
+    let name = required_string(arguments, "name")?;
+    Ok((project, name))
+}
+
+/// One of `generate` or `value`, as the body the API takes. The value is passed
+/// through exactly as given: a secret may legitimately contain spaces.
+fn secret_source(arguments: &Value) -> std::result::Result<serde_json::Map<String, Value>, String> {
+    let generate = optional_string(arguments, "generate")?;
+    let value = optional_string(arguments, "value")?;
+    let mut body = serde_json::Map::new();
+    match (generate, value) {
+        (Some(generate), None) => {
+            body.insert("generate".to_string(), Value::String(generate));
+        }
+        (None, Some(value)) => {
+            body.insert("value".to_string(), Value::String(value));
+        }
+        _ => return Err("pass exactly one of `generate` or `value`".to_string()),
+    }
+    Ok(body)
+}
+
+fn create_secret_arguments(arguments: &Value) -> std::result::Result<(String, Value), String> {
+    let (project, name) = secret_arguments(arguments)?;
+    let mut body = secret_source(arguments)?;
+    body.insert("name".to_string(), Value::String(name));
+    Ok((project, Value::Object(body)))
+}
+
+fn update_secret_arguments(
+    arguments: &Value,
+) -> std::result::Result<(String, String, Value), String> {
+    let (project, name) = secret_arguments(arguments)?;
+    let body = secret_source(arguments)?;
+    Ok((project, name, Value::Object(body)))
 }
 
 /// `create_project` takes exactly one of `fixture` or `manifest`.

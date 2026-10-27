@@ -110,6 +110,11 @@ pub struct FakeScript {
     pub unbound_resources: Vec<String>,
     /// Pause between exec chunks.
     pub exec_delay_ms: u64,
+    /// Write the [`EnvironmentSpec`] this Backend was handed to this path, as
+    /// JSON. A test uses it to check what the daemon actually resolved — the
+    /// values it injected, and the placeholders it left behind — without the
+    /// production API ever exposing a spec.
+    pub record_spec_path: Option<String>,
     /// Capabilities to advertise. Defaults to the fake's own set.
     pub capabilities: Capabilities,
 }
@@ -123,6 +128,7 @@ impl Default for FakeScript {
             exec_fault: None,
             unbound_resources: Vec::new(),
             exec_delay_ms: 0,
+            record_spec_path: None,
             capabilities: Capabilities {
                 pty: false,
                 mount: false,
@@ -182,6 +188,14 @@ impl FakeScript {
                             .ok_or_else(|| format!("`{key}` must hold strings"))?;
                         script.unbound_resources.push(name.to_string());
                     }
+                }
+                "record_spec_path" => {
+                    script.record_spec_path = Some(
+                        value
+                            .as_str()
+                            .ok_or_else(|| format!("`{key}` must be a path"))?
+                            .to_string(),
+                    );
                 }
                 other => return Err(format!("unknown fake script key: {other}")),
             }
@@ -342,6 +356,21 @@ impl Backend for FakeBackend {
         Box::pin(async move {
             if let Some(fault) = self.script.start_fault {
                 return Err(fault.error("start"));
+            }
+            if let Some(path) = &self.script.record_spec_path {
+                // What the daemon resolved, exactly as a real adapter would
+                // receive it. A test reads this instead of asking the API for a
+                // spec the API does not serve.
+                let rendered = serde_json::to_vec_pretty(spec).map_err(|err| {
+                    BackendError::BackendUnavailable {
+                        detail: format!("cannot render the recorded spec: {err}"),
+                    }
+                })?;
+                std::fs::write(path, rendered).map_err(|err| {
+                    BackendError::BackendUnavailable {
+                        detail: format!("cannot write the recorded spec to {path}: {err}"),
+                    }
+                })?;
             }
             if self.script.start_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.script.start_delay_ms)).await;

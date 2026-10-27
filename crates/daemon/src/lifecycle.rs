@@ -48,6 +48,8 @@ pub enum LifecycleError {
     Backend(BackendError),
     /// No host port could be leased.
     Port { port: u16, holder: String },
+    /// A secret the Manifest references has no value, or the store failed.
+    Secret(String),
     /// The store failed.
     Store(anyhow::Error),
 }
@@ -60,6 +62,7 @@ impl LifecycleError {
             LifecycleError::Validation { .. } => "ValidationFailed".to_string(),
             LifecycleError::Backend(err) => err.code().to_string(),
             LifecycleError::Port { .. } => "PortUnavailable".to_string(),
+            LifecycleError::Secret(_) => "SecretSourceMissing".to_string(),
             LifecycleError::Store(_) => "Internal".to_string(),
         }
     }
@@ -70,6 +73,7 @@ impl LifecycleError {
             LifecycleError::Validation { .. } => 422,
             LifecycleError::Backend(err) => err.status(),
             LifecycleError::Port { .. } => 409,
+            LifecycleError::Secret(_) => 409,
             LifecycleError::Store(_) => 500,
         }
     }
@@ -82,6 +86,7 @@ impl LifecycleError {
             LifecycleError::Port { port, holder } => {
                 format!("no host port could be leased: port {port} is held by {holder}")
             }
+            LifecycleError::Secret(detail) => detail.clone(),
             LifecycleError::Store(err) => format!("{err:#}"),
         }
     }
@@ -121,6 +126,8 @@ impl From<anyhow::Error> for LifecycleError {
 pub struct Lifecycle {
     pub backend: Arc<dyn Backend>,
     pub ports: PortRegistry,
+    /// The Project's secret values, resolved into the spec before every start.
+    pub secrets: Arc<crate::secrets::Secrets>,
     /// How long the daemon waits for one leased port to answer.
     pub probe_timeout: Duration,
     /// Upper bound the daemon puts on one `exec`.
@@ -157,7 +164,7 @@ impl Lifecycle {
         // what the daemon probes. A bind race with another process on the
         // machine is retried on a fresh part of the range; a port held by
         // another Environment is a typed failure, not a retry.
-        let base = projects::environment_spec(record)?;
+        let base = projects::environment_spec(record, &self.secrets)?;
         let requests = projects::port_requests(record)?;
         let mut leases = Vec::new();
         let mut spec = base.clone();

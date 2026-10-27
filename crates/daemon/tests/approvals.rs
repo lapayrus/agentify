@@ -13,6 +13,9 @@ use agentify_daemon::ports::PortRange;
 use agentify_daemon::Config;
 use serde_json::{json, Value};
 
+/// The value the fixture imports for `api-token`.
+const FIXTURE_API_TOKEN: &str = "fixture-api-token-from-the-host";
+
 /// A daemon booted by a test, shut down on drop.
 struct Daemon {
     inner: Option<agentify_daemon::RunningDaemon>,
@@ -30,6 +33,10 @@ impl Daemon {
     }
 
     fn boot(config: Config) -> Daemon {
+        // The bundled fixture imports one secret from the host environment. A
+        // test supplies it explicitly, so the result does not depend on how the
+        // machine running the suite is set up.
+        let config = config.with_secret_env([("HELLO_API_TOKEN", FIXTURE_API_TOKEN)]);
         Daemon {
             inner: Some(agentify_daemon::start_in_background(config).expect("boot daemon")),
         }

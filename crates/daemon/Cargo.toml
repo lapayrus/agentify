@@ -43,7 +43,20 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_System_Threading",
+  # `HKCU\Environment`, the fallback a `fromEnv` import reads when the daemon was
+  # started by a login item that never inherited the user's variables.
+  "Win32_System_Registry",
 ] }
+# The OS credential manager, which holds every Project's secret values.
+keyring = { version = "3.6", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Keychain on macOS. The daemon is Windows-first in v0; this keeps the crate
+# buildable on a Mac while the real adapter is still the Windows one.
+keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["linux-native"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
