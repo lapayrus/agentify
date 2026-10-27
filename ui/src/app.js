@@ -17,11 +17,31 @@ const DEFAULT_LOG_TAIL = 100;
 const APPROVAL_LIMIT = 12;
 /** How many audit entries the feed shows. */
 const ACTIVITY_LIMIT = 40;
+/** How often a background update check runs while the window is open. */
+const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+/** Where the shell keeps its one local preference. */
+const PREFERENCES_KEY = "agentify.preferences";
 const app = document.getElementById("app");
 
 let status = { state: "loading" };
 let selected = null;
 let tab = "overview";
+/** `projects`, `mcp`, or `settings`: the top-level section in the header. */
+let section = "projects";
+/** `{ autoUpdate }`, persisted in the webview. */
+let preferences = loadPreferences();
+/** What `shell_info` reported: the app version, data root, and MCP connector. */
+let shellInfo = null;
+let shellInfoError = null;
+/** The last update check: status, versions, notes, and whether it was dismissed. */
+let update = {
+  status: "idle",
+  currentVersion: null,
+  version: null,
+  body: null,
+  error: null,
+  dismissed: false,
+};
 /** The first-run state: `{ state, message, elevated_step, reboot_required }`. */
 let bootstrap = null;
 /** { status, stats, logs: { lines, nextSince, following, error }, pending, error } */
@@ -191,9 +211,128 @@ async function decide(action, approvalId) {
   paint();
 }
 
+function loadPreferences() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(PREFERENCES_KEY) ?? "{}");
+    return { autoUpdate: parsed?.autoUpdate !== false };
+  } catch {
+    return { autoUpdate: true };
+  }
+}
+
+function savePreferences() {
+  try {
+    window.localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences));
+  } catch {
+    // Storage may be disabled; the preference then lasts for this window only.
+  }
+}
+
+/** The app version, data root, and MCP connector details. A read. */
+async function loadShellInfo() {
+  if (!bridge()) {
+    return;
+  }
+  try {
+    shellInfo = await call("shell_info");
+    shellInfoError = null;
+  } catch (error) {
+    shellInfoError = String(error);
+  }
+  paint();
+}
+
+/**
+ * Ask the updater whether a signed release is newer than this build. A manual
+ * check surfaces a failure; a background one stays quiet, because being offline
+ * is not something the window needs to shout about.
+ */
+async function checkForUpdate({ manual = false } = {}) {
+  if (!bridge()) {
+    return;
+  }
+  if (manual) {
+    update = { ...update, status: "checking", error: null, dismissed: false };
+    paint();
+  }
+  try {
+    const result = await call("update_check");
+    const available = result?.update ?? null;
+    const version = available?.version ?? null;
+    update = {
+      status: available ? "available" : "current",
+      currentVersion: result?.current_version ?? update.currentVersion,
+      version,
+      body: available?.body ?? null,
+      error: null,
+      dismissed: update.dismissed && update.version === version,
+    };
+  } catch (error) {
+    update = { ...update, status: manual ? "error" : "idle", error: String(error) };
+  }
+  paint();
+}
+
+/**
+ * Download and install the update. The updater restarts the shell; the daemon is
+ * stopped first so the installer can replace its sidecar.
+ */
+async function installUpdate() {
+  update = { ...update, status: "installing", error: null, dismissed: false };
+  paint();
+  try {
+    await call("update_install");
+    // The updater restarts the shell on Windows. If it returns instead, bring
+    // the daemon back up on the new build.
+    await call("restart_daemon").catch(() => {});
+  } catch (error) {
+    update = { ...update, status: "error", error: String(error) };
+    paint();
+  }
+}
+
 function paint() {
   app.dataset.connection = status.state;
-  app.innerHTML = render({ ...status, selected, view, inbox, bootstrap });
+  app.innerHTML = render({
+    ...status,
+    selected,
+    view,
+    inbox,
+    bootstrap,
+    section,
+    update,
+    shellInfo,
+    shellInfoError,
+    preferences,
+  });
+
+  for (const button of app.querySelectorAll("[data-nav]")) {
+    button.addEventListener("click", () => {
+      const next = button.dataset.nav;
+      if (!["projects", "mcp", "settings"].includes(next) || next === section) {
+        return;
+      }
+      section = next;
+      paint();
+      if (next === "mcp" && shellInfo === null && shellInfoError === null) {
+        loadShellInfo();
+      }
+    });
+  }
+
+  for (const input of app.querySelectorAll("[data-setting]")) {
+    input.addEventListener("change", () => {
+      if (input.dataset.setting !== "auto-update") {
+        return;
+      }
+      preferences = { ...preferences, autoUpdate: input.checked };
+      savePreferences();
+      paint();
+      if (input.checked) {
+        checkForUpdate();
+      }
+    });
+  }
 
   for (const button of app.querySelectorAll("[data-project]")) {
     button.addEventListener("click", () => {
@@ -223,6 +362,21 @@ function paint() {
         // thing in this window that can reach the elevated command.
         button.disabled = true;
         setupWsl();
+        return;
+      }
+      if (action === "check-update") {
+        button.disabled = true;
+        checkForUpdate({ manual: true });
+        return;
+      }
+      if (action === "install-update") {
+        button.disabled = true;
+        installUpdate();
+        return;
+      }
+      if (action === "dismiss-update") {
+        update = { ...update, dismissed: true };
+        paint();
         return;
       }
       act(action);
@@ -323,3 +477,16 @@ startFollowing();
 // The first-run state is asked for once and after every consent: it is a probe
 // of the machine, not something that changes on a five-second cadence.
 loadBootstrap().then(paint);
+// The connector details are static for this build; read them once so the MCP
+// tab and Settings draw without a second round trip.
+loadShellInfo();
+// Check once shortly after launch (so the window paints first) and then at a
+// slow cadence. `autoUpdate` is the one preference the window keeps locally.
+if (preferences.autoUpdate) {
+  setTimeout(() => checkForUpdate(), 1500);
+  setInterval(() => {
+    if (preferences.autoUpdate) {
+      checkForUpdate();
+    }
+  }, UPDATE_INTERVAL_MS);
+}

@@ -9,12 +9,19 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# A release build is never cancelled by a newer tag: two simultaneous installers
+# would race for the same `latest.json`.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
   release:
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +30,12 @@ jobs:
           node-version: 22
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          workspaces: "ui/src-tauri -> target"
 
       - name: Install the shell's dependencies
         working-directory: ui

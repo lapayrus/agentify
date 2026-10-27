@@ -15,7 +15,7 @@ members = [
 exclude = ["ui/src-tauri"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.94"
 license = "UNLICENSED"

@@ -87,6 +87,38 @@ body {
   font-size: 12px;
 }
 
+/* ---------- top-level tabs ---------- */
+
+.top-nav {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  align-self: center;
+}
+
+.nav-item {
+  padding: 5px 11px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.nav-item:hover {
+  background: var(--line-soft);
+  color: var(--ink);
+}
+
+.nav-item[aria-current="true"] {
+  background: var(--panel);
+  border-color: var(--line);
+  color: var(--ink);
+  font-weight: 600;
+}
+
 .dot {
   width: 7px;
   height: 7px;
@@ -991,6 +1023,137 @@ table.resources .resource-name {
   .side {
     padding: 16px 12px;
   }
+}
+
+/* ---------- global tabs: MCP connector and Settings ---------- */
+
+.main.settings {
+  padding: 30px 36px 48px;
+  max-width: 900px;
+}
+
+.card {
+  margin: 0 0 18px;
+  padding: 16px 18px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.card h2 {
+  margin: 0 0 10px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 10px;
+}
+
+.hint {
+  margin: 0 0 10px;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.code-block {
+  margin: 0;
+  padding: 12px 14px;
+  overflow-x: auto;
+  background: #f3f1ec;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+}
+
+.code-block code {
+  padding: 0;
+  background: transparent;
+  font-size: inherit;
+}
+
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tag-list li code {
+  font-size: 11.5px;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.toggle input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+}
+
+.pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.pill-ok {
+  background: #e6f0ee;
+  color: var(--accent);
+}
+
+.pill-warn {
+  background: #fdf6e7;
+  color: var(--warn);
+}
+
+/* The update banner is good news, not a warning: it borrows the setup card's
+   accent while keeping the same shape as the version and bootstrap banners. */
+.banner-update h2 {
+  color: var(--accent);
+}
+
+.banner-update[data-state="error"] h2 {
+  color: var(--warn);
+}
+
+.banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.action-quiet {
+  background: transparent;
+  color: var(--ink-soft);
+  border-color: var(--line);
+}
+
+.update-notes {
+  white-space: pre-line;
 }
 
 
