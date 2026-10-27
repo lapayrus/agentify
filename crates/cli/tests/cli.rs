@@ -72,3 +72,71 @@ fn status_reports_a_connected_daemon() {
 
     daemon.shutdown().expect("stop daemon");
 }
+
+#[test]
+fn bootstrap_without_a_flag_only_reports_and_changes_nothing() {
+    // A read: no elevation, no RunOnce entry, no install. On a machine that
+    // already has WSL 2 this is the "Ready and do nothing" path; on a machine
+    // without it, it is the "someone has to agree" path. Either way the exit
+    // code says which, and the registry value is exactly as it was.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let before = pending_resume();
+    let output = agentify(temp.path(), &["bootstrap"]);
+    let after = pending_resume();
+    assert_eq!(
+        before, after,
+        "reporting the bootstrap state must not write a resume entry"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match output.status.code() {
+        // Ready: nothing to do, and nothing was asked for.
+        Some(0) => {
+            assert!(stdout.contains("bootstrap: ready"), "got: {stdout}");
+            assert!(
+                !stdout.contains("elevated step"),
+                "a ready machine is asked for no elevated step: {stdout}"
+            );
+            assert!(
+                !stdout.to_ascii_lowercase().contains("administrator prompt"),
+                "nothing is proposed on a ready machine: {stdout}"
+            );
+        }
+        // A human action is still needed: the output says which, and offers no
+        // install without consent.
+        Some(2) => {
+            assert!(
+                stdout.contains("consent_required")
+                    || stdout.contains("reboot_required")
+                    || stdout.contains("missing"),
+                "got: {stdout} stderr: {stderr}"
+            );
+            assert!(
+                stdout.contains("agentify bootstrap --consent")
+                    || stdout.contains("elevated step"),
+                "the output names the human step: {stdout}"
+            );
+        }
+        other => panic!(
+            "unexpected exit {other:?}; stdout: {stdout} stderr: {stderr}"
+        ),
+    }
+}
+
+#[test]
+fn bootstrap_rejects_an_unknown_action_without_touching_anything() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let output = agentify(temp.path(), &["bootstrap", "--install-silently"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown bootstrap action"), "{stderr}");
+    assert!(stderr.contains("--consent"), "it says what to use: {stderr}");
+}
+
+/// The shipped resume value, read without elevation: `None` on a machine that is
+/// not mid-install, which is what a test run must leave behind.
+fn pending_resume() -> Option<String> {
+    use agentify_bootstrap::{ResumeStore, RunOnce, RESUME_VALUE_NAME};
+    RunOnce.pending(RESUME_VALUE_NAME).expect("read RunOnce")
+}

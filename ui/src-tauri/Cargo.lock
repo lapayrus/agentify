@@ -25,6 +25,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentify-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "agentify-proto",
+ "anyhow",
+ "serde",
+]
+
+[[package]]
 name = "agentify-daemon"
 version = "0.1.0"
 dependencies = [
@@ -79,6 +88,7 @@ dependencies = [
 name = "agentify-shell"
 version = "0.1.0"
 dependencies = [
+ "agentify-bootstrap",
  "agentify-daemon",
  "agentify-proto",
  "serde",

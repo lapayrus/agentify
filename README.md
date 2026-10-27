@@ -197,6 +197,22 @@ The bundle is signing-ready but unsigned locally: `bundle.windows` already names
 change. Updater artifacts are off; turning them on also needs
 `TAURI_SIGNING_PRIVATE_KEY`.
 
+First run is the one place Agentify asks for an administrator prompt.
+`agentify bootstrap` only reports: exit 0 and `ready` on a machine that already
+has WSL 2, exit 2 and `consent_required` when one elevated step is still needed,
+and nothing is installed either way. Consenting is a human action — the setup
+card in the shell, or `agentify bootstrap --consent` — and both run the same
+single command, `wsl --install --no-distribution`, in a UAC-elevated process
+that the app waits for. When Windows needs a restart the app writes one per-user
+`HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce` value
+(`AgentifyResumeBootstrap`) that relaunches it with `--resume`, says "reboot
+required" instead of retrying, and removes the value once setup succeeds. An
+Agent can read the state; it cannot consent. The state machine
+(`missing`/`consent_required`/`installing`/`reboot_required`/`resuming`/`ready`/
+`failed`) lives in `crates/bootstrap`, with the elevated command, the restart
+signal, and the registry injected so tests never install, reboot, or leave an
+entry behind.
+
 Caddy is not in the bundle yet. The daemon does not download it: ingress looks
 for `%LOCALAPPDATA%\Agentify\tools\caddy.exe` (or `AGENTIFY_CADDY`) and reports
 its typed `Missing` error until a pinned 2.10.2 binary is placed there.

@@ -8,6 +8,7 @@ members = [
   "crates/daemon",
   "crates/mcp",
   "crates/cli",
+  "crates/bootstrap",
 ]
 # The Tauri shell is built separately (see ui/README.md): it embeds webview
 # assets, so it must not slow down or gate the daemon workspace build.
@@ -22,6 +23,7 @@ publish = false
 
 [workspace.dependencies]
 agentify-backends = { path = "crates/backends" }
+agentify-bootstrap = { path = "crates/bootstrap" }
 agentify-ingress = { path = "crates/ingress" }
 agentify-manifest = { path = "crates/manifest" }
 agentify-proto = { path = "crates/proto" }

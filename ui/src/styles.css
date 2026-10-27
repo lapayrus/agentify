@@ -954,6 +954,34 @@ table.resources .resource-name {
   font-size: 11.5px;
 }
 
+/* The first-run card. It is the only place in the shell that offers an
+   administrator prompt, so it reads like a decision, not an error: the step is
+   named, the button is the only way forward, and a machine that is ready shows
+   no card at all. */
+.banner-setup h2 {
+  color: var(--accent, var(--warn));
+}
+
+.banner-step {
+  margin: 0 0 10px;
+  font-size: 11.5px;
+  color: var(--ink-soft);
+}
+
+.banner-step code {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink);
+}
+
+.banner-setup .action {
+  margin: 0 0 8px;
+}
+
+.banner-setup[data-state="reboot_required"] h2 {
+  color: var(--warn);
+}
+
 /* A narrow window keeps all three zones but gives the right column less room. */
 @media (max-width: 1180px) {
   .body {
