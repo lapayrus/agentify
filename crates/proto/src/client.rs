@@ -201,6 +201,12 @@ impl DaemonClient {
         self.get_json("/v1/whoami")
     }
 
+    /// `GET /v1/handshake`: the pinned versions, what the daemon found, and the
+    /// refusal when the two disagree.
+    pub fn handshake(&self) -> Result<Value, ClientError> {
+        self.get_json("/v1/handshake")
+    }
+
     /// `GET /v1/projects`.
     pub fn list_projects(&self) -> Result<Value, ClientError> {
         self.get_json("/v1/projects")

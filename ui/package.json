@@ -6,6 +6,13 @@
   "description": "Agentify desktop shell front end: header, Project rail, empty and connection states",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "stage:sidecar": "node scripts/stage-sidecar.mjs",
+    "tauri": "tauri",
+    "bundle": "tauri build --bundles nsis",
+    "bundle:debug": "tauri build --debug --bundles nsis"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.1"
   }
 }

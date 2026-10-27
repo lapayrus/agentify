@@ -24,6 +24,7 @@ fn a_running_daemon_is_reported_as_connected_with_the_whoami_payload() {
             whoami,
             projects,
             projects_error,
+            handshake,
             data_root,
         } => {
             assert_eq!(whoami["api_version"], "v1");
@@ -32,6 +33,48 @@ fn a_running_daemon_is_reported_as_connected_with_the_whoami_payload() {
             assert_eq!(data_root, temp.path().display().to_string());
             assert!(projects.is_empty(), "no Projects exist yet");
             assert!(projects_error.is_none());
+            // The shell carries the daemon's startup handshake, so the version
+            // banner can be drawn without a second request.
+            let handshake = handshake.expect("the daemon answered, so it has a handshake");
+            assert_eq!(handshake["ok"], true, "a shipped build matches its own pins");
+            assert!(handshake["refusal"].is_null(), "{handshake}");
+        }
+        other => panic!("expected a connected shell, got {other:?}"),
+    }
+
+    daemon.shutdown().expect("stop daemon");
+}
+
+#[test]
+fn a_mismatched_adapter_reaches_the_shell_as_a_refused_handshake() {
+    // The fake reads its script from configuration, so a different major is
+    // produced the sanctioned way: no test-only switch in the daemon.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut mismatched = config(temp.path());
+    mismatched.backend_script = Some(r#"{"version":"9.0.0"}"#.to_string());
+    let mut daemon = agentify_daemon::start_in_background(mismatched).expect("boot daemon");
+
+    match status_for(temp.path()) {
+        DaemonStatus::Connected {
+            handshake,
+            projects_error,
+            ..
+        } => {
+            assert!(projects_error.is_none(), "{projects_error:?}");
+            let handshake = handshake.expect("the daemon still answers");
+            assert_eq!(handshake["ok"], false, "the mismatch is carried to the shell");
+            let refusal = handshake["refusal"].as_str().unwrap_or_default();
+            assert!(refusal.contains("refused"), "{refusal}");
+            assert!(refusal.contains("adapter:fake"), "{refusal}");
+            assert!(refusal.contains("9.0.0"), "{refusal}");
+            // The banner needs only this payload, and its failing row is here.
+            let failing = handshake["components"]
+                .as_array()
+                .expect("components")
+                .iter()
+                .filter(|component| component["ok"] == false)
+                .count();
+            assert_eq!(failing, 1, "one component is refused: {handshake}");
         }
         other => panic!("expected a connected shell, got {other:?}"),
     }

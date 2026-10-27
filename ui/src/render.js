@@ -546,6 +546,38 @@ ${renderActivity(inbox.activity, inbox.activityError)}
 </aside>`;
 }
 
+/**
+ * The version banner: shown only when the daemon's startup handshake refused a
+ * component. The daemon is the one that decides; the shell repeats what it said,
+ * because an Agent would otherwise discover a mismatched adapter through a
+ * failing `start`.
+ */
+export function renderVersionBanner(status) {
+  const handshake = status?.handshake;
+  if (!handshake || handshake.ok !== false) {
+    return "";
+  }
+  const failures = (Array.isArray(handshake.components) ? handshake.components : [])
+    .filter((component) => component?.ok === false)
+    .map((component) => {
+      const found = component.found ?? "nothing";
+      return `<li><code>${escapeHtml(component.component)}</code>: expected ${escapeHtml(
+        component.expected,
+      )}, found ${escapeHtml(found)}</li>`;
+    })
+    .join("");
+  const refusal =
+    typeof handshake.refusal === "string" && handshake.refusal
+      ? `<p class="banner-detail">${escapeHtml(handshake.refusal)}</p>`
+      : "";
+  return `<section class="banner" data-banner="version-mismatch" role="status">
+  <h2>Backend refused: VersionMismatch</h2>
+  ${refusal}
+  <ul class="banner-list">${failures}</ul>
+  <p class="banner-hint">Reinstall Agentify so the app, the daemon, the MCP shim, Caddy, and the Backend adapters come from one build. Nothing was started.</p>
+</section>`;
+}
+
 function renderEmptyProjects(whoami) {
   const scopes = (whoami?.scopes ?? []).join(", ") || "none";
   const capabilities = Object.entries(whoami?.capabilities ?? {})
@@ -621,6 +653,7 @@ export function renderMain(status) {
 export function render(status) {
   return `<div class="shell" data-connection="${escapeHtml(status.state)}">
 ${renderHeader(status)}
+${renderVersionBanner(status)}
 <div class="body">
 ${renderRail(status)}
 ${renderMain(status)}

@@ -373,8 +373,12 @@ fn whole_number(name: &str, raw: &str) -> Result<u64> {
         .with_context(|| format!("{name}={raw} is not a whole number"))
 }
 
-/// Create the data root if it does not exist yet.
+/// Create the data root and the directories the daemon owns under it.
+///
+/// Idempotent: installing over a version must find the tree already there and
+/// leave it alone.
 pub fn ensure_data_root(data_root: &Path) -> Result<()> {
-    std::fs::create_dir_all(data_root)
+    agentify_proto::DataRoot::new(data_root)
+        .ensure()
         .with_context(|| format!("creating the data root {}", data_root.display()))
 }

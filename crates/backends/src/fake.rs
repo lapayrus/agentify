@@ -117,6 +117,11 @@ pub struct FakeScript {
     pub record_spec_path: Option<String>,
     /// Capabilities to advertise. Defaults to the fake's own set.
     pub capabilities: Capabilities,
+    /// Version to report from `describe()`. `None` reports
+    /// [`BACKEND_VERSION`], which is what the daemon pins. A test sets this to
+    /// a different major to exercise the startup handshake's refusal without
+    /// waiting for a real adapter to drift.
+    pub version: Option<String>,
 }
 
 impl Default for FakeScript {
@@ -137,6 +142,7 @@ impl Default for FakeScript {
                 resource_stats: false,
                 log_since: true,
             },
+            version: None,
         }
     }
 }
@@ -194,6 +200,14 @@ impl FakeScript {
                         value
                             .as_str()
                             .ok_or_else(|| format!("`{key}` must be a path"))?
+                            .to_string(),
+                    );
+                }
+                "version" => {
+                    script.version = Some(
+                        value
+                            .as_str()
+                            .ok_or_else(|| format!("`{key}` must be a version string"))?
                             .to_string(),
                     );
                 }
@@ -346,7 +360,11 @@ impl Backend for FakeBackend {
     fn describe(&self) -> BackendInfo {
         BackendInfo {
             name: BACKEND_NAME.to_string(),
-            version: BACKEND_VERSION.to_string(),
+            version: self
+                .script
+                .version
+                .clone()
+                .unwrap_or_else(|| BACKEND_VERSION.to_string()),
             platform: PLATFORM.to_string(),
             capabilities: self.script.capabilities.clone(),
         }

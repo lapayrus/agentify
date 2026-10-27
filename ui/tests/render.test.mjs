@@ -16,6 +16,7 @@ import {
   renderTabs,
   renderLogs,
   renderSide,
+  renderVersionBanner,
   renderApprovals,
   renderApprovalCard,
   renderActivity,
@@ -727,3 +728,66 @@ test("Approval and activity text from the daemon is escaped, never injected", ()
   assert.doesNotMatch(feed, /<img/);
   assert.match(feed, /&lt;script&gt;/);
 });
+
+// The daemon's startup handshake is the only thing that can refuse a Backend. The
+// shell's job is to say so in words a person can act on, and to say nothing at all
+// when the daemon never answered — silence is not a pass.
+const refusedHandshake = {
+  ok: false,
+  refusal:
+    "the fake Backend is refused: VersionMismatch: adapter:fake: expected 0.1.0, found 9.0.0.",
+  components: [
+    { component: "api", expected: "v1", found: "v1", rule: "exact", ok: true },
+    {
+      component: "adapter:fake",
+      expected: "0.1.0",
+      found: "9.0.0",
+      rule: "major",
+      ok: false,
+    },
+  ],
+};
+
+test("a refused Backend is shown in the shell as VersionMismatch", () => {
+  const banner = renderVersionBanner({ ...connected, handshake: refusedHandshake });
+  assert.match(banner, /data-banner="version-mismatch"/);
+  assert.match(banner, /Backend refused: VersionMismatch/);
+  assert.match(banner, /adapter:fake/, "the failing component is named");
+  assert.match(banner, /expected 0\.1\.0, found 9\.0\.0/, "what was found is named");
+  assert.match(banner, /is refused/, "the daemon's own sentence is repeated");
+  assert.doesNotMatch(banner, /data-component="api"/, "passing components are not listed");
+  // The banner is part of the whole shell, above the body.
+  const shell = render({ ...connected, handshake: refusedHandshake });
+  assert.ok(shell.indexOf('data-banner="version-mismatch"') < shell.indexOf('<div class="body"'));
+});
+
+test("a passing or absent handshake draws no version banner", () => {
+  const passing = {
+    ok: true,
+    refusal: null,
+    components: [{ component: "api", expected: "v1", found: "v1", rule: "exact", ok: true }],
+  };
+  assert.equal(renderVersionBanner({ ...connected, handshake: passing }), "");
+  // No handshake at all is not the same as "everything matches": the banner stays
+  // empty, but so does any claim that the versions were checked.
+  assert.equal(renderVersionBanner({ ...connected, handshake: null }), "");
+  assert.equal(renderVersionBanner({ ...connected }), "");
+  assert.equal(renderVersionBanner({ state: "unreachable", reason: "no discovery" }), "");
+});
+
+test("a mismatched version string from the daemon is escaped, never injected", () => {
+  const banner = renderVersionBanner({
+    ...connected,
+    handshake: {
+      ok: false,
+      refusal: '<script>alert("pwned")</script>',
+      components: [
+        { component: "<img src=x>", expected: "0.1.0", found: '<b onload="x">', ok: false },
+      ],
+    },
+  });
+  assert.doesNotMatch(banner, /<script>/);
+  assert.doesNotMatch(banner, /<img/);
+  assert.match(banner, /&lt;script&gt;/);
+});
+
