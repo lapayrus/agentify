@@ -16,8 +16,11 @@ agentify-proto = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+ureq = { workspace = true, features = ["tls"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+ureq = { workspace = true, features = ["tls"] }

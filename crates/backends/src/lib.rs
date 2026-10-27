@@ -26,6 +26,7 @@ pub mod contract;
 pub mod error;
 pub mod fake;
 pub mod spec;
+pub mod wsl;
 
 pub use conformance::{run_conformance, run_lifecycle_conformance, Case, Outcome, Report};
 pub use contract::{
@@ -37,3 +38,4 @@ pub use contract::{
 pub use error::{BackendError, Result};
 pub use fake::{FakeBackend, FakeFault, FakeScript};
 pub use spec::{EnvironmentSpec, HealthcheckSpec, PortLease, ResourceSpec};
+pub use wsl::{RootfsSource, WslBackend, WslConfig};

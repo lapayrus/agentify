@@ -21,14 +21,21 @@ struct Daemon {
 
 impl Daemon {
     fn boot(home: &Path) -> Daemon {
+        Daemon::boot_with(home, &[])
+    }
+
+    fn boot_with(home: &Path, extra_env: &[(&str, &str)]) -> Daemon {
         std::fs::create_dir_all(home).expect("create data root");
-        let child = Command::new(env!("CARGO_BIN_EXE_agentifyd"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentifyd"));
+        command
             .env("AGENTIFY_HOME", home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn agentifyd");
+            .stderr(Stdio::piped());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let child = command.spawn().expect("spawn agentifyd");
 
         let mut daemon = Daemon {
             child,
@@ -117,6 +124,22 @@ fn try_http_get(url: &str, token: Option<&str>) -> Result<(u16, String), ureq::E
 
 fn http_get(url: &str, token: Option<&str>) -> (u16, String) {
     try_http_get(url, token).unwrap_or_else(|err| panic!("transport error for {url}: {err}"))
+}
+
+fn http_post(url: &str, token: &str, body: &str) -> (u16, String) {
+    let request = ureq::post(url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json");
+    match request.send_string(body) {
+        Ok(response) => (
+            response.status(),
+            response.into_string().unwrap_or_default(),
+        ),
+        Err(ureq::Error::Status(status, response)) => {
+            (status, response.into_string().unwrap_or_default())
+        }
+        Err(transport) => panic!("transport error for {url}: {transport}"),
+    }
 }
 
 #[test]
@@ -242,3 +265,147 @@ fn the_events_stream_opens_with_a_heartbeat() {
         "heartbeats are named events: {first_chunk:?}"
     );
 }
+
+/// The whole Environment lifecycle, driven over HTTP, on real WSL distros.
+///
+/// Gated by `AGENTIFY_TEST_WSL=1`: it creates and destroys a real per-Project
+/// distro, which is not something a CI box without WSL should pay for. It
+/// asserts only what a client can see — status codes, the status payload, the
+/// leases it can reach — plus the one operating-system fact the ticket is
+/// about: the distro is registered while running and gone after teardown.
+#[test]
+fn the_wsl_backend_serves_the_lifecycle_over_the_api() {
+    let enabled = matches!(
+        std::env::var("AGENTIFY_TEST_WSL").as_deref().map(str::trim),
+        Ok("1")
+    );
+    if !enabled {
+        return;
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() % 0xffff_ffff)
+        .unwrap_or(0);
+    let prefix = format!("agentify-api{:x}", stamp);
+
+    // The expensive caches (rootfs, golden template) live under `target/`, so a
+    // rerun does not rebuild them; the daemon's own state starts empty.
+    let home = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("wsl-test")
+        .join("api-home");
+    std::fs::create_dir_all(&home).expect("create data root");
+    for leftover in ["state.db", "state.db-wal", "state.db-shm", "discovery.json"] {
+        let _ = std::fs::remove_file(home.join(leftover));
+    }
+    let _ = std::fs::remove_dir_all(home.join("projects"));
+
+    let cleanup = || {
+        let wsl = agentify_backends::wsl::cli::Wsl::new(&prefix);
+        let removed = agentify_backends::wsl::template::unregister_all(&wsl).unwrap_or_default();
+        removed
+    };
+
+    let daemon = Daemon::boot_with(
+        &home,
+        &[
+            ("AGENTIFY_BACKEND", "wsl"),
+            ("AGENTIFY_WSL_PREFIX", &prefix),
+            ("AGENTIFY_OPERATION_TIMEOUT_MS", "600000"),
+        ],
+    );
+
+    let whoami = daemon.whoami();
+    assert_eq!(whoami.backend.name, "wsl", "the daemon drives the WSL Backend");
+    assert_eq!(whoami.backend.platform, "windows-wsl2");
+    assert!(
+        !whoami.capabilities.events,
+        "the WSL adapter does not claim an events stream"
+    );
+
+    let token = daemon.discovery.token.clone();
+    let (status, body) = http_post(
+        &daemon.url("/v1/projects"),
+        &token,
+        r#"{"fixture":"hello-pg"}"#,
+    );
+    assert_eq!(status, 201, "create project: {body}");
+
+    let (status, body) = http_post(
+        &daemon.url("/v1/projects/hello-pg/environments/dev/start"),
+        &token,
+        "{}",
+    );
+    assert_eq!(status, 200, "start: {body}");
+    let started: agentify_proto::EnvironmentStatus =
+        serde_json::from_str(&body).expect("start returns a status");
+    assert_eq!(started.environment.state, "running", "{body}");
+    assert_eq!(started.health, "healthy", "the daemon's probe reached the lease");
+    assert_eq!(started.backend.name, "wsl");
+
+    // Every leased port is reachable on the host: that is what the daemon
+    // probes, and it is the promise `start` makes.
+    let mut leased = Vec::new();
+    for resource in &started.resources {
+        for port in &resource.ports {
+            leased.push(port.host_port);
+            let address = std::net::SocketAddr::from(([127, 0, 0, 1], port.host_port));
+            assert!(
+                std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok(),
+                "leased port {} answers on the host",
+                port.host_port
+            );
+        }
+    }
+    assert!(!leased.is_empty(), "the fixture leases a port");
+
+    // The distro really exists while the Environment is running.
+    let distros = agentify_backends::wsl::cli::Wsl::new(&prefix)
+        .list()
+        .expect("list distros");
+    assert_eq!(
+        distros.len(),
+        1,
+        "one distro per Project: {distros:?}"
+    );
+    assert_eq!(distros[0].version, "2", "imported as WSL 2");
+
+    let (status, body) = http_post(
+        &daemon.url("/v1/projects/hello-pg/environments/dev/stop"),
+        &token,
+        "{}",
+    );
+    assert_eq!(status, 200, "stop: {body}");
+    let stopped: agentify_proto::EnvironmentStatus =
+        serde_json::from_str(&body).expect("stop returns a status");
+    assert_eq!(stopped.environment.state, "stopped", "{body}");
+    for port in &leased {
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], *port)),
+                Duration::from_millis(500)
+            )
+            .is_err(),
+            "stop releases lease {port}"
+        );
+    }
+
+    // Stopping kept the distro; teardown removes it. The daemon has no delete
+    // route yet (a later ticket), so the test drives the removal the same way
+    // an uninstall will: unregister this run's prefix and verify nothing is
+    // left on the machine.
+    drop(daemon);
+    let removed = cleanup();
+    assert_eq!(removed.len(), 1, "teardown unregisters the Project's distro");
+    assert!(
+        agentify_backends::wsl::cli::Wsl::new(&prefix)
+            .list()
+            .expect("list")
+            .is_empty(),
+        "no distro from this run is left registered"
+    );
+}
+
