@@ -30,7 +30,7 @@ use agentify_proto::{
     Discovery, ExecRequest, ExecResponse, LogLineView, LogsResponse, OperationView, Problem,
     ProjectList,
     StatsResponse, Whoami, API_VERSION, APPROVAL_APPROVED, APPROVAL_DENIED, APPROVAL_EXPIRED,
-    APPROVAL_PENDING, DEV_ENVIRONMENT, OPERATION_WAITING_FOR_APPROVAL,
+    APPROVAL_PENDING, DEV_ENVIRONMENT, OPERATION_WAITING_FOR_APPROVAL, STATE_RUNNING,
 };
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
@@ -69,6 +69,12 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long a replayed mutation stays replayable.
 pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many times startup tries to republish the routes, and how long it waits
+/// between tries. A restart's own previous Caddy releases 80 and 443 a moment
+/// after it is killed, and a route must not be lost to that race.
+const REPUBLISH_ATTEMPTS: u32 = 20;
+const REPUBLISH_PAUSE: Duration = Duration::from_millis(500);
 
 /// Identity the auth middleware attaches to an authenticated request.
 #[derive(Debug, Clone)]
@@ -279,6 +285,29 @@ async fn serve(
         eprintln!("agentifyd: reconciling Environments failed: {err:#}");
     }
 
+    // Then the routes: a restart must not change what this machine serves, so
+    // every Environment's route is recomputed from the database and loaded into
+    // Caddy again. The previous ingress may still be letting go of 80 and 443 —
+    // a stopped daemon kills its Caddy, and the OS releases the sockets a moment
+    // later — so this is allowed a few tries before it is reported.
+    let mut republished = state.lifecycle.republish(&state.state);
+    for _ in 1..REPUBLISH_ATTEMPTS {
+        if republished.is_ok() {
+            break;
+        }
+        tokio::time::sleep(REPUBLISH_PAUSE).await;
+        republished = state.lifecycle.republish(&state.state);
+    }
+    if let Err(err) = republished {
+        // Ingress is not the API: a machine whose 80 or 443 is held by somebody
+        // else still gets a daemon that answers, and the next start republishes.
+        eprintln!(
+            "agentifyd: republishing the routes at startup failed: {} ({})",
+            err.code(),
+            err.detail()
+        );
+    }
+
     let published = discovery.clone();
     if ready.send(Ok(discovery)).is_err() {
         // Nobody is waiting for us any more; nothing to serve.
@@ -291,7 +320,6 @@ async fn serve(
         published.url
     );
 
-    let app = router(Arc::new(state));
     let graceful = async move {
         let shutdown = shutdown;
         tokio::select! {
@@ -300,13 +328,71 @@ async fn serve(
         }
     };
 
-    let served = axum::serve(listener, app)
+    let app = Arc::new(state);
+    // Adoption: what was asked to be running is brought back, in the
+    // background, so the API answers while the workloads come up.
+    spawn_adoption(app.clone());
+    let served = axum::serve(listener, router(app))
         .with_graceful_shutdown(graceful)
         .await
         .context("serving the loopback API");
 
     discovery::remove(&config);
     served
+}
+
+/// Bring every Environment whose desired state is `running` back up.
+///
+/// A daemon restart is not a stop. On Windows the Backend's supervisor is a
+/// foreground process the daemon holds open, so a daemon that dies takes the
+/// workload and its leased ports with it — the data is still on disk, but the
+/// URL behind the route answers 502 until something starts the Environment
+/// again. Something is this: every Environment the user or an Agent asked to
+/// keep running is adopted here.
+///
+/// It runs as one background task per Environment, under the same per-Environment
+/// lock a mutation takes, so a start that arrives at the same moment waits for
+/// this rather than racing it. The Backend's `start` is idempotent and
+/// convergent, and the port registry hands back the same lease, so adopting a
+/// runtime that did survive is a no-op.
+fn spawn_adoption(app: Arc<AppState>) {
+    tokio::spawn(async move {
+        let projects = match app.state.list_projects() {
+            Ok(projects) => projects,
+            Err(err) => {
+                eprintln!("agentifyd: adoption could not read the Projects: {err:#}");
+                return;
+            }
+        };
+        for record in projects {
+            let desired = app
+                .state
+                .environment(&record.environment.id)
+                .ok()
+                .flatten()
+                .map(|environment| environment.desired_state)
+                .unwrap_or_default();
+            if desired != STATE_RUNNING {
+                continue;
+            }
+            let lock = app.env_lock(&record.environment.id);
+            let guard = lock.lock_owned().await;
+            match app.lifecycle.start(&app.state, &record).await {
+                Ok(status) => eprintln!(
+                    "agentifyd: adopted {}/{} ({})",
+                    record.name, record.environment.name, status.health
+                ),
+                Err(err) => eprintln!(
+                    "agentifyd: adopting {}/{} failed: {} ({})",
+                    record.name,
+                    record.environment.name,
+                    err.code(),
+                    err.detail()
+                ),
+            }
+            drop(guard);
+        }
+    });
 }
 
 async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> {

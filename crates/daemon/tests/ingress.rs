@@ -238,6 +238,50 @@ fn start_publishes_a_route_whose_upstream_is_the_leased_host_port() {
 }
 
 // ---------------------------------------------------------------------------
+// restart: the route comes back from the database, without a start.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_restarted_daemon_republishes_the_route_a_url_was_serving() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let fake = FakeAdmin::start();
+    let mut daemon = daemon_with(&fake, temp.path(), TrustState::Installed);
+    create_fixture(&daemon);
+    let (status, started) = start(&daemon);
+    assert_eq!(status, 200, "{started}");
+    let port = leased_web_port(&daemon);
+    assert_eq!(
+        routes(&fake, SERVER_TLS).get(WEB_ID_HTTPS),
+        Some(&format!("proxy 127.0.0.1:{port}")),
+        "{:#?}",
+        fake.routes(SERVER_TLS)
+    );
+
+    // A restart: the daemon forgets everything it held in memory, and so does
+    // Caddy — a fresh instance knows no routes at all. What the machine serves
+    // has to be rebuilt from the database. Nothing calls `start`, and no row is
+    // written by hand.
+    daemon.shutdown();
+    let fresh = FakeAdmin::start();
+    let daemon = daemon_with(&fresh, temp.path(), TrustState::Installed);
+
+    let republished = routes(&fresh, SERVER_TLS);
+    assert_eq!(
+        republished.get(WEB_ID_HTTPS),
+        Some(&format!("proxy 127.0.0.1:{port}")),
+        "a restart republishes the route it was serving, on the same lease: {republished:#?}"
+    );
+    assert!(
+        fresh.loads() >= 1,
+        "the restarted daemon loaded the recovered routes into Caddy"
+    );
+    // The Project row is intact, and the URL it advertises is unchanged.
+    let (status, project) = daemon.get(&format!("/v1/projects/{PROJECT}"));
+    assert_eq!(status, 200, "{project}");
+    assert_eq!(project["routes"][0]["url"], "https://web.hello-pg.localhost");
+}
+
+// ---------------------------------------------------------------------------
 // stop: the route moves to the daemon's 503, and the lease goes back.
 // ---------------------------------------------------------------------------
 
