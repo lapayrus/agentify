@@ -23,7 +23,10 @@ use super::{unix_script, WslConfig, SUPERVISE_PATH, SUPERVISE_SCRIPT};
 use crate::error::{BackendError, Result};
 
 /// Bump when [`PREPARE_SCRIPT`] changes in a way that must invalidate caches.
-pub const RECIPE_VERSION: u32 = 1;
+///
+/// v2 adds Docker Compose to the template: the supervisor runs the Project's
+/// Resources with it, and a template built by v1 has the engine but no Compose.
+pub const RECIPE_VERSION: u32 = 2;
 
 /// The in-distro recipe, compiled in so an installed daemon needs no files.
 pub const PREPARE_SCRIPT: &str = include_str!("scripts/prepare.sh");

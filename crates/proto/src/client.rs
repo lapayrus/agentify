@@ -10,8 +10,13 @@ use std::time::Duration;
 use crate::Discovery;
 use serde_json::Value;
 
-/// Request timeout for a single API call.
+/// Request timeout for a read.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Mutations block until the daemon finishes: a cold start builds images and can
+/// take minutes. The daemon's own operation timeout is the real bound; this one
+/// only has to be larger than it.
+const MUTATION_TIMEOUT: Duration = Duration::from_secs(1800);
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -143,11 +148,15 @@ impl DaemonClient {
 
     /// `GET <path>` and parse the JSON body.
     pub fn get_json(&self, path: &str) -> Result<Value, ClientError> {
+        self.get_json_timeout(path, REQUEST_TIMEOUT)
+    }
+
+    fn get_json_timeout(&self, path: &str, timeout: Duration) -> Result<Value, ClientError> {
         let discovery = self.discovery()?;
         let url = format!("{}{}", discovery.url, path);
         let response = ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", discovery.token))
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(timeout)
             .call();
         parse(response, &url)
     }
@@ -159,7 +168,7 @@ impl DaemonClient {
         let response = ureq::post(&url)
             .set("Authorization", &format!("Bearer {}", discovery.token))
             .set("Content-Type", "application/json")
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(MUTATION_TIMEOUT)
             .send_string(&body.to_string());
         parse(response, &url)
     }
@@ -171,7 +180,7 @@ impl DaemonClient {
         let response = ureq::request("PATCH", &url)
             .set("Authorization", &format!("Bearer {}", discovery.token))
             .set("Content-Type", "application/json")
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(MUTATION_TIMEOUT)
             .send_string(&body.to_string());
         parse(response, &url)
     }
@@ -182,7 +191,7 @@ impl DaemonClient {
         let url = format!("{}{}", discovery.url, path);
         let response = ureq::request("DELETE", &url)
             .set("Authorization", &format!("Bearer {}", discovery.token))
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(MUTATION_TIMEOUT)
             .call();
         parse(response, &url)
     }
@@ -229,7 +238,7 @@ impl DaemonClient {
         );
         let response = ureq::request("DELETE", &url)
             .set("Authorization", &format!("Bearer {}", discovery.token))
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(MUTATION_TIMEOUT)
             .call();
         parse(response, &url)
     }
@@ -394,7 +403,7 @@ impl DaemonClient {
         if let Some(timeout_ms) = timeout_ms {
             path.push_str(&format!("?timeoutMs={timeout_ms}"));
         }
-        self.get_json(&path)
+        self.get_json_timeout(&path, MUTATION_TIMEOUT)
     }
 
     fn secrets_path(project: &str) -> String {

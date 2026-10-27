@@ -34,7 +34,7 @@ pub fn select(name: &str, script: Option<&str>, data_root: &Path) -> Result<Arc<
         }
         BACKEND_WSL => {
             let mut config = WslConfig::from_env();
-            config.data_root = data_root.to_path_buf();
+            config.set_data_root(data_root);
             if let Some(raw) = script {
                 // A script has no meaning for WSL; refusing is clearer than
                 // quietly ignoring a knob the caller thought mattered.

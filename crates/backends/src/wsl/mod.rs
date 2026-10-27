@@ -38,6 +38,7 @@
 //! See `research/windows-wsl-per-project.md`.
 
 pub mod cli;
+pub mod compose;
 pub mod exec;
 pub mod log;
 pub mod paths;
@@ -106,6 +107,13 @@ pub const ENGINE_ENV: &str = "AGENTIFY_WSL_ENGINE";
 pub const SYSTEMD_ENV: &str = "AGENTIFY_WSL_SYSTEMD";
 /// Environment variable that overrides the distro name prefix.
 pub const PREFIX_ENV: &str = "AGENTIFY_WSL_PREFIX";
+/// Environment variable that turns workloads off (`0`): the distro then holds
+/// its leases and runs nothing, which is what a conformance run wants.
+pub const WORKLOADS_ENV: &str = "AGENTIFY_WSL_WORKLOADS";
+/// Environment variable overriding how long `start` waits (milliseconds). A
+/// first start builds an image and initialises a database, which outlasts the
+/// default.
+pub const START_TIMEOUT_ENV: &str = "AGENTIFY_WSL_START_TIMEOUT_MS";
 
 /// How long `start` waits for the supervisor to have every leased port bound.
 pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(180);
@@ -138,6 +146,11 @@ pub struct WslConfig {
     /// this is the adapter's half of that promise. `None` accepts any absolute,
     /// non-climbing path, which only a test wants.
     pub host_transfer_root: Option<PathBuf>,
+    /// Run the Environment's Resources. On in production: the distro starts the
+    /// Project's containers with `docker compose`. Off — or with no workspace to
+    /// run — the supervisor only holds the leases, which is the mode a Backend
+    /// conformance run uses.
+    pub workloads: bool,
 }
 
 impl WslConfig {
@@ -161,6 +174,7 @@ impl WslConfig {
             start_timeout: DEFAULT_START_TIMEOUT,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
             remove_timeout: DEFAULT_REMOVE_TIMEOUT,
+            workloads: true,
         }
     }
 
@@ -179,6 +193,14 @@ impl WslConfig {
         if let Ok(raw) = std::env::var(PREFIX_ENV) {
             if !raw.trim().is_empty() {
                 config.distro_prefix = raw.trim().to_ascii_lowercase();
+            }
+        }
+        if let Ok(raw) = std::env::var(WORKLOADS_ENV) {
+            config.workloads = !matches!(raw.trim(), "0" | "false" | "no");
+        }
+        if let Ok(raw) = std::env::var(START_TIMEOUT_ENV) {
+            if let Ok(millis) = raw.trim().parse::<u64>() {
+                config.start_timeout = Duration::from_millis(millis.max(1_000));
             }
         }
         config
@@ -209,12 +231,31 @@ impl WslConfig {
         self
     }
 
+    /// Run the Resources, or only hold the leases. A spec with no workspace is
+    /// listener-only whatever this says: there is nothing to build.
+    pub fn with_workloads(mut self, workloads: bool) -> Self {
+        self.workloads = workloads;
+        self
+    }
+
     /// Where a transfer's host path is allowed to live. `None` lifts the
     /// daemon-owned root, which is only ever right in a test. A root is
     /// configuration, so it is read as written ([`paths::tidy`]).
     pub fn with_host_transfer_root(mut self, root: Option<PathBuf>) -> Self {
         self.host_transfer_root = root.map(|root| paths::tidy(&root));
         self
+    }
+
+    /// Move the whole adapter — every derived path and the transfer boundary —
+    /// onto a new data root.
+    ///
+    /// `from_env` starts from the default root; a daemon that supplies its own
+    /// must move both, or a transfer under the configured root is refused as
+    /// "outside the daemon-owned root".
+    pub fn set_data_root(&mut self, root: impl Into<PathBuf>) {
+        let root = paths::tidy(&root.into());
+        self.data_root = root.clone();
+        self.host_transfer_root = Some(root);
     }
 
     /// Everything this adapter writes lives under `<data_root>/wsl/`.
@@ -288,6 +329,12 @@ struct EnvRecord {
     /// Leased host ports, bound inside the distro at the same numbers.
     ports: Vec<u16>,
     started_at: String,
+    /// True when the distro runs the Environment's Resources with Compose. Read
+    /// back by `exec`, `stop`, and `remove`, so a daemon that restarted still
+    /// knows there are containers to reach and to take down. Absent in a record
+    /// written by an older build, which is listener-only.
+    #[serde(default)]
+    workloads: bool,
 }
 
 impl EnvRecord {
@@ -641,6 +688,7 @@ fn require_running(
         resources: Vec::new(),
         ports: Vec::new(),
         started_at: String::new(),
+        workloads: false,
     });
     if let Some(target) = target {
         if !record.resources.is_empty() && !record.resources.iter().any(|name| name == target) {
@@ -661,7 +709,7 @@ fn exec_environment(
     target: Option<&str>,
     spec: &ExecSpec,
 ) -> Result<ExecSession> {
-    let (distro, _) = require_running(inner, environment, target, "run a command in it")?;
+    let (distro, record) = require_running(inner, environment, target, "run a command in it")?;
     let marker = exec::marker(environment);
     let log = inner
         .running
@@ -669,7 +717,56 @@ fn exec_environment(
         .expect("wsl running lock")
         .get(environment)
         .map(|supervisor| supervisor.log.clone());
-    exec::start(&inner.wsl, &distro, spec, &marker, log)
+    // A command runs where the Resource is: in its container when the
+    // Environment runs workloads, and in the distro when it only holds leases.
+    let spec = match (record.workloads, target) {
+        (true, Some(service)) => {
+            let wrapped = ExecSpec {
+                command: compose_exec_argv(service, &spec.command, &spec.env)?,
+                cwd: None,
+                env: Default::default(),
+                ..spec.clone()
+            };
+            wrapped
+        }
+        _ => spec.clone(),
+    };
+    exec::start(&inner.wsl, &distro, &spec, &marker, log)
+}
+
+/// `docker compose -f <file> exec -T [-e K=V]... <service> <command...>`.
+///
+/// `-T` because v0 has no PTY: a command gets pipes. The Compose file is named
+/// absolutely, so the command does not depend on a working directory, and the
+/// service is the Resource's name, which is what the generated file calls it.
+fn compose_exec_argv(
+    service: &str,
+    command: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    if command.is_empty() {
+        return Err(BackendError::ExecutionFailed {
+            code: 2,
+            detail: "a command needs at least one argument".to_string(),
+        });
+    }
+    let mut argv = vec![
+        "docker".to_string(),
+        "compose".to_string(),
+        "-f".to_string(),
+        compose::COMPOSE_PATH.to_string(),
+        "exec".to_string(),
+        "-T".to_string(),
+    ];
+    // A variable the caller asked for belongs to the command, not to the
+    // distro's `docker` CLI, so it is forwarded into the container.
+    for (key, value) in env {
+        argv.push("-e".to_string());
+        argv.push(format!("{key}={value}"));
+    }
+    argv.push(service.to_string());
+    argv.extend(command.iter().cloned());
+    Ok(argv)
 }
 
 /// Read one Environment's log. A stopped Environment keeps its log, so this
@@ -724,6 +821,12 @@ fn start_environment(inner: &Inner, spec: &EnvironmentSpec) -> Result<()> {
     let environment = &spec.environment_id;
     let distro = config.distro_name(environment);
     let ports = host_ports(spec);
+    // Workloads need something to run: a spec with no workspace is a listener,
+    // which is the arrangement a conformance case uses.
+    let workloads = config.workloads
+        && !spec.workspace.as_os_str().is_empty()
+        && spec.workspace.is_dir()
+        && !spec.resources.is_empty();
 
     // The substrate first: a verified rootfs and a cached golden template. Both
     // are machine-wide and idempotent, so a second Project pays for neither.
@@ -768,13 +871,37 @@ fn start_environment(inner: &Inner, spec: &EnvironmentSpec) -> Result<()> {
         "0755",
     )?;
 
+    // The Project's own files and the Compose document, written before anything
+    // runs: a distro that answers a probe but has no workloads must not happen.
+    let mut argv: Vec<String> = vec![SUPERVISE_PATH.to_string()];
+    if workloads {
+        compose::push_workspace(
+            &inner.wsl,
+            &distro,
+            spec,
+            config.host_transfer_root.as_deref(),
+        )?;
+        let document = compose::compose_yaml(spec)?;
+        inner.wsl.write_file(
+            &distro,
+            compose::COMPOSE_PATH,
+            document.as_bytes(),
+            "0600",
+        )?;
+        argv.push("--compose".to_string());
+        argv.push(compose::COMPOSE_PATH.to_string());
+        for relay in compose::relays(spec) {
+            argv.push("--map".to_string());
+            argv.push(relay.token());
+        }
+    } else {
+        argv.extend(ports.iter().map(u16::to_string));
+    }
+
     // The Environment's log: one append-only file per Environment, written by
     // dedicated threads, so nothing a follower does can slow the supervisor.
     let sink = Arc::new(Mutex::new(LogSink::open(&config.log_path(environment))?));
 
-    let argv: Vec<String> = std::iter::once(SUPERVISE_PATH.to_string())
-        .chain(ports.iter().map(u16::to_string))
-        .collect();
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let child = inner.wsl.spawn_foreground(&distro, &argv_refs)?;
 
@@ -786,6 +913,7 @@ fn start_environment(inner: &Inner, spec: &EnvironmentSpec) -> Result<()> {
                 resources: spec.resource_names(),
                 ports,
                 started_at: now_rfc3339(),
+                workloads,
             };
             record.write(config)?;
             inner
@@ -901,6 +1029,7 @@ fn stop_environment(inner: &Inner, environment: &str) -> Result<()> {
     require_supported()?;
     let config = &inner.config;
     let distro = config.distro_name(environment);
+    let record = EnvRecord::read(config, environment);
 
     // Drop the launcher first: the distro is what owns the listeners.
     let held = inner
@@ -917,6 +1046,14 @@ fn stop_environment(inner: &Inner, environment: &str) -> Result<()> {
         return Ok(());
     }
 
+    // The workloads go down before the distro does, and their volumes stay: that
+    // is the whole difference between a stop and a remove.
+    if record.as_ref().map(|record| record.workloads).unwrap_or(false)
+        && inner.wsl.is_running(&distro)?
+    {
+        compose_down(inner, &distro, "down --remove-orphans");
+    }
+
     if inner.wsl.is_running(&distro)? {
         // Terminate only this distro: never `wsl --shutdown`, which would take
         // every other distro on the machine with it.
@@ -926,8 +1063,9 @@ fn stop_environment(inner: &Inner, environment: &str) -> Result<()> {
     // The leases are released when the distro dies; a probe from the host is
     // what proves it, and the daemon's port registry relies on it.
     let leased = ports.unwrap_or_else(|| {
-        EnvRecord::read(config, environment)
-            .map(|record| record.ports)
+        record
+            .as_ref()
+            .map(|record| record.ports.clone())
             .unwrap_or_default()
     });
     wait_until(config.stop_timeout, || {
@@ -937,6 +1075,39 @@ fn stop_environment(inner: &Inner, environment: &str) -> Result<()> {
 
     // The disk and the record stay: `stop` is the preservation path.
     Ok(())
+}
+
+/// Take the Environment's containers down inside its distro.
+///
+/// `down` keeps the named volumes, so a stop is the preservation path; `down -v`
+/// deletes them, so a remove leaves nothing behind. Best effort by design: the
+/// distro is terminated next either way, and a Compose file that is missing (a
+/// listener-only Environment, or one whose start never got that far) has nothing
+/// to take down.
+fn compose_down(inner: &Inner, distro: &str, verb: &str) {
+    let script = format!(
+        "export COMPOSE_PROJECT_NAME={project}\n\
+         test -f {path} || {{ echo 'no compose file'; exit 0; }}\n\
+         if docker compose version >/dev/null 2>&1; then\n\
+           docker compose -f {path} {verb}\n\
+         elif command -v docker-compose >/dev/null 2>&1; then\n\
+           docker-compose -f {path} {verb}\n\
+         else\n\
+           echo 'no compose'; exit 0\n\
+         fi\n",
+        project = compose::COMPOSE_PROJECT,
+        path = compose::COMPOSE_PATH,
+        verb = verb
+    );
+    match inner.wsl.run(distro, &["sh", "-c", &script]) {
+        Ok(output) if output.code == 0 => {}
+        Ok(output) => eprintln!(
+            "agentify: `compose {verb}` in {distro} exited {}: {}",
+            output.code,
+            output.diagnostic()
+        ),
+        Err(err) => eprintln!("agentify: `compose {verb}` in {distro} failed: {err}"),
+    }
 }
 
 fn remove_environment(inner: &Inner, environment: &str, keep_volumes: bool) -> Result<()> {
@@ -961,6 +1132,14 @@ fn remove_environment(inner: &Inner, environment: &str, keep_volumes: bool) -> R
     let ports = ports.unwrap_or_default();
 
     if inner.wsl.find(&distro)?.is_some() {
+        // `down -v` first: the containers and their volumes are the Project's
+        // data, and unregistering the distro without taking them down would leave
+        // the engine writing into a disk that is about to be deleted.
+        if record.as_ref().map(|record| record.workloads).unwrap_or(false)
+            && inner.wsl.is_running(&distro)?
+        {
+            compose_down(inner, &distro, "down --volumes --remove-orphans");
+        }
         if inner.wsl.is_running(&distro)? {
             let _ = inner.wsl.terminate(&distro);
         }
@@ -1138,6 +1317,7 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_distro_name_is_prefixed_and_lower_case() {
@@ -1245,6 +1425,14 @@ mod tests {
     }
 
     #[test]
+    fn setting_the_data_root_moves_the_transfer_boundary_too() {
+        let mut config = WslConfig::new("C:/default");
+        config.set_data_root("C:/configured");
+        assert_eq!(config.data_root, PathBuf::from("C:/configured"));
+        assert_eq!(config.host_transfer_root, Some(PathBuf::from("C:/configured")));
+    }
+
+    #[test]
     fn a_data_root_is_read_as_written_so_every_derived_path_is_clean() {
         // A data root spelled with a `..` — `agentify-proto` reads the value of
         // an environment variable verbatim, and a test builds its root from
@@ -1311,13 +1499,74 @@ mod tests {
             resources: vec!["web".to_string(), "db".to_string()],
             ports: vec![41000, 41001],
             started_at: now_rfc3339(),
+            workloads: true,
         };
         record.write(&config).expect("write");
         let read = EnvRecord::read(&config, "env-1").expect("read");
         assert_eq!(read.distro, "agentify-env-1");
         assert_eq!(read.resources, vec!["web", "db"]);
+        assert!(
+            read.workloads,
+            "a daemon that restarts still knows there are containers to take down"
+        );
         EnvRecord::delete(&config, "env-1");
         assert!(EnvRecord::read(&config, "env-1").is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_record_without_the_workloads_field_is_listener_only() {
+        // A record written by a build before workloads existed has containers to
+        // take down and must not be read as anything else.
+        let record: EnvRecord = serde_json::from_value(json!({
+            "environment": "env-1",
+            "distro": "agentify-env-1",
+            "resources": ["web"],
+            "ports": [41000],
+            "started_at": "2026-01-01T00:00:00.000Z"
+        }))
+        .expect("an older record still parses");
+        assert!(!record.workloads);
+    }
+
+    #[test]
+    fn an_exec_in_a_workload_environment_runs_inside_the_container() {
+        let argv = compose_exec_argv(
+            "web",
+            &["node".to_string(), "migrate.js".to_string()],
+            &std::collections::BTreeMap::from([(
+                "GREETING".to_string(),
+                "hi".to_string(),
+            )]),
+        )
+        .expect("argv");
+        assert_eq!(
+            argv,
+            vec![
+                "docker",
+                "compose",
+                "-f",
+                compose::COMPOSE_PATH,
+                "exec",
+                "-T",
+                "-e",
+                "GREETING=hi",
+                "web",
+                "node",
+                "migrate.js",
+            ],
+            "no PTY, the Project's own Compose file, and the env goes to the container"
+        );
+        assert!(compose_exec_argv("web", &[], &Default::default()).is_err());
+    }
+
+    #[test]
+    fn workloads_are_only_run_when_there_is_something_to_run() {
+        // The rule `start_environment` applies: the conformance suite hands the
+        // adapter a spec with resources and no workspace, and that must bind its
+        // leases without trying to build a container.
+        let config = WslConfig::new("C:/data");
+        assert!(config.workloads, "production runs workloads");
+        assert!(!config.clone().with_workloads(false).workloads);
     }
 }

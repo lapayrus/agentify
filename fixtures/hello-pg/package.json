@@ -1,0 +1,10 @@
+{
+  "name": "hello-pg",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The vertical slice: a Node 22 page read from Postgres 16",
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

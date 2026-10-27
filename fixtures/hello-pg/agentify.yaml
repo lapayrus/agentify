@@ -14,6 +14,7 @@ secrets:
 resources:
   web:
     kind: app
+    # Built from the fixture's own context, inside the Project's distro.
     build:
       context: .
       dockerfile: Dockerfile
@@ -21,11 +22,11 @@ resources:
     env:
       DATABASE_URL: postgres://hello:${secret:pg-password}@db:5432/hello
       API_TOKEN: ${secret:api-token}
-      GREETING: hello # a literal, not a secret
+      GREETING: hello from postgres # a literal, not a secret
     ports:
       - port: 3000
         hostname: web # https://web.hello-pg.localhost
-    dependsOn: [db] # start order
+    dependsOn: [db] # start order: the database is healthy before the app builds
     healthcheck:
       port: 3000
       path: /health
@@ -38,4 +39,6 @@ resources:
     credentials:
       username: hello
       password: ${secret:pg-password}
-    # volume omitted on purpose: the daemon names it hello-pg-db-data
+    # volume omitted on purpose: the daemon names it hello-pg-db-data, and the
+    # generated Compose file pins that exact name so the data outlives the
+    # container, a stop, and a daemon restart.
