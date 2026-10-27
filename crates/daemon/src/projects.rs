@@ -29,6 +29,9 @@ pub const PROJECTS_DIR: &str = "projects";
 /// owns it; a Manifest never names a host path.
 pub const WORKSPACE_DIR: &str = "workspace";
 
+/// The abuse cap from ADR-0003: no more than this many Projects per daemon.
+pub const MAX_PROJECTS: i64 = 20;
+
 /// Why a Project could not be created.
 #[derive(Debug)]
 pub enum CreateError {
@@ -41,6 +44,8 @@ pub enum CreateError {
     SecretSourceMissing(String),
     /// A Project with this name already exists.
     AlreadyExists(String),
+    /// The 20-Project abuse cap was hit.
+    ProjectCapExceeded(String),
     /// The state database failed.
     Store(anyhow::Error),
 }
@@ -123,6 +128,13 @@ pub fn create(
                 builds.join(", ")
             )));
         }
+    }
+
+    let projects = state.count_projects().map_err(CreateError::Store)?;
+    if projects >= MAX_PROJECTS {
+        return Err(CreateError::ProjectCapExceeded(format!(
+            "at most {MAX_PROJECTS} Projects may exist; delete one first"
+        )));
     }
 
     if let Some(existing) = state

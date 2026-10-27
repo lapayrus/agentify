@@ -47,6 +47,8 @@ windows-sys = { version = "0.61", features = [
   # `HKCU\Environment`, the fallback a `fromEnv` import reads when the daemon was
   # started by a login item that never inherited the user's variables.
   "Win32_System_Registry",
+  # `GetDiskFreeSpaceExW`, for the `whoami` disk-pressure warning.
+  "Win32_Storage_FileSystem",
 ] }
 # The OS credential manager, which holds every Project's secret values.
 keyring = { version = "3.6", default-features = false, features = ["windows-native"] }

@@ -1,0 +1,18 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the workspace test suite
+        # The default Backend is the scripted fake, and none of the WSL, Caddy,
+        # or keyring gates are set, so the security acceptance suite runs here
+        # without touching the host machine.
+        run: cargo test --workspace

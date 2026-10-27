@@ -56,6 +56,8 @@ pub enum LifecycleError {
     Ingress(IngressError),
     /// The store failed.
     Store(anyhow::Error),
+    /// The two-concurrent-start abuse cap was hit.
+    StartCapExceeded,
 }
 
 impl LifecycleError {
@@ -69,6 +71,7 @@ impl LifecycleError {
             LifecycleError::Secret(_) => "SecretSourceMissing".to_string(),
             LifecycleError::Ingress(err) => err.code().to_string(),
             LifecycleError::Store(_) => "Internal".to_string(),
+            LifecycleError::StartCapExceeded => "StartCapExceeded".to_string(),
         }
     }
 
@@ -81,6 +84,7 @@ impl LifecycleError {
             LifecycleError::Secret(_) => 409,
             LifecycleError::Ingress(err) => err.status(),
             LifecycleError::Store(_) => 500,
+            LifecycleError::StartCapExceeded => 409,
         }
     }
 
@@ -95,6 +99,9 @@ impl LifecycleError {
             LifecycleError::Secret(detail) => detail.clone(),
             LifecycleError::Ingress(err) => err.detail(),
             LifecycleError::Store(err) => format!("{err:#}"),
+            LifecycleError::StartCapExceeded => {
+                "at most two Environments may start at once; wait for one to finish".to_string()
+            }
         }
     }
 

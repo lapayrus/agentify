@@ -157,6 +157,7 @@ fn parse_resource(
 
     let resource = match kind.as_str() {
         "app" => {
+            deny_privileged(&body, path)?;
             deny_unknown(
                 &body,
                 path,
@@ -802,6 +803,29 @@ fn require<'a>(map: &'a Mapping, path: &str, key: &str) -> Result<&'a Value> {
             format!("missing required field `{key}`"),
         )
     })
+}
+
+/// Reject the container privileges the threat model forbids, by name rather
+/// than as an "unknown field" typo. The Backend cannot carry any of them, and
+/// the parser is the first gate.
+fn deny_privileged(map: &Mapping, path: &str) -> Result<()> {
+    for key in map.keys() {
+        let Some(key) = key.as_str() else {
+            continue;
+        };
+        let message = match key {
+            "privileged" => Some("privileged mode is not supported"),
+            "hostNetwork" | "networkMode" => Some("host networking is not supported"),
+            "pid" => Some("a host PID namespace is not supported"),
+            "dockerSocket" => Some("Docker socket mounts are not supported"),
+            "volumes" | "mounts" => Some("volume and socket mounts are not supported"),
+            _ => None,
+        };
+        if let Some(message) = message {
+            return Err(ManifestError::new(join(path, key), message.to_string()));
+        }
+    }
+    Ok(())
 }
 
 fn deny_unknown(map: &Mapping, path: &str, allowed: &[&str]) -> Result<()> {

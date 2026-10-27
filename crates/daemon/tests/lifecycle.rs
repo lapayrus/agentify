@@ -833,3 +833,112 @@ fn state_survives_a_daemon_restart_and_start_converges_again() {
 
     second.kill();
 }
+
+#[test]
+fn creating_a_twenty_first_project_is_refused_with_a_typed_cap() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let daemon = Daemon::boot(temp.path());
+
+    for index in 0..20 {
+        let manifest = format!(
+            "version: 1\nproject: p{index}\nresources:\n  web: {{ kind: app, image: node:22 }}\n"
+        );
+        let (status, body) = daemon.post_with(
+            "/v1/projects",
+            &json!({ "manifest": manifest }),
+            &[],
+        );
+        assert_eq!(status, 201, "project {index} created: {body}");
+    }
+
+    let manifest = "version: 1\nproject: overflow\nresources:\n  web: { kind: app, image: node:22 }\n";
+    let (status, body) = daemon.post_with(
+        "/v1/projects",
+        &json!({ "manifest": manifest }),
+        &[],
+    );
+    assert_eq!(status, 409, "the 21st project is refused: {body}");
+    assert_eq!(body["code"], "ProjectCapExceeded");
+}
+
+#[test]
+fn a_third_concurrent_start_is_refused_with_a_typed_cap() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config = Config::new(temp.path()).with_backend_script(r#"{"start_delay_ms": 2000}"#);
+    let daemon = Daemon::boot_with(config);
+
+    for name in ["a", "b", "c"] {
+        let manifest = format!(
+            "version: 1\nproject: {name}\nresources:\n  web: {{ kind: app, image: node:22 }}\n"
+        );
+        let (status, body) = daemon.post_with(
+            "/v1/projects",
+            &json!({ "manifest": manifest }),
+            &[],
+        );
+        assert_eq!(status, 201, "project {name} created: {body}");
+    }
+
+    // Fire all three starts at once so they overlap: two take the two slots, the
+    // third is refused before it creates an operation.
+    let base = daemon.url("");
+    let token = daemon.token();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut handles = Vec::new();
+    for name in ["a", "b", "c"] {
+        let base = base.clone();
+        let token = token.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            raw(
+                "POST",
+                &format!("{base}/v1/projects/{name}/environments/dev/start"),
+                &token,
+                Some("{}"),
+                None,
+            )
+        }));
+    }
+
+    let results: Vec<(u16, String)> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("start thread"))
+        .collect();
+    let statuses: Vec<u16> = results.iter().map(|(status, _)| *status).collect();
+    let started = statuses.iter().filter(|status| **status == 200).count();
+    let capped = statuses.iter().filter(|status| **status == 409).count();
+    assert_eq!(started, 2, "exactly two starts run: {statuses:?}");
+    assert_eq!(capped, 1, "exactly one start is capped: {statuses:?}");
+}
+
+#[test]
+fn whoami_reports_disk_pressure_from_the_injected_seam() {
+    #[derive(Debug)]
+    struct FakeDisk {
+        free: u64,
+    }
+    impl agentify_daemon::disk::DiskUsage for FakeDisk {
+        fn free_bytes(&self, _path: &Path) -> anyhow::Result<u64> {
+            Ok(self.free)
+        }
+    }
+
+    let low = tempfile::tempdir().expect("temp dir");
+    let daemon = Daemon::boot_with(
+        Config::new(low.path()).with_disk_usage(std::sync::Arc::new(FakeDisk { free: 1 })),
+    );
+    let (status, body) = daemon.get("/v1/whoami");
+    assert_eq!(status, 200);
+    assert_eq!(body["disk"]["free_bytes"].as_u64(), Some(1));
+    assert_eq!(body["disk"]["warning"].as_bool(), Some(true));
+
+    let high = tempfile::tempdir().expect("temp dir");
+    let daemon = Daemon::boot_with(
+        Config::new(high.path()).with_disk_usage(std::sync::Arc::new(FakeDisk {
+            free: u64::MAX,
+        })),
+    );
+    let (_, body) = daemon.get("/v1/whoami");
+    assert_eq!(body["disk"]["warning"].as_bool(), Some(false));
+}

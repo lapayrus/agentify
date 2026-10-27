@@ -266,6 +266,46 @@ fn the_events_stream_opens_with_a_heartbeat() {
     );
 }
 
+#[test]
+fn revoking_a_token_rejects_it_on_the_next_call() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let daemon = Daemon::boot(temp.path());
+
+    let token = daemon.discovery.token.clone();
+    let (status, body) = http_post(&daemon.url("/v1/tokens/revoke"), &token, "{}");
+    assert_eq!(status, 200, "revoke succeeds: {body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("revoke body is JSON");
+    assert_eq!(payload["revoked"], true, "the token was revoked: {body}");
+
+    let (status, body) = daemon.get_raw("/v1/whoami", Some(&token));
+    assert_eq!(status, 401, "a revoked token is rejected: {body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).expect("problem body");
+    assert_eq!(problem["code"], "Unauthorized");
+}
+
+#[test]
+fn an_expired_token_is_rejected() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let daemon = Daemon::boot(temp.path());
+    let token = daemon.discovery.token.clone();
+
+    // The daemon owns `state.db`; a second WAL connection can reach in and age
+    // the token so the seven-day expiry is observable without sleeping.
+    let connection = rusqlite::Connection::open(agentify_proto::state_db_path(temp.path()))
+        .expect("open state.db");
+    connection
+        .execute(
+            "UPDATE agent_tokens SET expires_at = '2000-01-01T00:00:00Z' WHERE revoked_at IS NULL",
+            [],
+        )
+        .expect("age the token");
+
+    let (status, body) = daemon.get_raw("/v1/whoami", Some(&token));
+    assert_eq!(status, 401, "an expired token is rejected: {body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).expect("problem body");
+    assert_eq!(problem["code"], "Unauthorized");
+}
+
 /// The whole Environment lifecycle, driven over HTTP, on real WSL distros.
 ///
 /// Gated by `AGENTIFY_TEST_WSL=1`: it creates and destroys a real per-Project

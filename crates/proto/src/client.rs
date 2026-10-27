@@ -218,6 +218,11 @@ impl DaemonClient {
         self.post_json("/v1/system/shutdown", &serde_json::json!({}))
     }
 
+    /// `POST /v1/tokens/revoke`: revoke the token making this request.
+    pub fn revoke_token(&self) -> Result<Value, ClientError> {
+        self.post_json("/v1/tokens/revoke", &serde_json::json!({}))
+    }
+
     /// `GET /v1/projects`.
     pub fn list_projects(&self) -> Result<Value, ClientError> {
         self.get_json("/v1/projects")

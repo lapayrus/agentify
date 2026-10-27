@@ -157,6 +157,18 @@ pub struct Whoami {
     pub backend: BackendRef,
     pub actor: Actor,
     pub daemon: DaemonInfo,
+    /// Free space on the data-root volume. Present when the measurement works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<DiskView>,
+}
+
+/// Free space on the data-root volume, reported by `whoami`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskView {
+    /// Free bytes on the volume.
+    pub free_bytes: u64,
+    /// Whether free space is below the daemon's pressure threshold.
+    pub warning: bool,
 }
 
 /// `application/problem+json` body used for every error response.

@@ -5,11 +5,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use crate::consent::{self, ConsentMode};
+use crate::disk::{DiskUsage, SystemDiskUsage};
 use crate::ports::PortRange;
 use crate::secrets::{self, SecretEnv, SecretStoreKind, Secrets};
 
@@ -151,6 +153,9 @@ pub struct Config {
     /// Where a `fromEnv` import reads from. A test-config daemon is hermetic: an
     /// empty map, so a developer's shell cannot change what a test sees.
     pub secret_env: SecretEnv,
+    /// How free space on the data-root volume is measured. The shipped daemon
+    /// measures the real volume; a test scripts it.
+    pub disk: Arc<dyn DiskUsage>,
 }
 
 impl Config {
@@ -180,6 +185,7 @@ impl Config {
             secret_store: SecretStoreKind::Memory,
             secret_service: secrets::DEFAULT_SERVICE.to_string(),
             secret_env: SecretEnv::Fixed(BTreeMap::new()),
+            disk: Arc::new(SystemDiskUsage),
         }
     }
 
@@ -343,6 +349,13 @@ impl Config {
     /// Drive a scripted fake Backend. Tests use this.
     pub fn with_backend_script(mut self, script: impl Into<String>) -> Self {
         self.backend_script = Some(script.into());
+        self
+    }
+
+    /// Script the free-space measurement, so a test can exercise the pressure
+    /// warning without touching the real volume.
+    pub fn with_disk_usage(mut self, disk: Arc<dyn DiskUsage>) -> Self {
+        self.disk = disk;
         self
     }
 

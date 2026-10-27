@@ -610,6 +610,18 @@ impl State {
         })
     }
 
+    /// Revoke the token with this id, if it is still live. Returns `true` when a
+    /// row changed and `false` when there was nothing left to revoke.
+    pub fn revoke_token(&self, token_id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE agent_tokens SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+                rusqlite::params![clock::now_rfc3339(), token_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     /// Insert a Project with its Environment and Resources in one transaction.
     ///
     /// Returns `Ok(false)` when the name is already taken, so the caller can
@@ -704,6 +716,15 @@ impl State {
             rows.into_iter()
                 .map(|record| hydrate_resources(conn, record))
                 .collect()
+        })
+    }
+
+    /// How many Projects exist, for the abuse cap.
+    pub fn count_projects(&self) -> Result<i64> {
+        self.with_conn(|conn| {
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))?;
+            Ok(count)
         })
     }
 
@@ -1534,5 +1555,23 @@ mod tests {
             .expect("lookup")
             .expect("the new token is live");
         assert_eq!(record.scopes, vec!["read", "operate"]);
+    }
+
+    #[test]
+    fn revoking_a_token_removes_it() {
+        let state = State::open_in_memory().expect("state");
+        let issued = state.issue_agent_token().expect("token");
+        let hash = auth::sha256_hex(&issued.token);
+        assert!(state.find_active_token(&hash).expect("lookup").is_some());
+
+        assert!(state.revoke_token(&issued.id).expect("revoke"));
+        assert!(
+            state.find_active_token(&hash).expect("lookup").is_none(),
+            "a revoked token must not be live"
+        );
+        assert!(
+            !state.revoke_token(&issued.id).expect("revoke"),
+            "revoking the same token twice is a no-op"
+        );
     }
 }

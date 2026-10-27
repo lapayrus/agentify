@@ -18,6 +18,7 @@ fn main() -> ExitCode {
         "daemon" => run_daemon(),
         "whoami" => whoami(),
         "status" => status(),
+        "revoke-token" => revoke_token(),
         "bootstrap" => bootstrap(&args[1..]),
         "login-item" => login_item(&args[1..]),
         "uninstall" => uninstall(&args[1..]),
@@ -45,6 +46,8 @@ Usage:
   agentify daemon                     run the daemon in the foreground
   agentify status                     report whether the daemon is reachable
   agentify whoami                     print the daemon's whoami payload as JSON
+  agentify revoke-token               revoke the discovery token (the next daemon
+                                      run mints a fresh one)
   agentify bootstrap                  report whether this machine can run Projects
   agentify bootstrap --consent        agree to the one Windows step (a UAC prompt)
   agentify bootstrap --resume         finish setup after the restart
@@ -292,6 +295,23 @@ fn whoami() -> ExitCode {
     match client.whoami() {
         Ok(payload) => {
             println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("agentify: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `agentify revoke-token`: revoke the token in the discovery file.
+fn revoke_token() -> ExitCode {
+    match DaemonClient::from_env().revoke_token() {
+        Ok(payload) => {
+            println!(
+                "token revoked: {}",
+                payload["revoked"].as_bool().unwrap_or(false)
+            );
             ExitCode::SUCCESS
         }
         Err(err) => {

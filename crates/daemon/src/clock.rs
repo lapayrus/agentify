@@ -59,3 +59,14 @@ pub fn millis_between(from: &str, to: &str) -> Option<u64> {
     let millis = (to - from).whole_milliseconds();
     u64::try_from(millis.max(0)).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expiry_compares_rfc3339_timestamps() {
+        assert!(is_expired("2000-01-01T00:00:00Z"));
+        assert!(!is_expired(&rfc3339_in_days(1)));
+    }
+}

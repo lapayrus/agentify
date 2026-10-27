@@ -608,6 +608,7 @@ mod tests {
         let yaml = rendered();
         assert!(!yaml.contains("privileged"), "{yaml}");
         assert!(!yaml.contains("network_mode"), "{yaml}");
+        assert!(!yaml.contains("pid:"), "{yaml}");
         assert!(!yaml.contains("/var/run/docker.sock"), "{yaml}");
     }
 

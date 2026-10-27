@@ -74,10 +74,24 @@ impl Drop for Shim {
 /// explicitly, so the suite does not depend on how the machine's shell is set up.
 const FIXTURE_API_TOKEN: &str = "fixture-api-token-from-the-host";
 
-/// A daemon for these tests: the memory secret store, and the fixture's imported
-/// value, so no test touches this machine's credential manager.
+/// A fixed free-space measurement, so the `whoami` payload is deterministic and
+/// no test depends on how full this machine's disk is.
+#[derive(Debug)]
+struct FixedDisk;
+
+impl agentify_daemon::disk::DiskUsage for FixedDisk {
+    fn free_bytes(&self, _path: &Path) -> anyhow::Result<u64> {
+        Ok(123_456_789)
+    }
+}
+
+/// A daemon for these tests: the memory secret store, the fixture's imported
+/// value, and a scripted disk, so no test touches this machine's credential
+/// manager or depends on how full its disk is.
 fn config(home: &Path) -> agentify_daemon::Config {
-    agentify_daemon::Config::new(home).with_secret_env([("HELLO_API_TOKEN", FIXTURE_API_TOKEN)])
+    agentify_daemon::Config::new(home)
+        .with_secret_env([("HELLO_API_TOKEN", FIXTURE_API_TOKEN)])
+        .with_disk_usage(std::sync::Arc::new(FixedDisk))
 }
 
 fn initialize() -> Value {

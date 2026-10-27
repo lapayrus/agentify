@@ -12,6 +12,7 @@ pub mod backends;
 pub mod clock;
 pub mod config;
 pub mod consent;
+pub mod disk;
 pub mod discovery;
 pub mod fixtures;
 pub mod handshake;

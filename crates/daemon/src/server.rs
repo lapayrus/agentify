@@ -27,8 +27,8 @@ use agentify_backends::LogOptions;
 use agentify_proto::{
     ActivityPage, Actor, ApprovalAccepted, ApprovalDecision as ApprovalDecisionView,
     ApprovalDecisionRequest, ApprovalList, Capabilities, CreateProjectRequest, DaemonInfo,
-    Discovery, ExecRequest, ExecResponse, LogLineView, LogsResponse, OperationView, Problem,
-    ProjectList,
+    Discovery, DiskView, ExecRequest, ExecResponse, LogLineView, LogsResponse, OperationView,
+    Problem, ProjectList,
     StatsResponse, Whoami, API_VERSION, APPROVAL_APPROVED, APPROVAL_DENIED, APPROVAL_EXPIRED,
     APPROVAL_PENDING, DEV_ENVIRONMENT, HEALTH_HEALTHY, OPERATION_WAITING_FOR_APPROVAL,
     STATE_RUNNING,
@@ -45,7 +45,7 @@ use axum::{Extension, Json, Router};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, Notify, OwnedMutexGuard};
+use tokio::sync::{oneshot, Notify, OwnedMutexGuard, Semaphore};
 use tokio::time::Instant;
 
 use crate::approval::{self, Destructive};
@@ -55,6 +55,7 @@ use crate::backends;
 use crate::clock;
 use crate::config::Config;
 use crate::consent::{self, ConsentOutcome, ConsentVerifier};
+use crate::disk::{DiskUsage, DISK_PRESSURE_BYTES};
 use crate::discovery;
 use crate::lifecycle::{self, Lifecycle, LifecycleError};
 use crate::projects::{self, CreateError};
@@ -76,6 +77,9 @@ pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// after it is killed, and a route must not be lost to that race.
 const REPUBLISH_ATTEMPTS: u32 = 20;
 const REPUBLISH_PAUSE: Duration = Duration::from_millis(500);
+
+/// The abuse cap from ADR-0003: at most two Environments may be starting at once.
+const MAX_CONCURRENT_STARTS: usize = 2;
 
 /// Identity the auth middleware attaches to an authenticated request.
 #[derive(Debug, Clone)]
@@ -117,6 +121,11 @@ struct AppState {
     /// Signals the graceful-shutdown future that an API caller asked the daemon
     /// to stop, so `POST /v1/system/shutdown` reuses the same exit path as Ctrl-C.
     shutdown: Arc<Notify>,
+    /// Permits the two-concurrent-start cap: held only while `lifecycle.start`
+    /// runs, so a third `start` is refused instead of queued.
+    start_slots: Arc<Semaphore>,
+    /// Measures free space on the data-root volume for the `whoami` warning.
+    disk: Arc<dyn DiskUsage>,
 }
 
 impl AppState {
@@ -484,6 +493,8 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
         env_locks: Mutex::new(HashMap::new()),
         handshake,
         shutdown: Arc::new(Notify::new()),
+        start_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_STARTS)),
+        disk: config.disk.clone(),
     };
     Ok((state, listener, discovery))
 }
@@ -492,6 +503,7 @@ fn router(state: Arc<AppState>) -> Router {
     let environments = "/v1/projects/{project}/environments/{environment}";
     let protected = Router::new()
         .route("/v1/whoami", get(whoami))
+        .route("/v1/tokens/revoke", post(revoke_token))
         .route("/v1/handshake", get(handshake))
         .route("/v1/events", get(events))
         .route("/v1/projects", get(list_projects).post(create_project))
@@ -647,6 +659,10 @@ async fn shutdown_system(State(app): State<Arc<AppState>>) -> Response {
 
 async fn whoami(State(app): State<Arc<AppState>>, Extension(caller): Extension<Caller>) -> Json<Whoami> {
     let backend = app.lifecycle.backend_ref();
+    let disk = app.disk.free_bytes(&app.data_root).ok().map(|free_bytes| DiskView {
+        free_bytes,
+        warning: free_bytes < DISK_PRESSURE_BYTES,
+    });
     Json(Whoami {
         // The walking skeleton has no Projects, so no caller is bound to one.
         project: None,
@@ -663,7 +679,32 @@ async fn whoami(State(app): State<Arc<AppState>>, Extension(caller): Extension<C
             instance_id: app.instance_id.clone(),
             started_at: app.started_at.clone(),
         },
+        disk,
     })
+}
+
+/// `POST /v1/tokens/revoke`: revoke the token that made this request.
+async fn revoke_token(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    match app.state.revoke_token(&caller.token_id) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "revoked": true })),
+        )
+            .into_response(),
+        Ok(false) => problem(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            Some("the presented token is already revoked or unknown".to_string()),
+        ),
+        Err(err) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            Some(format!("{err:#}")),
+        ),
+    }
 }
 
 async fn events(State(app): State<Arc<AppState>>) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
@@ -789,6 +830,18 @@ async fn create_project(
                 "AlreadyExists",
                 Some(detail),
             )
+        }
+        Err(CreateError::ProjectCapExceeded(detail)) => {
+            record_failure(
+                &app,
+                &caller,
+                &request_id,
+                "create_project",
+                None,
+                "ProjectCapExceeded",
+                started,
+            );
+            problem(StatusCode::CONFLICT, "ProjectCapExceeded", Some(detail))
         }
         Err(CreateError::Store(err)) => problem(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -943,6 +996,18 @@ async fn mutate(
         Ok(record) => record,
         Err(err) => return Outcome::lifecycle(err).into_response(),
     };
+
+    // The two-concurrent-start cap: a third start is refused before it even
+    // creates an operation, rather than queued behind the other two.
+    let start_slot = if mutation == Mutation::Start {
+        match app.start_slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => return Outcome::lifecycle(LifecycleError::StartCapExceeded).into_response(),
+        }
+    } else {
+        None
+    };
+
     let operation_kind = match mutation {
         Mutation::Start => "start_environment",
         Mutation::Stop => "stop_environment",
@@ -990,6 +1055,7 @@ async fn mutate(
             Mutation::Stop => worker.lifecycle.stop(&worker.state, &worker_record).await,
         };
         drop(guard);
+        drop(start_slot);
 
         let outcome = match result {
             Ok(mut status) => {

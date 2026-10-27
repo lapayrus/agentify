@@ -277,16 +277,57 @@ fn unknown_fields_are_rejected_at_every_level() {
             "version: 1\nproject: demo\nsecrets:\n  pg: { generate: password, rotation: 30d }\nresources:\n  web: { kind: app, image: node:22 }\n",
             "secrets.pg.rotation",
         ),
-        (
-            "version: 1\nproject: demo\nresources:\n  web: { kind: app, image: node:22, privileged: true }\n",
-            "resources.web.privileged",
-        ),
     ];
 
     for (yaml, expected) in cases {
         let err = error(yaml);
         assert_eq!(err.path, expected, "wrong path for {yaml}");
         assert!(err.message.contains("unknown field"), "{:?}", err.message);
+    }
+}
+
+#[test]
+fn privileged_requests_are_rejected_by_name() {
+    let cases = [
+        (
+            "privileged: true",
+            "resources.web.privileged",
+            "privileged mode is not supported",
+        ),
+        (
+            "hostNetwork: true",
+            "resources.web.hostNetwork",
+            "host networking is not supported",
+        ),
+        (
+            "networkMode: host",
+            "resources.web.networkMode",
+            "host networking is not supported",
+        ),
+        (
+            "pid: host",
+            "resources.web.pid",
+            "a host PID namespace is not supported",
+        ),
+        (
+            "dockerSocket: /var/run/docker.sock",
+            "resources.web.dockerSocket",
+            "Docker socket mounts are not supported",
+        ),
+        (
+            "volumes: [\"/var/run/docker.sock:/var/run/docker.sock\"]",
+            "resources.web.volumes",
+            "volume and socket mounts are not supported",
+        ),
+    ];
+
+    for (field, expected_path, expected_message) in cases {
+        let yaml = format!(
+            "version: 1\nproject: demo\nresources:\n  web:\n    kind: app\n    image: node:22\n    {field}\n"
+        );
+        let err = error(&yaml);
+        assert_eq!(err.path, expected_path, "wrong path for {yaml}");
+        assert_eq!(err.message, expected_message, "wrong message for {yaml}");
     }
 }
 
