@@ -27,7 +27,7 @@ pub mod error;
 pub mod fake;
 pub mod spec;
 
-pub use conformance::{run_conformance, Case, Outcome, Report};
+pub use conformance::{run_conformance, run_lifecycle_conformance, Case, Outcome, Report};
 pub use contract::{
     Backend, BackendEvent, BackendInfo, BackendStatus, BoxFuture, CheckpointId, EventStream,
     ExecChunk, ExecSession, ExecSpec, LogLine, LogOptions, LogStream, ResourceStat, ResourceStatus,
