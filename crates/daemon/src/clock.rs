@@ -13,6 +13,19 @@ pub fn rfc3339_in_days(days: i64) -> String {
     format(OffsetDateTime::now_utc() + time::Duration::days(days))
 }
 
+/// Now plus `millis` milliseconds, as RFC 3339 in UTC. An Approval's deadline is
+/// measured this way: fifteen minutes by default, milliseconds in a test.
+pub fn rfc3339_in_millis(millis: i64) -> String {
+    format(OffsetDateTime::now_utc() + time::Duration::milliseconds(millis))
+}
+
+/// How long until `timestamp`, in milliseconds. `None` when it does not parse.
+pub fn millis_until(timestamp: &str) -> Option<u64> {
+    let at = parse(timestamp)?;
+    let remaining = (at - OffsetDateTime::now_utc()).whole_milliseconds();
+    Some(u64::try_from(remaining.max(0)).unwrap_or(0))
+}
+
 fn format(value: OffsetDateTime) -> String {
     value
         .format(&Rfc3339)

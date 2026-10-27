@@ -5,13 +5,17 @@
 //! `127.0.0.1` only and every route except the liveness probe requires the
 //! Agent token published in the discovery file.
 //!
-//! Two rules shape the mutating routes:
+//! Three rules shape the mutating routes:
 //!
 //! * each mutation runs as an **operation** with an id, and the HTTP call blocks
 //!   for at most `AGENTIFY_OPERATION_TIMEOUT_MS`. A timeout answers `504` with
 //!   the operation id, and `GET /v1/operations/{id}/wait` finishes the job.
 //! * mutations are serialised per Environment, so a second `start` cannot race
 //!   the first.
+//! * a destructive mutation answers `202` with an Approval and an operation id
+//!   before changing anything. The operation then waits for a human, who
+//!   authorises it with an interactive OS gesture; an Agent holds the token but
+//!   cannot produce that gesture.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -21,9 +25,11 @@ use std::time::Duration;
 
 use agentify_backends::LogOptions;
 use agentify_proto::{
-    Actor, Capabilities, CreateProjectRequest, DaemonInfo, Discovery, ExecRequest, ExecResponse,
-    LogsResponse, OperationView, Problem, ProjectList, StatsResponse, Whoami, API_VERSION,
-    DEV_ENVIRONMENT,
+    ActivityPage, Actor, ApprovalAccepted, ApprovalDecision as ApprovalDecisionView,
+    ApprovalDecisionRequest, ApprovalList, Capabilities, CreateProjectRequest, DaemonInfo,
+    Discovery, ExecRequest, ExecResponse, LogsResponse, OperationView, Problem, ProjectList,
+    StatsResponse, Whoami, API_VERSION, APPROVAL_APPROVED, APPROVAL_DENIED, APPROVAL_EXPIRED,
+    APPROVAL_PENDING, DEV_ENVIRONMENT, OPERATION_WAITING_FOR_APPROVAL,
 };
 use anyhow::{Context, Result};
 use axum::body::Bytes;
@@ -40,14 +46,19 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, OwnedMutexGuard};
 use tokio::time::Instant;
 
+use crate::approval::{self, Destructive};
+use crate::audit;
 use crate::auth;
 use crate::backends;
 use crate::clock;
 use crate::config::Config;
+use crate::consent::{self, ConsentOutcome, ConsentVerifier};
 use crate::discovery;
 use crate::lifecycle::{self, Lifecycle, LifecycleError};
 use crate::projects::{self, CreateError};
-use crate::state::{IdempotencyRecord, OperationRecord, ProjectRecord, State as StateStore};
+use crate::state::{
+    ActorRecord, ApprovalRecord, IdempotencyRecord, OperationRecord, ProjectRecord, State as StateStore,
+};
 
 /// Version of this daemon build.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -76,6 +87,10 @@ struct AppState {
     operation_timeout: Duration,
     /// Default log tail.
     log_tail: usize,
+    /// How long an Approval stays usable.
+    approval_ttl: Duration,
+    /// The human gate every Approval passes through.
+    consent: Arc<dyn ConsentVerifier>,
     /// One async mutex per Environment: mutations are serialised, reads are not.
     env_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -92,6 +107,15 @@ impl AppState {
 
     fn backend_capabilities(&self) -> Capabilities {
         self.lifecycle.backend.describe().capabilities
+    }
+
+    /// The Agent actor behind an authenticated request.
+    fn actor(caller: &Caller) -> ActorRecord {
+        ActorRecord {
+            kind: "agent".to_string(),
+            id: caller.token_id.clone(),
+            token_id: Some(caller.token_id.clone()),
+        }
     }
 }
 
@@ -269,6 +293,8 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
         lifecycle,
         operation_timeout: config.operation_timeout,
         log_tail: config.log_tail,
+        approval_ttl: config.approval_ttl,
+        consent: config.consent.verifier(),
         env_locks: Mutex::new(HashMap::new()),
     };
     Ok((state, listener, discovery))
@@ -280,12 +306,16 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/whoami", get(whoami))
         .route("/v1/events", get(events))
         .route("/v1/projects", get(list_projects).post(create_project))
-        .route("/v1/projects/{project}", get(get_project))
+        .route(
+            "/v1/projects/{project}",
+            get(get_project).delete(delete_project),
+        )
         .route(
             &format!("{environments}/start"),
             post(start_environment),
         )
         .route(&format!("{environments}/stop"), post(stop_environment))
+        .route(&format!("{environments}/reset"), post(reset_environment))
         .route(&format!("{environments}/status"), get(environment_status))
         .route(
             &format!("{environments}/resources/{{resource}}/exec"),
@@ -293,6 +323,10 @@ fn router(state: Arc<AppState>) -> Router {
         )
         .route(&format!("{environments}/logs"), get(environment_logs))
         .route(&format!("{environments}/stats"), get(environment_stats))
+        .route("/v1/approvals", get(list_approvals))
+        .route("/v1/approvals/{id}/approve", post(approve_approval))
+        .route("/v1/approvals/{id}/deny", post(deny_approval))
+        .route("/v1/activity", get(activity))
         .route("/v1/operations/{id}", get(get_operation))
         .route("/v1/operations/{id}/wait", get(wait_operation))
         .route_layer(middleware::from_fn_with_state(
@@ -358,7 +392,14 @@ async fn events(State(app): State<Arc<AppState>>) -> Sse<impl futures_util::Stre
 
 /// `POST /v1/projects`: create a Project from exactly one of a bundled fixture
 /// or an inline Manifest. Nothing starts.
-async fn create_project(State(app): State<Arc<AppState>>, body: Bytes) -> Response {
+async fn create_project(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = std::time::Instant::now();
+    let request_id = request_id(&headers);
     let request: CreateProjectRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
@@ -375,26 +416,73 @@ async fn create_project(State(app): State<Arc<AppState>>, body: Bytes) -> Respon
     };
 
     match projects::create(&app.state, &app.data_root, request) {
-        Ok(project) => (StatusCode::CREATED, Json(project)).into_response(),
-        Err(CreateError::Validation { path, detail }) => problem_at(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "ValidationFailed",
-            Some(detail),
-            Some(path),
-        ),
-        Err(CreateError::SourceMissing(detail)) => problem(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "SourceMissing",
-            Some(detail),
-        ),
-        Err(CreateError::AlreadyExists(detail)) => problem(
-            StatusCode::CONFLICT,
-            "AlreadyExists",
-            Some(detail),
-        ),
-        Err(CreateError::Store(err)) => {
-            problem(StatusCode::INTERNAL_SERVER_ERROR, "Internal", Some(format!("{err:#}")))
+        Ok(project) => {
+            record_audit(
+                &app,
+                audit::Append {
+                    project_id: Some(&project.id),
+                    operation: "create_project",
+                    target: Some(&project.name),
+                    duration_ms: Some(started.elapsed().as_millis() as u64),
+                    ..audit::Append::done(AppState::actor(&caller), "create_project", &request_id)
+                },
+            );
+            (StatusCode::CREATED, Json(project)).into_response()
         }
+        Err(CreateError::Validation { path, detail }) => {
+            record_failure(
+                &app,
+                &caller,
+                &request_id,
+                "create_project",
+                None,
+                "ValidationFailed",
+                started,
+            );
+            problem_at(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationFailed",
+                Some(detail),
+                Some(path),
+            )
+        }
+        Err(CreateError::SourceMissing(detail)) => {
+            record_failure(
+                &app,
+                &caller,
+                &request_id,
+                "create_project",
+                None,
+                "SourceMissing",
+                started,
+            );
+            problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "SourceMissing",
+                Some(detail),
+            )
+        }
+        Err(CreateError::AlreadyExists(detail)) => {
+            record_failure(
+                &app,
+                &caller,
+                &request_id,
+                "create_project",
+                None,
+                "AlreadyExists",
+                started,
+            );
+            problem(
+                StatusCode::CONFLICT,
+                "AlreadyExists",
+                Some(detail),
+            )
+        }
+        Err(CreateError::Store(err)) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            Some(format!("{err:#}")),
+        ),
     }
 }
 
@@ -492,17 +580,19 @@ impl Mutation {
 async fn start_environment(
     State(app): State<Arc<AppState>>,
     Path((project, environment)): Path<(String, String)>,
+    Extension(caller): Extension<Caller>,
     headers: HeaderMap,
 ) -> Response {
-    mutate(app, project, environment, Mutation::Start, headers).await
+    mutate(app, project, environment, Mutation::Start, caller, headers).await
 }
 
 async fn stop_environment(
     State(app): State<Arc<AppState>>,
     Path((project, environment)): Path<(String, String)>,
+    Extension(caller): Extension<Caller>,
     headers: HeaderMap,
 ) -> Response {
-    mutate(app, project, environment, Mutation::Stop, headers).await
+    mutate(app, project, environment, Mutation::Stop, caller, headers).await
 }
 
 /// Run a lifecycle mutation as an operation with an id.
@@ -511,8 +601,11 @@ async fn mutate(
     project: String,
     environment: String,
     mutation: Mutation,
+    caller: Caller,
     headers: HeaderMap,
 ) -> Response {
+    let started = std::time::Instant::now();
+    let request_id = request_id(&headers);
     let path = format!(
         "/v1/projects/{project}/environments/{environment}/{}",
         mutation.as_str()
@@ -538,6 +631,11 @@ async fn mutate(
         Ok(record) => record,
         Err(err) => return Outcome::lifecycle(err).into_response(),
     };
+    let operation_kind = match mutation {
+        Mutation::Start => "start_environment",
+        Mutation::Stop => "stop_environment",
+    };
+    let target = format!("{}/{}", record.name, record.environment.name);
 
     let now = clock::now_rfc3339();
     let operation = OperationRecord {
@@ -569,6 +667,9 @@ async fn mutate(
     let worker_operation = operation_id.clone();
     let worker_record = record.clone();
     let environment_id = record.environment.id.clone();
+    let worker_project = record.id.clone();
+    let worker_request = request_id.clone();
+    let worker_actor = AppState::actor(&caller);
     tokio::spawn(async move {
         let lock = worker.env_lock(&environment_id);
         let guard: OwnedMutexGuard<()> = lock.lock_owned().await;
@@ -589,6 +690,16 @@ async fn mutate(
                     None,
                     Some(&outcome.body),
                 );
+                record_audit(
+                    &worker,
+                    audit::Append {
+                        project_id: Some(&worker_project),
+                        operation: operation_kind,
+                        target: Some(&target),
+                        duration_ms: Some(started.elapsed().as_millis() as u64),
+                        ..audit::Append::done(worker_actor, operation_kind, &worker_request)
+                    },
+                );
                 outcome
             }
             Err(err) => {
@@ -601,6 +712,18 @@ async fn mutate(
                     Some(&code),
                     Some(&detail),
                     None,
+                );
+                record_audit(
+                    &worker,
+                    audit::Append {
+                        project_id: Some(&worker_project),
+                        operation: operation_kind,
+                        target: Some(&target),
+                        result: "failed",
+                        error_code: Some(&code),
+                        duration_ms: Some(started.elapsed().as_millis() as u64),
+                        ..audit::Append::done(worker_actor, operation_kind, &worker_request)
+                    },
                 );
                 outcome
             }
@@ -653,8 +776,12 @@ async fn environment_status(
 async fn exec_in_resource(
     State(app): State<Arc<AppState>>,
     Path((project, environment, resource)): Path<(String, String, String)>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let started = std::time::Instant::now();
+    let request_id = request_id(&headers);
     let request: ExecRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
@@ -671,13 +798,43 @@ async fn exec_in_resource(
         Ok(record) => record,
         Err(err) => return Outcome::lifecycle(err).into_response(),
     };
+    let target = format!("{}/{}/{}", record.name, record.environment.name, resource);
     match app
         .lifecycle
         .exec(&app.state, &record, &resource, &request)
         .await
     {
-        Ok(response) => Json::<ExecResponse>(response).into_response(),
-        Err(err) => Outcome::lifecycle(err).into_response(),
+        Ok(response) => {
+            // The command's output is a value: the audit records that it ran,
+            // in which Resource, and for how long — never what it printed.
+            record_audit(
+                &app,
+                audit::Append {
+                    project_id: Some(&record.id),
+                    operation: "exec",
+                    target: Some(&target),
+                    duration_ms: Some(response.duration_ms),
+                    ..audit::Append::done(AppState::actor(&caller), "exec", &request_id)
+                },
+            );
+            Json::<ExecResponse>(response).into_response()
+        }
+        Err(err) => {
+            let code = err.code();
+            record_audit(
+                &app,
+                audit::Append {
+                    project_id: Some(&record.id),
+                    operation: "exec",
+                    target: Some(&target),
+                    result: "failed",
+                    error_code: Some(&code),
+                    duration_ms: Some(started.elapsed().as_millis() as u64),
+                    ..audit::Append::done(AppState::actor(&caller), "exec", &request_id)
+                },
+            );
+            Outcome::lifecycle(err).into_response()
+        }
     }
 }
 
@@ -776,6 +933,913 @@ async fn environment_stats(
         Ok(stats) => Json::<StatsResponse>(stats).into_response(),
         Err(err) => Outcome::lifecycle(err).into_response(),
     }
+}
+
+// ---- destructive operations: 202, an Approval, and an operation ------------
+
+/// The `202` a destructive call answers with, before changing anything.
+struct Accepted {
+    approval_id: String,
+    operation_id: String,
+    body: String,
+}
+
+impl Accepted {
+    fn into_response(self) -> Response {
+        let Accepted {
+            approval_id,
+            operation_id,
+            body,
+        } = self;
+        (
+            StatusCode::ACCEPTED,
+            [
+                ("content-type", "application/json"),
+                ("x-approval-id", approval_id.as_str()),
+                ("x-operation-id", operation_id.as_str()),
+            ],
+            body,
+        )
+            .into_response()
+    }
+}
+
+/// `DELETE /v1/projects/{project}`: ask a human first.
+async fn delete_project(
+    State(app): State<Arc<AppState>>,
+    Path(project): Path<String>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+) -> Response {
+    let record = match app.state.find_project(&project) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                Some(format!("no Project named or identified by {project:?}")),
+            )
+        }
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                Some(format!("{err:#}")),
+            )
+        }
+    };
+    let destructive = Destructive {
+        operation: approval::DELETE_PROJECT,
+        target: record.name.clone(),
+        parameters: [
+            ("project".to_string(), record.name.clone()),
+            ("projectId".to_string(), record.id.clone()),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    request_approval(app, record, destructive, caller, headers, "DELETE").await
+}
+
+/// `POST .../environments/{environment}/reset`: ask a human first.
+async fn reset_environment(
+    State(app): State<Arc<AppState>>,
+    Path((project, environment)): Path<(String, String)>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+) -> Response {
+    let record = match resolve(&app.state, &project, &environment) {
+        Ok(record) => record,
+        Err(err) => return Outcome::lifecycle(err).into_response(),
+    };
+    let destructive = Destructive {
+        operation: approval::RESET_ENVIRONMENT,
+        target: format!("{}/{}", record.name, record.environment.name),
+        parameters: [
+            ("project".to_string(), record.name.clone()),
+            (
+                "environment".to_string(),
+                record.environment.name.clone(),
+            ),
+            ("environmentId".to_string(), record.environment.id.clone()),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    request_approval(app, record, destructive, caller, headers, "POST").await
+}
+
+/// Record an operation that waits for a human, the Approval that releases it,
+/// and answer `202` with both ids. Nothing about the target changes here.
+async fn request_approval(
+    app: Arc<AppState>,
+    record: ProjectRecord,
+    destructive: Destructive,
+    caller: Caller,
+    headers: HeaderMap,
+    method: &str,
+) -> Response {
+    let request_id = request_id(&headers);
+    let path = match destructive.operation {
+        approval::DELETE_PROJECT => format!("/v1/projects/{}", record.name),
+        _ => format!(
+            "/v1/projects/{}/environments/{}/reset",
+            record.name, record.environment.name
+        ),
+    };
+    let fingerprint = fingerprint(method, &path, &[]);
+    match replay(&app, &headers, method, &path, &fingerprint) {
+        Replay::None => {}
+        Replay::Response(outcome) => return outcome.into_response(),
+        Replay::Conflict => {
+            return Outcome::problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationFailed",
+                "this Idempotency-Key was already used for a different request".to_string(),
+                None,
+            )
+            .into_response()
+        }
+    }
+
+    let now = clock::now_rfc3339();
+    let expires_at = clock::rfc3339_in_millis(app.approval_ttl.as_millis() as i64);
+    let params_hash = destructive.params_hash();
+    let operation = OperationRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        kind: destructive.operation.to_string(),
+        project_id: record.id.clone(),
+        environment_id: record.environment.id.clone(),
+        state: OPERATION_WAITING_FOR_APPROVAL.to_string(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        finished_at: None,
+        error_code: None,
+        error_detail: None,
+        result_json: None,
+    };
+    if let Err(err) = app.state.create_operation(&operation) {
+        return Outcome::problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            format!("{err:#}"),
+            None,
+        )
+        .into_response();
+    }
+
+    let approval = ApprovalRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        operation_id: operation.id.clone(),
+        operation: destructive.operation.to_string(),
+        project_id: Some(record.id.clone()),
+        project_name: record.name.clone(),
+        environment_id: Some(record.environment.id.clone()),
+        target: destructive.target.clone(),
+        params_json: destructive.params_json(),
+        params_hash: params_hash.clone(),
+        requester: AppState::actor(&caller),
+        state: APPROVAL_PENDING.to_string(),
+        created_at: now,
+        expires_at: expires_at.clone(),
+        decided_at: None,
+        decided_by: None,
+    };
+    if let Err(err) = app.state.create_approval(&approval) {
+        let _ = app.state.finish_operation(
+            &operation.id,
+            "failed",
+            Some("Internal"),
+            Some("the Approval could not be recorded"),
+            None,
+        );
+        return Outcome::problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            format!("{err:#}"),
+            Some(&operation.id),
+        )
+        .into_response();
+    }
+
+    record_audit(
+        &app,
+        audit::Append {
+            project_id: Some(&record.id),
+            operation: destructive.operation,
+            target: Some(&destructive.target),
+            params_hash: Some(&params_hash),
+            approval_id: Some(&approval.id),
+            result: "requested",
+            ..audit::Append::done(
+                AppState::actor(&caller),
+                destructive.operation,
+                &request_id,
+            )
+        },
+    );
+
+    // Release whoever is waiting when nobody decides in time.
+    spawn_expiry(&app, approval.id.clone(), expires_at.clone());
+
+    let body = serde_json::to_string(&ApprovalAccepted {
+        approval_id: approval.id.clone(),
+        operation_id: operation.id.clone(),
+        operation: destructive.operation.to_string(),
+        target: destructive.target,
+        params_hash,
+        expires_at,
+    })
+    .unwrap_or_default();
+
+    let accepted = Accepted {
+        approval_id: approval.id.clone(),
+        operation_id: operation.id.clone(),
+        body,
+    };
+    let outcome = Outcome {
+        status: StatusCode::ACCEPTED,
+        body: accepted.body.clone(),
+    };
+    remember(&app, &headers, method, &path, &fingerprint, &outcome);
+    accepted.into_response()
+}
+
+/// Spawn the timer that expires one Approval, and releases its operation.
+fn spawn_expiry(app: &Arc<AppState>, approval_id: String, expires_at: String) {
+    let worker = app.clone();
+    let wait = clock::millis_until(&expires_at)
+        .unwrap_or(0)
+        .saturating_add(20);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        expire(&worker, &approval_id);
+    });
+}
+
+/// Expire a pending Approval: the operation fails with `ApprovalExpired` so a
+/// waiter is released instead of hanging.
+fn expire(app: &AppState, approval_id: &str) {
+    let Ok(Some(record)) = app.state.approval(approval_id) else {
+        return;
+    };
+    if record.state != APPROVAL_PENDING {
+        return;
+    }
+    let decided = app.state.decide_approval(
+        approval_id,
+        &approval::decision(APPROVAL_EXPIRED, record.requester.clone()),
+    );
+    if !matches!(decided, Ok(true)) {
+        return;
+    }
+    let _ = app.state.finish_operation(
+        &record.operation_id,
+        "failed",
+        Some("ApprovalExpired"),
+        Some("nobody approved the operation before its Approval expired"),
+        None,
+    );
+    record_audit(
+        app,
+        audit::Append {
+            project_id: record.project_id.as_deref(),
+            operation: &record.operation,
+            target: Some(&record.target),
+            params_hash: Some(&record.params_hash),
+            approval_id: Some(&record.id),
+            result: "expired",
+            error_code: Some("ApprovalExpired"),
+            ..audit::Append::done(record.requester.clone(), &record.operation, "approval-timer")
+        },
+    );
+}
+
+// ---- the Approval inbox ----------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ApprovalQuery {
+    /// `pending` by default; `all` shows decided ones too.
+    state: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `GET /v1/approvals`: the inbox, pending first.
+async fn list_approvals(
+    State(app): State<Arc<AppState>>,
+    Query(query): Query<ApprovalQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let state = query.state.as_deref().unwrap_or(APPROVAL_PENDING);
+    let filter = match state {
+        "all" | "*" => None,
+        APPROVAL_PENDING | APPROVAL_APPROVED | APPROVAL_DENIED | APPROVAL_EXPIRED => Some(state),
+        other => {
+            return problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationFailed",
+                Some(format!(
+                    "`state` must be one of pending, approved, denied, expired, all; got {other:?}"
+                )),
+            )
+        }
+    };
+    // Anything past its deadline is not pending any more, whatever the row says.
+    if filter.is_none() || filter == Some(APPROVAL_PENDING) {
+        let now = clock::now_rfc3339();
+        match app.state.expire_due_approvals(&now) {
+            Ok(due) => {
+                let timer_request = "approval-timer".to_string();
+                for record in due {
+                    let _ = app.state.finish_operation(
+                        &record.operation_id,
+                        "failed",
+                        Some("ApprovalExpired"),
+                        Some("nobody approved the operation before its Approval expired"),
+                        None,
+                    );
+                    record_audit(
+                        &app,
+                        audit::Append {
+                            project_id: record.project_id.as_deref(),
+                            operation: &record.operation,
+                            target: Some(&record.target),
+                            params_hash: Some(&record.params_hash),
+                            approval_id: Some(&record.id),
+                            result: "expired",
+                            error_code: Some("ApprovalExpired"),
+                            ..audit::Append::done(
+                                record.requester.clone(),
+                                &record.operation,
+                                &timer_request,
+                            )
+                        },
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("agentifyd: expiring approvals failed: {err:#}");
+            }
+        }
+    }
+
+    match app.state.approvals(filter, limit) {
+        Ok(records) => Json(ApprovalList {
+            approvals: records.iter().map(approval::view).collect(),
+        })
+        .into_response(),
+        Err(err) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            Some(format!("{err:#}")),
+        ),
+    }
+}
+
+/// `POST /v1/approvals/{id}/approve`: the OS gesture is the gate.
+async fn approve_approval(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    decide(app, id, caller, headers, body, true).await
+}
+
+/// `POST /v1/approvals/{id}/deny`: the target is left exactly as it was.
+async fn deny_approval(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    decide(app, id, caller, headers, body, false).await
+}
+
+/// Decide one Approval: check it is still usable, ask the OS when approving,
+/// then record the decision. Only the decision is atomic; the work it releases
+/// runs afterwards, under the Environment's lock.
+async fn decide(
+    app: Arc<AppState>,
+    id: String,
+    caller: Caller,
+    headers: HeaderMap,
+    body: Bytes,
+    approve: bool,
+) -> Response {
+    let started = std::time::Instant::now();
+    let request_id = request_id(&headers);
+    let request: ApprovalDecisionRequest = if body.is_empty() {
+        ApprovalDecisionRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(err) => {
+                return problem(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ValidationFailed",
+                    Some(format!("the request body is not an approval decision: {err}")),
+                )
+            }
+        }
+    };
+
+    let record = match app.state.approval(&id) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                Some(format!("no Approval with id {id:?}")),
+            )
+        }
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                Some(format!("{err:#}")),
+            )
+        }
+    };
+
+    // An Approval past its deadline cannot be spent, whatever the row says.
+    if record.state == APPROVAL_PENDING && clock::is_expired(&record.expires_at) {
+        expire(&app, &id);
+    }
+
+    let refusal = |code: &str, status: StatusCode, detail: String| -> Response {
+        record_audit(
+            &app,
+            audit::Append {
+                project_id: record.project_id.as_deref(),
+                operation: &record.operation,
+                target: Some(&record.target),
+                params_hash: Some(&record.params_hash),
+                approval_id: Some(&record.id),
+                result: "failed",
+                error_code: Some(code),
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                ..audit::Append::done(AppState::actor(&caller), &record.operation, &request_id)
+            },
+        );
+        let mut problem = Problem::new(status.as_u16(), code, status.canonical_reason().unwrap_or("Error"), Some(detail));
+        problem.approval_id = Some(record.id.clone());
+        problem.operation_id = Some(record.operation_id.clone());
+        (
+            status,
+            [(header::CONTENT_TYPE, "application/problem+json")],
+            serde_json::to_string(&problem).unwrap_or_default(),
+        )
+            .into_response()
+    };
+
+    // A yes covers exactly what the human was shown: a decision that names a
+    // different operation or a different parameter hash is refused.
+    if let Some(operation_id) = request.operation_id.as_deref() {
+        if operation_id != record.operation_id {
+            return refusal(
+                "ApprovalMismatch",
+                StatusCode::CONFLICT,
+                format!(
+                    "this Approval covers operation {:?}, not {operation_id:?}",
+                    record.operation_id
+                ),
+            );
+        }
+    }
+    if let Some(params_hash) = request.params_hash.as_deref() {
+        if params_hash != record.params_hash {
+            return refusal(
+                "ApprovalMismatch",
+                StatusCode::CONFLICT,
+                "the parameters the caller named are not the ones this Approval covers"
+                    .to_string(),
+            );
+        }
+    }
+
+    // Already decided: say which way, so a replay is unambiguous.
+    if record.state != APPROVAL_PENDING {
+        let (code, status) = match record.state.as_str() {
+            APPROVAL_EXPIRED => ("ApprovalExpired", StatusCode::GONE),
+            APPROVAL_DENIED => ("ApprovalDenied", StatusCode::CONFLICT),
+            _ => ("ApprovalConsumed", StatusCode::CONFLICT),
+        };
+        return refusal(
+            code,
+            status,
+            format!(
+                "this Approval is {}; it can be used once, within its lifetime",
+                record.state
+            ),
+        );
+    }
+
+    let by = if approve {
+        // The gate: only an interactive OS gesture lets a destructive operation
+        // run. An Agent holds the token but cannot produce the gesture.
+        match ask_for_consent(&app, &record).await {
+            ConsentOutcome::Verified => ActorRecord {
+                kind: "human".to_string(),
+                id: consent::os_account(),
+                token_id: Some(caller.token_id.clone()),
+            },
+            ConsentOutcome::Declined(detail) => {
+                return refusal("ApprovalRequired", StatusCode::FORBIDDEN, detail)
+            }
+            ConsentOutcome::Unavailable(detail) => {
+                return refusal("ConsentUnavailable", StatusCode::SERVICE_UNAVAILABLE, detail)
+            }
+        }
+    } else {
+        ActorRecord {
+            kind: "human".to_string(),
+            id: consent::os_account(),
+            token_id: Some(caller.token_id.clone()),
+        }
+    };
+
+    let state = if approve {
+        APPROVAL_APPROVED
+    } else {
+        APPROVAL_DENIED
+    };
+    let decision = approval::decision(state, by.clone());
+    match app.state.decide_approval(&id, &decision) {
+        Ok(true) => {}
+        Ok(false) => {
+            return refusal(
+                "ApprovalConsumed",
+                StatusCode::CONFLICT,
+                "another decision landed first; an Approval is single use".to_string(),
+            )
+        }
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal",
+                Some(format!("{err:#}")),
+            )
+        }
+    }
+
+    record_audit(
+        &app,
+        audit::Append {
+            project_id: record.project_id.as_deref(),
+            operation: &record.operation,
+            target: Some(&record.target),
+            params_hash: Some(&record.params_hash),
+            approval_id: Some(&record.id),
+            result: if approve { "approved" } else { "denied" },
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+            ..audit::Append::done(by.clone(), &record.operation, &request_id)
+        },
+    );
+
+    if approve {
+        // The operation becomes live again before the work starts, so a reader
+        // never sees a decided Approval beside a waiting operation.
+        let _ = app
+            .state
+            .start_operation(&record.operation_id)
+            .map_err(|err| eprintln!("agentifyd: resuming the operation failed: {err:#}"));
+        spawn_execution(app.clone(), record.clone(), by, request_id.clone());
+    } else {
+        let _ = app.state.finish_operation(
+            &record.operation_id,
+            "failed",
+            Some("ApprovalDenied"),
+            Some(if record.operation == approval::DELETE_PROJECT {
+                "a human denied the delete; the Project is unchanged".to_string()
+            } else {
+                "a human denied the reset; the data is unchanged".to_string()
+            }
+            .as_str()),
+            None,
+        );
+    }
+
+    let decided = match app.state.approval(&id) {
+        Ok(Some(decided)) => decided,
+        _ => record,
+    };
+    let operation = match app.state.operation(&decided.operation_id) {
+        Ok(Some(operation)) => operation_view(&operation),
+        _ => operation_view(&OperationRecord {
+            id: decided.operation_id.clone(),
+            kind: decided.operation.clone(),
+            project_id: String::new(),
+            environment_id: String::new(),
+            state: "failed".to_string(),
+            created_at: clock::now_rfc3339(),
+            updated_at: clock::now_rfc3339(),
+            finished_at: None,
+            error_code: Some("Internal".to_string()),
+            error_detail: None,
+            result_json: None,
+        }),
+    };
+    Json(ApprovalDecisionView {
+        approval: approval::view(&decided),
+        operation,
+    })
+    .into_response()
+}
+
+/// Ask the injected verifier for the interactive gesture, off the async workers.
+async fn ask_for_consent(app: &AppState, record: &ApprovalRecord) -> ConsentOutcome {
+    let verifier = app.consent.clone();
+    let message = approval::prompt(record);
+    match tokio::task::spawn_blocking(move || verifier.verify(&message)).await {
+        Ok(outcome) => outcome,
+        Err(err) => ConsentOutcome::Unavailable(format!("the consent prompt failed: {err}")),
+    }
+}
+
+/// Run the work an Approval released. The operation carries the outcome, so a
+/// caller waiting on it sees success or a typed failure.
+fn spawn_execution(
+    app: Arc<AppState>,
+    approval: ApprovalRecord,
+    decided_by: ActorRecord,
+    request_id: String,
+) {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let environment_id = approval.environment_id.clone().unwrap_or_default();
+        let lock = app.env_lock(&environment_id);
+        let guard: OwnedMutexGuard<()> = lock.lock_owned().await;
+        let result = match approval.operation.as_str() {
+            approval::DELETE_PROJECT => run_delete(&app, &approval).await,
+            approval::RESET_ENVIRONMENT => run_reset(&app, &approval).await,
+            other => Err(LifecycleError::NotFound(format!(
+                "no operation named {other:?} can be released by an Approval"
+            ))),
+        };
+        drop(guard);
+
+        let duration = started.elapsed().as_millis() as u64;
+        match result {
+            Ok(payload) => {
+                let body = payload.to_string();
+                let _ = app.state.finish_operation(
+                    &approval.operation_id,
+                    "succeeded",
+                    None,
+                    None,
+                    Some(&body),
+                );
+                record_audit(
+                    &app,
+                    audit::Append {
+                        project_id: approval.project_id.as_deref(),
+                        operation: &approval.operation,
+                        target: Some(&approval.target),
+                        params_hash: Some(&approval.params_hash),
+                        approval_id: Some(&approval.id),
+                        duration_ms: Some(duration),
+                        ..audit::Append::done(decided_by, &approval.operation, &request_id)
+                    },
+                );
+            }
+            Err(err) => {
+                let code = err.code();
+                let detail = err.detail();
+                let _ = app.state.finish_operation(
+                    &approval.operation_id,
+                    "failed",
+                    Some(&code),
+                    Some(&detail),
+                    None,
+                );
+                record_audit(
+                    &app,
+                    audit::Append {
+                        project_id: approval.project_id.as_deref(),
+                        operation: &approval.operation,
+                        target: Some(&approval.target),
+                        params_hash: Some(&approval.params_hash),
+                        approval_id: Some(&approval.id),
+                        result: "failed",
+                        error_code: Some(&code),
+                        duration_ms: Some(duration),
+                        ..audit::Append::done(decided_by, &approval.operation, &request_id)
+                    },
+                );
+            }
+        }
+    });
+}
+
+/// Delete a Project: stop it, destroy its runtime and volumes, delete its rows,
+/// and say what was found gone. The report is the point: "deleted" has to mean
+/// nothing is left.
+async fn run_delete(
+    app: &AppState,
+    approval: &ApprovalRecord,
+) -> std::result::Result<serde_json::Value, LifecycleError> {
+    let environment_id = approval.environment_id.clone().unwrap_or_default();
+    let project_id = approval.project_id.clone().unwrap_or_default();
+    let project = app.state.find_project(&project_id)?;
+    let mut notes: Vec<String> = Vec::new();
+
+    if let Some(record) = &project {
+        if let Err(err) = app.lifecycle.stop(&app.state, record).await {
+            // A runtime that cannot be stopped is reported, not hidden; the
+            // removal below still has to make it gone.
+            notes.push(format!("stop: {} {}", err.code(), err.detail()));
+        }
+        match app.lifecycle.backend.remove(&environment_id, false).await {
+            Ok(()) => {}
+            Err(agentify_backends::BackendError::NotProvisioned { .. }) => {}
+            Err(err) => return Err(LifecycleError::Backend(err)),
+        }
+    }
+
+    app.state.release_leases(&environment_id)?;
+    app.state.delete_project(&project_id)?;
+
+    let workspace = match &project {
+        Some(record) => PathBuf::from(&record.workspace_path),
+        None => crate::projects::workspace_path(&app.data_root, &project_id),
+    };
+    let project_dir = match workspace.parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => workspace.clone(),
+    };
+    let workspace_removed = match std::fs::remove_dir_all(&project_dir) {
+        Ok(()) => true,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                notes.push(format!("workspace: {err}"));
+            }
+            !workspace.exists()
+        }
+    };
+
+    // Verify rather than assume.
+    let rows_gone = app.state.find_project(&project_id)?.is_none();
+    let leases_gone = app.state.leases(&environment_id)?.is_empty();
+    let runtime = app.lifecycle.backend.status(&environment_id).await?;
+    let runtime_gone = runtime.state == agentify_backends::STATE_ABSENT;
+
+    let verified = rows_gone && leases_gone && runtime_gone && workspace_removed;
+    if !verified {
+        return Err(LifecycleError::Backend(
+            agentify_backends::BackendError::BackendUnavailable {
+                detail: format!(
+                    "the delete could not be verified: rows_gone={rows_gone} \
+                     leases_gone={leases_gone} runtime_gone={runtime_gone} \
+                     workspace_gone={workspace_removed}"
+                ),
+            },
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "project": approval.project_name,
+        "projectId": project_id,
+        "operation": approval.operation,
+        "removed": {
+            "rows": rows_gone,
+            "runtime": runtime_gone,
+            "volumes": runtime_gone,
+            "leases": leases_gone,
+            "workspace": workspace_removed,
+        },
+        "verified": verified,
+        "notes": notes,
+    }))
+}
+
+/// Reset an Environment: clear its data and restart it, keeping the Project.
+///
+/// The fake has no data model yet, so the Environment's runtime is dropped and
+/// built again — which is what clears its in-memory data. Ticket 09/10 replace
+/// this with real data semantics; the API and the Approval stay the same.
+async fn run_reset(
+    app: &AppState,
+    approval: &ApprovalRecord,
+) -> std::result::Result<serde_json::Value, LifecycleError> {
+    let environment_id = approval.environment_id.clone().unwrap_or_default();
+    let project_id = approval.project_id.clone().unwrap_or_default();
+    let record = app
+        .state
+        .find_project(&project_id)?
+        .ok_or_else(|| LifecycleError::NotFound(format!(
+            "no Project with id {project_id:?}; the reset cannot run"
+        )))?;
+
+    app.lifecycle.stop(&app.state, &record).await?;
+    match app.lifecycle.backend.remove(&environment_id, false).await {
+        Ok(()) => {}
+        Err(agentify_backends::BackendError::NotProvisioned { .. }) => {}
+        Err(err) => return Err(LifecycleError::Backend(err)),
+    }
+    app.state.release_leases(&environment_id)?;
+    let status = app.lifecycle.start(&app.state, &record).await?;
+    let mut payload = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "operation".to_string(),
+            serde_json::Value::String(approval.operation.clone()),
+        );
+        object.insert("reset".to_string(), serde_json::Value::Bool(true));
+    }
+    Ok(payload)
+}
+
+// ---- the activity feed -----------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ActivityQuery {
+    limit: Option<usize>,
+    /// Narrow to one Project.
+    project: Option<String>,
+}
+
+/// `GET /v1/activity`: the audit chain, newest first, with the chain's verdict.
+async fn activity(
+    State(app): State<Arc<AppState>>,
+    Query(query): Query<ActivityQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let project_id = match query.project.as_deref() {
+        Some(reference) => match app.state.find_project(reference) {
+            Ok(Some(record)) => Some(record.id),
+            // An unknown Project is an empty feed, not an error: the feed is a
+            // read over what happened, including things that no longer exist.
+            Ok(None) => Some(reference.to_string()),
+            Err(err) => {
+                return problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal",
+                    Some(format!("{err:#}")),
+                )
+            }
+        },
+        None => None,
+    };
+    match audit::page(&app.state, limit, project_id.as_deref()) {
+        Ok(page) => Json::<ActivityPage>(page).into_response(),
+        Err(err) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal",
+            Some(format!("{err:#}")),
+        ),
+    }
+}
+
+// ---- audit helpers ---------------------------------------------------------
+
+/// The id a mutation is recorded under, so a support question can be traced
+/// from one HTTP call to one audit entry.
+fn request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Append one audit entry. A failure to audit is loud but not fatal: the
+/// mutation already happened, and losing the caller's response would be worse.
+fn record_audit(app: &AppState, entry: audit::Append<'_>) {
+    if let Err(err) = audit::append(&app.state, entry) {
+        eprintln!("agentifyd: recording an audit entry failed: {err:#}");
+    }
+}
+
+/// Record a mutation that was refused before it changed anything.
+fn record_failure(
+    app: &AppState,
+    caller: &Caller,
+    request_id: &str,
+    operation: &str,
+    target: Option<&str>,
+    code: &str,
+    started: std::time::Instant,
+) {
+    record_audit(
+        app,
+        audit::Append {
+            project_id: None,
+            operation,
+            target,
+            params_hash: None,
+            approval_id: None,
+            result: "failed",
+            error_code: Some(code),
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+            request_id,
+            actor: AppState::actor(caller),
+        },
+    );
 }
 
 /// The Project and Environment a route named, or a typed `NotFound`.
