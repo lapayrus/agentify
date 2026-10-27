@@ -796,15 +796,27 @@ fn state_survives_a_daemon_restart_and_start_converges_again() {
     assert_eq!(code, 200, "the Project survived the restart: {project}");
     assert_eq!(project["name"], "hello-pg");
 
-    // It reports what it can actually see: the runtime did not survive, so the
-    // Environment is degraded rather than claimed running.
-    let (code, after_restart) = second.call("GET", "/v1/projects/hello-pg/environments/dev/status", None);
-    assert_eq!(code, 200, "{after_restart}");
+    // Adoption brings a running Environment back in the background. A daemon
+    // restart is not a stop: poll until it converges on its persisted leases.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let after_restart = loop {
+        let (code, status) = second.call("GET", "/v1/projects/hello-pg/environments/dev/status", None);
+        assert_eq!(code, 200, "{status}");
+        if status["environment"]["state"] == "running" {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "adoption did not bring the Environment back: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(after_restart["health"], "healthy", "{after_restart}");
     assert_eq!(
-        after_restart["environment"]["state"], "degraded",
-        "a lost runtime is degraded, not running: {after_restart}"
+        leased_ports(&after_restart),
+        ports,
+        "adoption reuses the persisted leases"
     );
-    assert_eq!(after_restart["health"], "unhealthy");
 
     // Starting again converges, and reacquires the same host ports.
     let (code, restarted) = second.call("POST", "/v1/projects/hello-pg/environments/dev/start", Some("{}"));

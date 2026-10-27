@@ -308,6 +308,27 @@ impl Lifecycle {
         Ok(self.view(record, STATE_STOPPED, HEALTH_UNKNOWN, &resources))
     }
 
+    /// Republish every Environment's routes from the database at startup.
+    ///
+    /// Routes are never read back from Caddy: they are recomputed from the
+    /// Manifest plus the leases on every start and stop. A daemon that comes
+    /// back after a restart therefore has to put them back itself, or a URL the
+    /// machine was serving would stop answering because the daemon did.
+    ///
+    /// Nothing is published when there is nothing to publish, so an idle machine
+    /// does not start an ingress it never asked for. A failure is the caller's
+    /// to report: the API still serves, and the next start republishes.
+    pub fn republish(&self, state: &State) -> Result<(), LifecycleError> {
+        let Some(ingress) = self.ingress.as_ref() else {
+            return Ok(());
+        };
+        let routes = routes::recovery_routes(state)?;
+        if routes.is_empty() {
+            return Ok(());
+        }
+        ingress.load_all(&routes).map_err(LifecycleError::Ingress)
+    }
+
     /// Withdraw an Environment's routes for good, without touching its runtime.
     ///
     /// Deleting the Environment is the only thing that deletes a route, so a
