@@ -149,6 +149,23 @@ impl IngressOptions {
     pub fn log_path(&self) -> PathBuf {
         self.data_dir.join("caddy.log")
     }
+
+    /// Where the admin endpoint of the running Caddy is recorded, so a daemon
+    /// that restarted after a crash can adopt it instead of fighting it for the
+    /// ports.
+    pub fn admin_record_path(&self) -> PathBuf {
+        self.data_dir.join("admin.json")
+    }
+}
+
+/// The admin endpoint recorded by a previous Caddy start, if it is still there.
+///
+/// A stale record is harmless: the caller tries to load the empty skeleton and
+/// falls through to a fresh start if the endpoint does not answer.
+fn recorded_admin(data_dir: &Path) -> Option<SocketAddr> {
+    let raw = std::fs::read_to_string(data_dir.join("admin.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value.get("admin")?.as_str()?.parse().ok()
 }
 
 fn parse_port(name: &str, raw: &str) -> Result<u16, IngressError> {
@@ -391,7 +408,22 @@ impl Ingress {
                 Ok(running)
             }
             AdminMode::Spawn => {
-                // Ports first: a conflict is the user's to fix, and it is not
+                // A previous daemon may have left a Caddy of ours running (a
+                // crash, a kill). Adopting it is what keeps the ports from
+                // becoming a conflict the user has to resolve by hand.
+                if let Some(admin) = recorded_admin(&self.options.data_dir) {
+                    let mut running = Running {
+                        admin: Arc::new(HttpAdminClient::new(admin)),
+                        instance: None,
+                        routes: Vec::new(),
+                        needs_load: false,
+                    };
+                    if self.load_config(&mut running, &[], mode).is_ok() {
+                        return Ok(running);
+                    }
+                }
+
+                // Ports next: a conflict is the user's to fix, and it is not
                 // worth starting a process to discover it.
                 PortProbe::check(&[self.options.http_port, self.options.https_port])?;
 
@@ -422,6 +454,12 @@ impl Ingress {
                     &self.options.log_path(),
                     admin_addr,
                 )?;
+                // Record the endpoint *after* a successful start, so a failed
+                // start cannot leave a stale record pointing at nothing.
+                let _ = write_json(
+                    &self.options.admin_record_path(),
+                    &json!({ "admin": admin_addr.to_string() }),
+                );
 
                 Ok(Running {
                     admin: Arc::new(HttpAdminClient::new(admin_addr)),
@@ -706,6 +744,9 @@ impl Ingress {
         if let Some(mut running) = inner.running.take() {
             if let Some(mut instance) = running.instance.take() {
                 instance.stop();
+                // Only our own process leaves a record behind; an adopted one
+                // keeps its record so the next daemon can adopt it too.
+                let _ = std::fs::remove_file(self.options.admin_record_path());
             }
         }
     }

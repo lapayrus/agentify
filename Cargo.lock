@@ -32,6 +32,7 @@ name = "agentify-daemon"
 version = "0.1.0"
 dependencies = [
  "agentify-backends",
+ "agentify-ingress",
  "agentify-manifest",
  "agentify-proto",
  "anyhow",

@@ -36,6 +36,15 @@ pub const LOG_TAIL_ENV: &str = "AGENTIFY_LOG_TAIL";
 /// Environment variable carrying the fake Backend's script as JSON.
 pub const FAKE_SCRIPT_ENV: &str = "AGENTIFY_FAKE_SCRIPT";
 
+/// Set to `off` to run the daemon without local ingress. Nothing is published
+/// at `<resource>.<project>.localhost`; tests that are not about ingress use it.
+pub const INGRESS_ENV: &str = "AGENTIFY_INGRESS";
+
+/// The explicit trust path: `install` or `remove`. Nothing touches a
+/// certificate store unless this is set (or the installer asks through the same
+/// call).
+pub const TRUST_ENV: &str = "AGENTIFY_TRUST";
+
 /// Default heartbeat period for `GET /v1/events`.
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
 
@@ -59,6 +68,15 @@ pub const BACKEND_FAKE: &str = "fake";
 
 /// One WSL2 distro per Project. Windows only.\r
 pub const BACKEND_WSL: &str = "wsl";
+
+/// An explicit trust action, taken at startup because a human asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustAction {
+    /// Install the local root for the current user.
+    Install,
+    /// Remove it, for uninstall.
+    Remove,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -87,6 +105,15 @@ pub struct Config {
     pub exec_timeout: Duration,
     /// Default log tail.
     pub log_tail: usize,
+    /// Local ingress, or `None` to run without publishing anything.
+    ///
+    /// Off for an in-process test unless it asks: starting Caddy binds real
+    /// ports and writes a real config, which is exactly what a test that is not
+    /// about ingress must not do. The binary turns it on.
+    pub ingress: Option<agentify_ingress::IngressOptions>,
+    /// An explicit, one-shot trust action: the manual path a human or the
+    /// installer opts into.
+    pub trust_action: Option<TrustAction>,
 }
 
 impl Config {
@@ -104,6 +131,8 @@ impl Config {
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             exec_timeout: DEFAULT_EXEC_TIMEOUT,
             log_tail: DEFAULT_LOG_TAIL,
+            ingress: None,
+            trust_action: None,
         }
     }
 
@@ -141,7 +170,44 @@ impl Config {
                 config.backend_script = Some(raw);
             }
         }
+        if let Ok(raw) = std::env::var(TRUST_ENV) {
+            config.trust_action = match raw.trim() {
+                "" => None,
+                "install" => Some(TrustAction::Install),
+                "remove" | "uninstall" => Some(TrustAction::Remove),
+                other => anyhow::bail!(
+                    "{TRUST_ENV}={other:?} is not a trust action; use `install` or `remove`"
+                ),
+            };
+        }
+        let ingress_enabled = match std::env::var(INGRESS_ENV) {
+            Ok(raw) => !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            ),
+            Err(_) => true,
+        };
+        if ingress_enabled {
+            let mut ingress = agentify_ingress::IngressOptions::new(&config.data_root);
+            ingress
+                .apply_env()
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            config.ingress = Some(ingress);
+        }
         Ok(config)
+    }
+
+    /// Publish `<resource>.<project>.localhost` through Caddy with explicit
+    /// options. Tests use this to attach to a fake admin endpoint.
+    pub fn with_ingress(mut self, ingress: agentify_ingress::IngressOptions) -> Self {
+        self.ingress = Some(ingress);
+        self
+    }
+
+    /// Take an explicit trust action at startup.
+    pub fn with_trust_action(mut self, action: TrustAction) -> Self {
+        self.trust_action = Some(action);
+        self
     }
 
     /// Drive a scripted fake Backend. Tests use this.

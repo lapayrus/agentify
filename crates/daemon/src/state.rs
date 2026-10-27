@@ -699,6 +699,26 @@ impl State {
         })
     }
 
+    /// Remove a Project and everything the daemon stores for it.
+    ///
+    /// No schema change: the rows already cascade, and the explicit deletes keep
+    /// the guarantee visible even if a caller turns foreign keys off.
+    pub fn delete_project(&self, project_id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute(
+                "DELETE FROM port_leases WHERE environment_id IN
+                     (SELECT id FROM environments WHERE project_id = ?1)",
+                [project_id],
+            )?;
+            transaction.execute("DELETE FROM resources WHERE project_id = ?1", [project_id])?;
+            transaction.execute("DELETE FROM environments WHERE project_id = ?1", [project_id])?;
+            let removed = transaction.execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
+            transaction.commit()?;
+            Ok(removed > 0)
+        })
+    }
+
     // ---- operations --------------------------------------------------------
 
     pub fn create_operation(&self, operation: &OperationRecord) -> Result<()> {

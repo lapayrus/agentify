@@ -12,6 +12,7 @@ pub mod config;
 pub mod discovery;
 pub mod fixtures;
 pub mod health;
+pub mod ingress;
 pub mod lifecycle;
 pub mod ports;
 pub mod projects;
