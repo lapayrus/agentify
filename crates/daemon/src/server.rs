@@ -274,9 +274,33 @@ async fn prepare(config: &Config) -> Result<(AppState, TcpListener, Discovery)> 
         config.backend_script.as_deref(),
         &config.data_root,
     )?;
+
+    let ingress = config
+        .ingress
+        .clone()
+        .map(|options| Arc::new(agentify_ingress::Ingress::new(options)));
+
+    // Trust is never changed implicitly: an explicit startup action is the only
+    // path that touches the user's certificate store.
+    if let (Some(ingress), Some(action)) = (ingress.clone(), config.trust_action) {
+        ingress
+            .ensure_started()
+            .map_err(|err| anyhow::anyhow!("starting ingress for the trust action: {err}"))?;
+        let installer = agentify_ingress::WindowsTrustInstaller::new();
+        match action {
+            crate::config::TrustAction::Install => ingress
+                .install_trust(&installer)
+                .map_err(|err| anyhow::anyhow!("installing the local CA root: {err}"))?,
+            crate::config::TrustAction::Remove => ingress
+                .remove_trust(&installer)
+                .map_err(|err| anyhow::anyhow!("removing the local CA root: {err}"))?,
+        };
+    }
+
     let lifecycle = Arc::new(Lifecycle {
         backend,
         ports: crate::ports::PortRegistry::new(config.lease_range),
+        ingress,
         probe_timeout: config.probe_timeout,
         exec_timeout: config.exec_timeout,
     });
@@ -1665,6 +1689,9 @@ async fn run_delete(
 
     app.state.release_leases(&environment_id)?;
     app.state.delete_project(&project_id)?;
+    // Deleting the Environment is the only thing that deletes its routes; the
+    // stop above replaced them with the 503, so they are withdrawn here.
+    app.lifecycle.withdraw_routes(&environment_id)?;
 
     let workspace = match &project {
         Some(record) => PathBuf::from(&record.workspace_path),

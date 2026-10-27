@@ -689,6 +689,10 @@ impl Process {
         std::fs::create_dir_all(home).expect("data root");
         let child = Command::new(env!("CARGO_BIN_EXE_agentifyd"))
             .env("AGENTIFY_HOME", home)
+            // This test is about restart persistence, not ingress: without the
+            // switch the binary would try to start Caddy and `start` would be a
+            // 503 on a machine that has none.
+            .env("AGENTIFY_INGRESS", "off")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

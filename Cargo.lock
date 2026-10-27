@@ -32,6 +32,7 @@ name = "agentify-daemon"
 version = "0.1.0"
 dependencies = [
  "agentify-backends",
+ "agentify-ingress",
  "agentify-manifest",
  "agentify-proto",
  "anyhow",
@@ -50,6 +51,16 @@ dependencies = [
  "uuid",
  "windows",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "agentify-ingress"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

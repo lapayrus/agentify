@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentify_backends::{Backend, BackendError, ExecChunk, ExecSpec, LogOptions, LogStream};
+use agentify_ingress::{Ingress, IngressError};
 use agentify_proto::{
     BackendRef, Cost, EnvironmentStatus, EnvironmentView, ExecRequest, ExecResponse, LeasedPortView,
     LogLineView, ResourceStatsView, ResourceStatusView, StatsResponse, HEALTH_HEALTHY,
@@ -29,6 +30,7 @@ use anyhow::Result as AnyResult;
 
 use crate::clock;
 use crate::health;
+use crate::ingress as routes;
 use crate::ports::{PortError, PortRegistry};
 use crate::projects;
 use crate::state::{EnvironmentRecord, LeaseRecord, ProjectRecord, State, StateUpdate};
@@ -48,6 +50,8 @@ pub enum LifecycleError {
     Backend(BackendError),
     /// No host port could be leased.
     Port { port: u16, holder: String },
+    /// Local ingress could not be configured: a port conflict, or no Caddy.
+    Ingress(IngressError),
     /// The store failed.
     Store(anyhow::Error),
 }
@@ -60,6 +64,7 @@ impl LifecycleError {
             LifecycleError::Validation { .. } => "ValidationFailed".to_string(),
             LifecycleError::Backend(err) => err.code().to_string(),
             LifecycleError::Port { .. } => "PortUnavailable".to_string(),
+            LifecycleError::Ingress(err) => err.code().to_string(),
             LifecycleError::Store(_) => "Internal".to_string(),
         }
     }
@@ -70,6 +75,7 @@ impl LifecycleError {
             LifecycleError::Validation { .. } => 422,
             LifecycleError::Backend(err) => err.status(),
             LifecycleError::Port { .. } => 409,
+            LifecycleError::Ingress(err) => err.status(),
             LifecycleError::Store(_) => 500,
         }
     }
@@ -82,6 +88,7 @@ impl LifecycleError {
             LifecycleError::Port { port, holder } => {
                 format!("no host port could be leased: port {port} is held by {holder}")
             }
+            LifecycleError::Ingress(err) => err.detail(),
             LifecycleError::Store(err) => format!("{err:#}"),
         }
     }
@@ -110,6 +117,12 @@ impl From<PortError> for LifecycleError {
     }
 }
 
+impl From<IngressError> for LifecycleError {
+    fn from(err: IngressError) -> Self {
+        LifecycleError::Ingress(err)
+    }
+}
+
 impl From<anyhow::Error> for LifecycleError {
     fn from(err: anyhow::Error) -> Self {
         LifecycleError::Store(err)
@@ -121,6 +134,9 @@ impl From<anyhow::Error> for LifecycleError {
 pub struct Lifecycle {
     pub backend: Arc<dyn Backend>,
     pub ports: PortRegistry,
+    /// Local ingress, or `None` when the daemon runs without publishing
+    /// anything. Routes are pushed here on every start and stop.
+    pub ingress: Option<Arc<Ingress>>,
     /// How long the daemon waits for one leased port to answer.
     pub probe_timeout: Duration,
     /// Upper bound the daemon puts on one `exec`.
@@ -135,6 +151,22 @@ impl Lifecycle {
             version: info.version,
             platform: info.platform,
         }
+    }
+
+    /// Publish one Environment's routes, or keep them answering 503.
+    fn publish(
+        &self,
+        record: &ProjectRecord,
+        leases: &[LeaseRecord],
+        running: bool,
+    ) -> Result<(), LifecycleError> {
+        let Some(ingress) = self.ingress.as_ref() else {
+            return Ok(());
+        };
+        let routes = routes::environment_routes(record, leases, running)?;
+        ingress
+            .sync_environment(&record.environment.id, &routes)
+            .map_err(LifecycleError::Ingress)
     }
 
     /// Bring an Environment up. Idempotent and convergent.
@@ -210,12 +242,25 @@ impl Lifecycle {
         }
 
         let resources = self.probe(state, record, &leases).await?;
+
+        // Publish before claiming health: an Environment whose URLs are not
+        // answering is not "up", and a port conflict at this point is a typed
+        // `PortUnavailable` rather than a start that quietly half-happened.
+        if let Err(err) = self.publish(record, &leases, true) {
+            self.mark(&state, &environment_id, STATE_RUNNING, STATE_DEGRADED, HEALTH_UNHEALTHY)?;
+            return Err(err);
+        }
+
         let (health, observed) = summarise(&resources, STATE_RUNNING);
         self.mark(&state, &environment_id, STATE_RUNNING, &observed, &health)?;
         Ok(self.view(record, &observed, &health, &resources))
     }
 
     /// Stop the workloads and release the leases. Idempotent.
+    ///
+    /// The routes stay, and switch to the daemon's 503: a bookmarked URL must
+    /// keep answering after a stop, and must only disappear when the
+    /// Environment does.
     pub async fn stop(
         &self,
         state: &State,
@@ -226,10 +271,54 @@ impl Lifecycle {
             self.mark(&state, &environment_id, STATE_STOPPED, STATE_FAILED, HEALTH_UNHEALTHY)?;
             return Err(err.into());
         }
+        // Publish the stopped page while the leases still exist, so the routes
+        // are keyed off the same set of ports the Environment had.
+        let leases = state.leases(&environment_id)?;
+        let published = self.publish(record, &leases, false);
         self.ports.release_all(state, &environment_id)?;
         self.mark(&state, &environment_id, STATE_STOPPED, STATE_STOPPED, HEALTH_UNKNOWN)?;
+        published?;
         let resources = stopped_resources(record);
         Ok(self.view(record, STATE_STOPPED, HEALTH_UNKNOWN, &resources))
+    }
+
+    /// Withdraw an Environment's routes for good, without touching its runtime.
+    ///
+    /// Deleting the Environment is the only thing that deletes a route, so a
+    /// path that removes the rows itself (the Approval-driven delete) still has
+    /// to call this: a stop only replaces the route with the 503.
+    pub fn withdraw_routes(&self, environment_id: &str) -> Result<(), LifecycleError> {
+        let Some(ingress) = self.ingress.as_ref() else {
+            return Ok(());
+        };
+        ingress
+            .remove_environment(environment_id)
+            .map_err(LifecycleError::Ingress)
+    }
+
+    /// Remove an Environment for good: the runtime, its leases, and its routes.
+    ///
+    /// Deleting an Environment is the only thing that deletes a route.
+    pub async fn remove(
+        &self,
+        state: &State,
+        record: &ProjectRecord,
+    ) -> Result<(), LifecycleError> {
+        let environment_id = record.environment.id.clone();
+        self.backend
+            .remove(&environment_id, false)
+            .await
+            .map_err(LifecycleError::Backend)?;
+        self.withdraw_routes(&environment_id)?;
+        self.ports.release_all(state, &environment_id)?;
+        state
+            .delete_project(&record.id)
+            .map_err(LifecycleError::Store)?;
+        let workspace = std::path::PathBuf::from(&record.workspace_path);
+        if let Some(project_dir) = workspace.parent() {
+            let _ = std::fs::remove_dir_all(project_dir);
+        }
+        Ok(())
     }
 
     /// Read the Environment's status, probing the leased ports. This persists

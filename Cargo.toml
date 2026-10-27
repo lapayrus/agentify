@@ -4,6 +4,7 @@ members = [
   "crates/proto",
   "crates/manifest",
   "crates/backends",
+  "crates/ingress",
   "crates/daemon",
   "crates/mcp",
   "crates/cli",
@@ -21,6 +22,7 @@ publish = false
 
 [workspace.dependencies]
 agentify-backends = { path = "crates/backends" }
+agentify-ingress = { path = "crates/ingress" }
 agentify-manifest = { path = "crates/manifest" }
 agentify-proto = { path = "crates/proto" }
 anyhow = "1.0"
