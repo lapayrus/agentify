@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The value the bundled fixture imports for `api-token`.
+const FIXTURE_API_TOKEN: &str = "fixture-api-token-from-the-host";
+
 /// A daemon booted by a test, shut down on drop.
 struct Daemon {
     inner: Option<agentify_daemon::RunningDaemon>,
@@ -27,6 +30,10 @@ impl Daemon {
     }
 
     fn boot_with(config: Config) -> Daemon {
+        // The bundled fixture imports one secret from the host environment. A
+        // test supplies it explicitly, so the suite does not depend on how the
+        // machine's shell is set up.
+        let config = config.with_secret_env([("HELLO_API_TOKEN", FIXTURE_API_TOKEN)]);
         Daemon {
             inner: Some(agentify_daemon::start_in_background(config).expect("boot daemon")),
         }
@@ -689,6 +696,9 @@ impl Process {
         std::fs::create_dir_all(home).expect("data root");
         let child = Command::new(env!("CARGO_BIN_EXE_agentifyd"))
             .env("AGENTIFY_HOME", home)
+            // The fixture imports one secret from the host environment.
+            .env("HELLO_API_TOKEN", FIXTURE_API_TOKEN)
+            .env("AGENTIFY_SECRET_STORE", "memory")
             // This test is about restart persistence, not ingress: without the
             // switch the binary would try to start Caddy and `start` would be a
             // 503 on a machine that has none.

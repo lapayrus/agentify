@@ -164,6 +164,29 @@ impl DaemonClient {
         parse(response, &url)
     }
 
+    /// `PATCH <path>` with a JSON body and parse the JSON response.
+    pub fn patch_json(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
+        let discovery = self.discovery()?;
+        let url = format!("{}{}", discovery.url, path);
+        let response = ureq::request("PATCH", &url)
+            .set("Authorization", &format!("Bearer {}", discovery.token))
+            .set("Content-Type", "application/json")
+            .timeout(REQUEST_TIMEOUT)
+            .send_string(&body.to_string());
+        parse(response, &url)
+    }
+
+    /// `DELETE <path>` and parse the JSON response.
+    pub fn delete_json(&self, path: &str) -> Result<Value, ClientError> {
+        let discovery = self.discovery()?;
+        let url = format!("{}{}", discovery.url, path);
+        let response = ureq::request("DELETE", &url)
+            .set("Authorization", &format!("Bearer {}", discovery.token))
+            .timeout(REQUEST_TIMEOUT)
+            .call();
+        parse(response, &url)
+    }
+
     /// `GET /v1/whoami`.
     pub fn whoami(&self) -> Result<Value, ClientError> {
         self.get_json("/v1/whoami")
@@ -372,6 +395,43 @@ impl DaemonClient {
             path.push_str(&format!("?timeoutMs={timeout_ms}"));
         }
         self.get_json(&path)
+    }
+
+    fn secrets_path(project: &str) -> String {
+        format!("/v1/projects/{}/secrets", encode_segment(project))
+    }
+
+    /// `GET /v1/projects/{project}/secrets`: metadata only, never a value.
+    pub fn list_secrets(&self, project: &str) -> Result<Value, ClientError> {
+        self.get_json(&Self::secrets_path(project))
+    }
+
+    /// `POST /v1/projects/{project}/secrets` with a `name` and one source.
+    pub fn create_secret(&self, project: &str, body: &Value) -> Result<Value, ClientError> {
+        self.post_json(&Self::secrets_path(project), body)
+    }
+
+    /// `PATCH /v1/projects/{project}/secrets/{name}`: replace a value.
+    pub fn update_secret(
+        &self,
+        project: &str,
+        name: &str,
+        body: &Value,
+    ) -> Result<Value, ClientError> {
+        self.patch_json(
+            &format!("{}/{}", Self::secrets_path(project), encode_segment(name)),
+            body,
+        )
+    }
+
+    /// `DELETE /v1/projects/{project}/secrets/{name}`: only one the Manifest no
+    /// longer references.
+    pub fn delete_secret(&self, project: &str, name: &str) -> Result<Value, ClientError> {
+        self.delete_json(&format!(
+            "{}/{}",
+            Self::secrets_path(project),
+            encode_segment(name)
+        ))
     }
 }
 

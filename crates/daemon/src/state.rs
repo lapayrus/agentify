@@ -14,7 +14,7 @@ use crate::auth;
 use crate::clock;
 
 /// Schema version the running binary expects.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Ordered migrations. Each entry is applied exactly once, inside a
 /// transaction, and recorded in `schema_migrations`.
@@ -197,6 +197,25 @@ const MIGRATIONS: &[(i64, &str)] = &[
     BEGIN
         SELECT RAISE(ABORT, 'the audit log is append-only');
     END;
+    "#,
+    ),
+    (
+        7,
+        r#"
+    -- A Project's secret *values* live in the OS credential manager, never here.
+    -- This table is metadata only: which Project has which secret, where the value
+    -- came from (`generate`, `fromEnv`, or `literal`), and when it was written.
+    -- There is no column a value could be stored in, so the state database is
+    -- safe to copy and there is nothing to leak.
+    CREATE TABLE secrets_metadata (
+        project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        name        TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        source_ref  TEXT,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        PRIMARY KEY (project_id, name)
+    );
     "#,
     ),
 ];
@@ -394,6 +413,31 @@ pub struct NewProject {
     pub environment_name: String,
     /// `(id, name, kind)` per Resource.
     pub resources: Vec<(String, String, String)>,
+    /// The secrets the Manifest declared. Metadata only: the values go to the
+    /// credential manager.
+    pub secrets: Vec<NewSecret>,
+}
+
+/// A secret's metadata on its way in. There is no value field on purpose: the
+/// only place a value is stored is the OS credential manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSecret {
+    pub name: String,
+    /// `generate`, `fromEnv`, or `literal`.
+    pub source_kind: String,
+    /// The host variable a `fromEnv` import came from.
+    pub source_ref: Option<String>,
+}
+
+/// A secret's metadata as it was stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretRecord {
+    pub project_id: String,
+    pub name: String,
+    pub source_kind: String,
+    pub source_ref: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 pub struct State {
@@ -618,6 +662,22 @@ impl State {
                         project.environment_id,
                         name,
                         kind,
+                        project.created_at,
+                    ],
+                )?;
+            }
+            // The Manifest's secrets are metadata here; their values were
+            // resolved and stored in the credential manager before this call.
+            for secret in &project.secrets {
+                tx.execute(
+                    "INSERT INTO secrets_metadata
+                         (project_id, name, source_kind, source_ref, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    rusqlite::params![
+                        project.id,
+                        secret.name,
+                        secret.source_kind,
+                        secret.source_ref,
                         project.created_at,
                     ],
                 )?;
@@ -1120,6 +1180,89 @@ impl State {
         })
     }
 
+    // ---- secrets -----------------------------------------------------------
+
+    /// A Project's secrets, by name. Metadata only: the values are elsewhere.
+    pub fn secrets(&self, project_id: &str) -> Result<Vec<SecretRecord>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "{SECRET_SELECT} WHERE project_id = ?1 ORDER BY name"
+            ))?;
+            let rows = statement
+                .query_map([project_id], secret_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// One secret's metadata, by Project and name.
+    pub fn find_secret(&self, project_id: &str, name: &str) -> Result<Option<SecretRecord>> {
+        self.with_conn(|conn| {
+            Ok(conn
+                .query_row(
+                    &format!("{SECRET_SELECT} WHERE project_id = ?1 AND name = ?2"),
+                    rusqlite::params![project_id, name],
+                    secret_row,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Record a secret's metadata. Returns `false` when the name is already
+    /// taken, so the caller can report `AlreadyExists` without racing on a
+    /// unique-constraint message.
+    pub fn insert_secret(&self, secret: &SecretRecord) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "INSERT OR IGNORE INTO secrets_metadata
+                     (project_id, name, source_kind, source_ref, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    secret.project_id,
+                    secret.name,
+                    secret.source_kind,
+                    secret.source_ref,
+                    secret.created_at,
+                    secret.updated_at,
+                ],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Replace a secret's metadata after its value changed. The creation time
+    /// stays put: a Project's history is not rewritten by a value update.
+    pub fn update_secret(&self, secret: &SecretRecord) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE secrets_metadata
+                 SET source_kind = ?3, source_ref = ?4, updated_at = ?5
+                 WHERE project_id = ?1 AND name = ?2",
+                rusqlite::params![
+                    secret.project_id,
+                    secret.name,
+                    secret.source_kind,
+                    secret.source_ref,
+                    secret.updated_at,
+                ],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Forget a secret's metadata. The value is deleted from the store by the
+    /// caller, which is what makes the order matter: a row without a value is
+    /// recoverable, a value without a row is not.
+    pub fn delete_secret(&self, project_id: &str, name: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "DELETE FROM secrets_metadata WHERE project_id = ?1 AND name = ?2",
+                rusqlite::params![project_id, name],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     // ---- audit -------------------------------------------------------------
 
     /// The hash of the newest audit entry, or the genesis hash when there is
@@ -1213,6 +1356,20 @@ const APPROVAL_SELECT: &str = "SELECT id, operation_id, operation, project_id, p
 const AUDIT_SELECT: &str = "SELECT seq, at, actor_kind, actor_id, token_id, project_id, operation,
         target, params_hash, approval_id, result, error_code, duration_ms, request_id, prev_hash,
         hash FROM audit";
+
+const SECRET_SELECT: &str = "SELECT project_id, name, source_kind, source_ref, created_at,
+        updated_at FROM secrets_metadata";
+
+fn secret_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretRecord> {
+    Ok(SecretRecord {
+        project_id: row.get(0)?,
+        name: row.get(1)?,
+        source_kind: row.get(2)?,
+        source_ref: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
 
 fn approval_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRecord> {
     let decided_kind: Option<String> = row.get(16)?;
