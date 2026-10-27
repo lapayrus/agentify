@@ -3,7 +3,9 @@
 // the daemon (through the Rust commands) and paints what it is told.
 //
 // Live logs are a cursor, not a second source of truth: the shell asks for
-// lines newer than `nextSince` and appends them.
+// lines newer than `nextSince` and appends them. The same holds for the
+// Approval inbox and the activity feed: both are reads over what the daemon
+// recorded, and both are re-read after every decision.
 
 import { render, projectsOf } from "./render.js";
 
@@ -11,6 +13,10 @@ const POLL_INTERVAL_MS = 5000;
 const LOGS_INTERVAL_MS = 1500;
 const LOG_BUFFER = 500;
 const DEFAULT_LOG_TAIL = 100;
+/** How many decided Approvals the card column keeps in view. */
+const APPROVAL_LIMIT = 12;
+/** How many audit entries the feed shows. */
+const ACTIVITY_LIMIT = 40;
 const app = document.getElementById("app");
 
 let status = { state: "loading" };
@@ -18,6 +24,14 @@ let selected = null;
 let tab = "overview";
 /** { status, stats, logs: { lines, nextSince, following, error }, pending, error } */
 let view = { status: null, stats: null, logs: { lines: [], following: false }, pending: null };
+/** The right column: the Approval inbox and the activity feed. */
+let inbox = {
+  approvals: [],
+  activity: null,
+  decision: null,
+  approvalsError: null,
+  activityError: null,
+};
 let logsTimer = null;
 
 function bridge() {
@@ -123,9 +137,61 @@ async function followLogs({ reset = false } = {}) {
   }
 }
 
+/**
+ * The Approval inbox and the activity feed. Both are reads, so a failure here
+ * is reported beside the column rather than replacing the Project pane.
+ */
+async function loadInbox() {
+  if (!bridge()) {
+    return;
+  }
+  try {
+    const approvals = await call("approvals", { state: "all", limit: APPROVAL_LIMIT });
+    inbox = {
+      ...inbox,
+      approvals: Array.isArray(approvals?.approvals) ? approvals.approvals : [],
+      approvalsError: null,
+    };
+  } catch (error) {
+    inbox = { ...inbox, approvals: [], approvalsError: String(error) };
+  }
+  try {
+    inbox = { ...inbox, activity: await call("activity", { limit: ACTIVITY_LIMIT }), activityError: null };
+  } catch (error) {
+    inbox = { ...inbox, activity: null, activityError: String(error) };
+  }
+}
+
+/**
+ * Approve or deny. The daemon is the gate — approving asks the OS for the
+ * gesture — so the shell only reports what came back and re-reads both lists.
+ */
+async function decide(action, approvalId) {
+  inbox = { ...inbox, decision: { id: approvalId, action }, approvalsError: null };
+  paint();
+  try {
+    const result = await call("decide_approval", {
+      approval: approvalId,
+      approve: action === "approve",
+    });
+    if (result && result.ok === false) {
+      inbox = {
+        ...inbox,
+        approvalsError: result.detail ?? `${action} failed (${result.code ?? "unknown"})`,
+      };
+    }
+  } catch (error) {
+    inbox = { ...inbox, approvalsError: String(error) };
+  }
+  inbox = { ...inbox, decision: null };
+  await loadInbox();
+  await loadView();
+  paint();
+}
+
 function paint() {
   app.dataset.connection = status.state;
-  app.innerHTML = render({ ...status, selected, view });
+  app.innerHTML = render({ ...status, selected, view, inbox });
 
   for (const button of app.querySelectorAll("[data-project]")) {
     button.addEventListener("click", () => {
@@ -148,6 +214,12 @@ function paint() {
         return;
       }
       act(action);
+    });
+  }
+
+  for (const button of app.querySelectorAll("[data-decision]")) {
+    button.addEventListener("click", () => {
+      decide(button.dataset.decision, button.dataset.approval);
     });
   }
 
@@ -185,6 +257,7 @@ async function refresh() {
   reconcileSelection();
   if (status.state === "connected") {
     await loadView();
+    await loadInbox();
   }
   paint();
 }

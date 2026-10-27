@@ -135,3 +135,117 @@ fn start_and_stop_from_the_shell_go_through_the_same_api() {
 
     daemon.shutdown().expect("stop daemon");
 }
+
+#[test]
+fn the_shell_shows_the_approval_inbox_and_decides_through_the_same_api() {
+    use agentify_shell::{activity_for, approvals_for, decide_approval_for};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut daemon = agentify_daemon::start_in_background(agentify_daemon::Config::new(temp.path()))
+        .expect("boot daemon");
+    ureq::post(&format!("{}/v1/projects", daemon.base_url()))
+        .set("Authorization", &format!("Bearer {}", daemon.token()))
+        .set("Content-Type", "application/json")
+        .send_string(&serde_json::json!({ "fixture": "hello-pg" }).to_string())
+        .expect("create the fixture Project");
+
+    // An Agent asks for a destructive call: it lands in the inbox, nothing more.
+    let accepted: serde_json::Value = serde_json::from_str(
+        &ureq::request(
+            "DELETE",
+            &format!("{}/v1/projects/hello-pg", daemon.base_url()),
+        )
+        .set("Authorization", &format!("Bearer {}", daemon.token()))
+        .call()
+        .expect("DELETE the Project")
+        .into_string()
+        .expect("body"),
+    )
+    .expect("202 JSON");
+    let approval = accepted["approvalId"].as_str().expect("approval id").to_string();
+    let operation = accepted["operationId"].as_str().expect("operation id").to_string();
+    let params = accepted["paramsHash"].as_str().expect("params hash").to_string();
+
+    // The card the shell renders comes straight from `GET /v1/approvals`.
+    let inbox = approvals_for(temp.path(), None, None).expect("the inbox");
+    let cards = inbox["approvals"].as_array().expect("approvals");
+    assert_eq!(cards.len(), 1, "{inbox}");
+    assert_eq!(cards[0]["operation"], "delete_project");
+    assert_eq!(cards[0]["target"], "hello-pg");
+    assert_eq!(cards[0]["state"], "pending");
+    assert_eq!(cards[0]["requester"]["kind"], "agent");
+    assert_eq!(cards[0]["paramsHash"], params.as_str());
+    assert!(!cards[0]["parameters"].as_array().expect("parameters").is_empty());
+    assert!(cards[0]["expiresAt"].is_string());
+    assert_eq!(
+        approvals_for(temp.path(), None, Some(1))
+            .expect("a bounded inbox")["approvals"]
+            .as_array()
+            .expect("approvals")
+            .len(),
+        1,
+        "the limit is honoured"
+    );
+
+    // The feed the shell renders is the audit chain, and it verifies.
+    let feed = activity_for(temp.path(), Some(50)).expect("the feed");
+    assert_eq!(feed["integrity"]["verified"], true, "{feed}");
+    let entries = feed["entries"].as_array().expect("entries");
+    assert!(
+        entries.iter().any(|entry| entry["operation"] == "delete_project"
+            && entry["result"] == "requested"
+            && entry["actor"]["kind"] == "agent"
+            && entry["approvalId"] == approval.as_str()),
+        "the request is in the feed: {feed}"
+    );
+
+    // Approving without the OS gesture is refused, and the shell reports why.
+    let refused = decide_approval_for(temp.path(), &approval, true, None, None);
+    assert!(!refused.ok, "an Agent cannot produce the gesture: {refused:?}");
+    assert_eq!(refused.code.as_deref(), Some("ApprovalRequired"));
+    assert!(refused.detail.is_some());
+
+    // Denying needs no gesture, and leaves the Project exactly as it was.
+    let denied = decide_approval_for(
+        temp.path(),
+        &approval,
+        false,
+        Some(&operation),
+        Some(&params),
+    );
+    assert!(denied.ok, "deny failed: {denied:?}");
+    assert_eq!(denied.approval.as_ref().expect("approval")["state"], "denied");
+    assert_eq!(
+        denied.approval.as_ref().expect("approval")["decidedBy"]["kind"],
+        "human"
+    );
+    assert_eq!(
+        denied.operation.as_ref().expect("operation")["errorCode"],
+        "ApprovalDenied"
+    );
+    assert!(
+        matches!(
+            status_for(temp.path()),
+            DaemonStatus::Connected { ref projects, .. } if projects.len() == 1
+        ),
+        "a denial leaves the Project alone"
+    );
+    assert!(
+        approvals_for(temp.path(), None, None)
+            .expect("the inbox")
+            ["approvals"]
+            .as_array()
+            .expect("approvals")
+            .is_empty(),
+        "the inbox holds pending work only"
+    );
+    let decided = approvals_for(temp.path(), Some("all"), None).expect("all Approvals");
+    assert_eq!(decided["approvals"][0]["state"], "denied");
+
+    // A decision on an Approval that does not exist is a typed failure.
+    let missing = decide_approval_for(temp.path(), "nope", false, None, None);
+    assert!(!missing.ok);
+    assert_eq!(missing.code.as_deref(), Some("NotFound"));
+
+    daemon.shutdown().expect("stop daemon");
+}
