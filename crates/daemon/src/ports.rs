@@ -98,12 +98,17 @@ impl PortRegistry {
     }
 
     /// Lease a host port for `(environment, resource, guest_port)`.
+    ///
+    /// `attempt` salts the preferred port: after a bind race the caller retries
+    /// with the next attempt and gets a different part of the range, instead of
+    /// hammering the port it just lost.
     pub fn allocate(
         &self,
         state: &State,
         environment_id: &str,
         resource: &str,
         guest_port: u16,
+        attempt: u32,
     ) -> Result<u16, PortError> {
         let existing = state
             .leases(environment_id)
@@ -123,7 +128,9 @@ impl PortRegistry {
             }
         }
         let span = self.range.span();
-        let offset = fnv1a(environment_id, resource, guest_port) % span;
+        let offset = fnv1a(environment_id, resource, guest_port).wrapping_add(
+            attempt.wrapping_mul(0x9e37_79b9),
+        ) % span;
         for step in 0..span {
             let port = (u32::from(self.range.start) + ((offset + step) % span)) as u16;
             if is_privileged(port) || Some(port) == preferred {
@@ -261,7 +268,7 @@ mod tests {
         let registry = PortRegistry::new(PortRange::new(1, 1));
         // Port 1 is below the leaseable floor, so nothing can be leased.
         let err = registry
-            .allocate(&state, "env-1", "web", 3000)
+            .allocate(&state, "env-1", "web", 3000, 0)
             .expect_err("no port in range");
         assert!(matches!(err, PortError::Unavailable { .. }));
     }

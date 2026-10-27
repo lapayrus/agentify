@@ -33,6 +33,10 @@ use crate::ports::{PortError, PortRegistry};
 use crate::projects;
 use crate::state::{EnvironmentRecord, LeaseRecord, ProjectRecord, State, StateUpdate};
 
+/// How many parts of the lease range a start may try when something outside the
+/// registry binds a port between the check and the bind.
+const LEASE_ATTEMPTS: u32 = 3;
+
 /// Why a lifecycle call failed.
 #[derive(Debug)]
 pub enum LifecycleError {
@@ -150,35 +154,59 @@ impl Lifecycle {
         )?;
 
         // Lease before the Backend runs: the port is what the Backend binds and
-        // what the daemon probes.
-        let mut spec = projects::environment_spec(record)?;
+        // what the daemon probes. A bind race with another process on the
+        // machine is retried on a fresh part of the range; a port held by
+        // another Environment is a typed failure, not a retry.
+        let base = projects::environment_spec(record)?;
         let requests = projects::port_requests(record)?;
         let mut leases = Vec::new();
-        for (resource, guest_port) in requests {
-            match self
-                .ports
-                .allocate(state, &environment_id, &resource, guest_port)
-            {
-                Ok(host_port) => {
-                    spec.lease(resource.clone(), guest_port, host_port);
-                    leases.push(LeaseRecord {
-                        environment_id: environment_id.clone(),
-                        resource,
-                        guest_port,
-                        host_port,
-                        created_at: clock::now_rfc3339(),
-                    });
+        let mut spec = base.clone();
+        for attempt in 0..LEASE_ATTEMPTS {
+            if attempt > 0 {
+                // The previous attempt's ports are not usable; give them back.
+                self.ports.release_all(state, &environment_id)?;
+                spec = base.clone();
+            }
+            leases.clear();
+            let mut port_failure = None;
+            for (resource, guest_port) in &requests {
+                match self
+                    .ports
+                    .allocate(state, &environment_id, resource, *guest_port, attempt)
+                {
+                    Ok(host_port) => {
+                        spec.lease(resource.clone(), *guest_port, host_port);
+                        leases.push(LeaseRecord {
+                            environment_id: environment_id.clone(),
+                            resource: resource.clone(),
+                            guest_port: *guest_port,
+                            host_port,
+                            created_at: clock::now_rfc3339(),
+                        });
+                    }
+                    Err(err) => {
+                        port_failure = Some(err);
+                        break;
+                    }
+                }
+            }
+            if let Some(err) = port_failure {
+                self.mark(&state, &environment_id, STATE_RUNNING, STATE_FAILED, HEALTH_UNHEALTHY)?;
+                return Err(err.into());
+            }
+
+            match self.backend.start(&spec).await {
+                Ok(()) => break,
+                Err(BackendError::PortUnavailable { .. }) if attempt + 1 < LEASE_ATTEMPTS => {
+                    // Something outside the registry bound a port between the
+                    // check and the bind. Try another part of the range.
+                    continue;
                 }
                 Err(err) => {
                     self.mark(&state, &environment_id, STATE_RUNNING, STATE_FAILED, HEALTH_UNHEALTHY)?;
                     return Err(err.into());
                 }
             }
-        }
-
-        if let Err(err) = self.backend.start(&spec).await {
-            self.mark(&state, &environment_id, STATE_RUNNING, STATE_FAILED, HEALTH_UNHEALTHY)?;
-            return Err(err.into());
         }
 
         let resources = self.probe(state, record, &leases).await?;
@@ -217,6 +245,18 @@ impl Lifecycle {
         if stored.observed_state == STATE_STOPPED || stored.observed_state == STATE_ABSENT {
             let resources = stopped_resources(record);
             return Ok(self.view(record, &stored.observed_state, HEALTH_UNKNOWN, &resources));
+        }
+
+        // A start in progress is `starting`, not `degraded`: the ports it will
+        // bind are not up yet, and saying otherwise would be a lie about a
+        // healthy start.
+        if stored.observed_state == STATE_STARTING {
+            let mut resources = self.probe(state, record, &leases).await?;
+            for resource in &mut resources {
+                resource.state = STATE_STARTING.to_string();
+                resource.health = HEALTH_UNKNOWN.to_string();
+            }
+            return Ok(self.view(record, STATE_STARTING, HEALTH_UNKNOWN, &resources));
         }
 
         let resources = self.probe(state, record, &leases).await?;

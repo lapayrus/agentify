@@ -5,11 +5,13 @@ runtime on the developer's machine, and one control plane exposes it to agents
 and humans alike. Read `GLOSSARY.md` for the domain language, `docs/adr/` for the
 hard-to-reverse decisions, and `.scratch/agentify-v0/spec.md` for the product spec.
 
-**Current status: ticket 02, Projects from a Manifest.** There is a daemon with
-state, a loopback API, an MCP server, a CLI, and a desktop shell. Projects can be
-created from the bundled `hello-pg` fixture or an inline Manifest and inspected
-through the API, MCP, and the UI. Nothing starts yet — no Backends, ingress,
-secrets store, or Approvals.
+**Current status: ticket 03, Environment lifecycle on the fake Backend.** There
+is a daemon with state, a loopback API, an MCP server, a CLI, and a desktop
+shell. Projects can be created from the bundled `hello-pg` fixture or an inline
+Manifest, and their `dev` Environment can be started, stopped, inspected, and
+driven: port leases, health, exec, logs, and stats all run end to end against a
+scripted fake Backend. Nothing touches a real substrate yet — no WSL, no ingress,
+no secrets store, and no Approvals.
 
 ## Layout
 
@@ -17,8 +19,9 @@ secrets store, or Approvals.
 | --- | --- |
 | `crates/proto` | Wire types, discovery-file format, data-root resolution, and the API client shared by every process |
 | `crates/manifest` | Pure Manifest parse and normalization into a spec: strict, path-accurate errors, no I/O |
-| `crates/daemon` | `agentifyd`: owns state (SQLite), serves `/v1` on loopback, embeds the bundled fixtures |
-| `crates/mcp` | `agentify-mcp`: MCP stdio shim exposing `whoami`, `create_project`, `list_projects`, and `get_project` |
+| `crates/backends` | The Backend contract (capabilities, typed errors, an object-safe async trait), the scripted fake, and the conformance suite every adapter runs |
+| `crates/daemon` | `agentifyd`: owns state (SQLite), port leases, health, operations, and the `/v1` API; embeds the bundled fixtures |
+| `crates/mcp` | `agentify-mcp`: MCP stdio shim over the same API |
 | `crates/cli` | `agentify`: `daemon`, `status`, `whoami` |
 | `fixtures/` | Bundled fixtures compiled into the daemon (`hello-pg`) |
 | `ui/` | Desktop front end: plain HTML/CSS/JS modules, built into `ui/dist` |
@@ -26,6 +29,37 @@ secrets store, or Approvals.
 
 The daemon is the only control plane (ADR-0003). The shell, the CLI, and the MCP
 shim are clients of the same API; none of them has a privileged path.
+
+## Backends
+
+A **Backend** is the runtime substrate that hosts an Environment. v0 ships one:
+`fake`, a scripted implementation selected with `AGENTIFY_BACKEND=fake` (the
+default). It binds a TCP listener on every leased host port so the daemon's own
+health probe succeeds or fails for a real reason, moves
+`absent → starting → running → stopped`, and can be scripted to fail or degrade:
+
+```sh
+AGENTIFY_FAKE_SCRIPT='{"start_delay_ms": 250, "unbound_resources": ["web"]}' agentifyd
+```
+
+The daemon — never the Backend — allocates ports and decides health. The WSL
+adapter arrives in a later ticket; `crates/backends` holds the contract and a
+[conformance suite](crates/backends/src/conformance.rs) that every adapter must
+pass before the API has to learn about it.
+
+### Daemon knobs
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AGENTIFY_HOME` | OS data dir | Data root |
+| `AGENTIFY_BACKEND` | `fake` | Which Backend to drive |
+| `AGENTIFY_FAKE_SCRIPT` | — | JSON script for the fake |
+| `AGENTIFY_OPERATION_TIMEOUT_MS` | `30000` | How long a mutating call blocks before answering `504` with an operation id |
+| `AGENTIFY_LEASE_RANGE` | `40000-40999` | Host ports the daemon may lease (`40000-40099`, or a single `40000`) |
+| `AGENTIFY_PROBE_TIMEOUT_MS` | `750` | How long one TCP health probe waits |
+| `AGENTIFY_EXEC_TIMEOUT_MS` | `60000` | Upper bound on one `exec` |
+| `AGENTIFY_LOG_TAIL` | `200` | Default log tail |
+| `AGENTIFY_HEARTBEAT_MS` | `15000` | SSE heartbeat period |
 
 ## Run it
 
@@ -56,20 +90,31 @@ Register the shim with an MCP client (stdio transport):
 }
 ```
 
-`initialize`, `tools/list`, and `tools/call` work today for `whoami`,
-`create_project`, `list_projects`, and `get_project`. Every tool result is
+`initialize`, `tools/list`, and `tools/call` work today. Every tool result is
 byte-for-byte the payload of the matching HTTP route:
 
 ```json
 {"name": "create_project", "arguments": {"fixture": "hello-pg"}}
-{"name": "create_project", "arguments": {"manifest": "version: 1\nproject: demo\n..."}}
 {"name": "list_projects", "arguments": {}}
 {"name": "get_project", "arguments": {"project": "hello-pg"}}
+{"name": "start_environment", "arguments": {"project": "hello-pg"}}
+{"name": "get_status", "arguments": {"project": "hello-pg"}}
+{"name": "run_command", "arguments": {"project": "hello-pg", "resource": "web", "command": ["node", "--version"]}}
+{"name": "read_logs", "arguments": {"project": "hello-pg", "resource": "web", "tail": 50}}
+{"name": "get_stats", "arguments": {"project": "hello-pg"}}
+{"name": "wait_for_operation", "arguments": {"operationId": "<id from a timed-out mutation>"}}
+{"name": "stop_environment", "arguments": {"project": "hello-pg"}}
 ```
+
+Tools: `whoami`, `create_project`, `list_projects`, `get_project`,
+`start_environment`, `stop_environment`, `get_status`, `run_command`,
+`read_logs`, `get_stats`, `wait_for_operation`. `environment` defaults to `dev`.
 
 A tool failure is a JSON-RPC error whose `data` carries the same stable `code`
 the API returns (`ValidationFailed`, `AlreadyExists`, `SourceMissing`,
-`NotFound`), plus `path` for a validation failure.
+`NotFound`, `PortUnavailable`, `NotProvisioned`, `BackendUnavailable`, `Timeout`,
+`Unsupported`, …), plus `path` for a validation failure and `operationId` when a
+mutation timed out.
 
 ### Desktop shell
 
@@ -91,8 +136,9 @@ cargo run                        # opens the window (needs a daemon for "connect
   on macOS, `$XDG_DATA_HOME/Agentify/` elsewhere. Override with `AGENTIFY_HOME`.
 * `state.db` — SQLite (bundled, WAL). Migrations run on start and are recorded in
   `schema_migrations`; the instance id is minted once per data root. Projects,
-  their one `dev` Environment, Resources, and each Project's normalized spec live
-  here.
+  their one `dev` Environment (desired and observed state plus health),
+  Resources, each Project's normalized spec, the machine-wide `port_leases`,
+  `operations`, and `idempotency_records` live here.
 * `projects/<project-id>/workspace/` — the daemon-owned source directory for a
   Project. A bundled fixture is copied here from inside the binary, so an
   installed daemon needs no repository paths.
@@ -103,24 +149,45 @@ cargo run                        # opens the window (needs a daemon for "connect
   a fresh token and revokes the previous one, so the discovery file always holds
   the only live token.
 
+`desired_state` is what the last mutation asked for, `observed_state` is what the
+daemon last saw. They diverge across a restart on purpose: a runtime that did not
+survive is reported `degraded` rather than quietly claimed `running`, and the
+next `start` converges it back on the same leases.
+
 ## API (v1)
 
 | Route | Auth | Notes |
 | --- | --- | --- |
 | `GET /v1/healthz` | none | liveness; used by clients to detect a stale discovery file |
-| `GET /v1/whoami` | Agent token | project context (`null` = global), scopes, daemon and API versions, capabilities |
+| `GET /v1/whoami` | Agent token | project context (`null` = global), scopes, daemon and API versions, the active Backend, and its capabilities |
 | `GET /v1/events` | Agent token | SSE heartbeats |
 | `POST /v1/projects` | Agent token | exactly one of `{"fixture": "hello-pg"}` or `{"manifest": "<yaml>"}`; `201` with the Project |
 | `GET /v1/projects` | Agent token | `{"projects": [...]}`, oldest first |
 | `GET /v1/projects/{project}` | Agent token | by name or id |
+| `POST /v1/projects/{project}/environments/dev/start` | Agent token | idempotent and convergent; returns the status once every Resource is up, or `504` with an `operationId` |
+| `POST /v1/projects/{project}/environments/dev/stop` | Agent token | idempotent; keeps the runtime and volumes, releases the leases |
+| `GET /v1/projects/{project}/environments/dev/status` | Agent token | state, health, Resources, leased ports, Backend |
+| `POST /v1/projects/{project}/environments/dev/resources/{resource}/exec` | Agent token | `{"command": [...], "timeoutMs": 5000}` → `{stdout, stderr, exitCode, durationMs}` |
+| `GET /v1/projects/{project}/environments/dev/logs` | Agent token | bounded `tail`, optional `since` and `resource`; `follow=1` is SSE |
+| `GET /v1/projects/{project}/environments/dev/stats` | Agent token | environment-level cpu/memory/disk |
+| `GET /v1/operations/{id}` | Agent token | a mutation's operation |
+| `GET /v1/operations/{id}/wait` | Agent token | block until it finishes (`?timeoutMs=`) |
 
-A Project carries its one `dev` Environment, its Resources, the derived Routes
-(`https://<hostname>.<project>.localhost`), and state and cost placeholders —
-nothing runs yet.
+A mutating call blocks for at most `AGENTIFY_OPERATION_TIMEOUT_MS`; a timeout is
+a `504` whose problem body carries the `operationId`, so a caller waits instead
+of retrying blindly. Mutations are serialised per Environment. `Idempotency-Key`
+on a mutation replays the original response for 24 hours without running it
+again.
 
-Errors are `application/problem+json` with a stable `code`: `ValidationFailed`
-(with a `path`), `AlreadyExists`, `SourceMissing`, `NotFound`. Everything binds to
-`127.0.0.1` only.
+State is `absent`, `starting`, `running`, `degraded`, `stopped`, or `failed`.
+Health is `healthy`, `unhealthy`, or `unknown`, and it is the daemon's decision:
+it probes the host ports it leased.
+
+Errors are `application/problem+json` with a stable `code`: the Backend enum
+(`Unsupported`, `VersionMismatch`, `NotProvisioned`, `AlreadyExists`,
+`PortUnavailable`, `ExecutionFailed`, `BackendUnavailable`, `Timeout`,
+`Cancelled`) plus `NotFound` and `ValidationFailed` (with a `path`). Everything
+binds to `127.0.0.1` only.
 
 ## Manifest v0
 
@@ -136,12 +203,23 @@ workspace. See `prototype/manifest-v0/agentify.yaml` for the annotated shape and
 ## Test
 
 ```sh
-cargo test --workspace     # manifest unit tests + daemon, MCP, and CLI acceptance tests
+cargo test --workspace     # Backend conformance, manifest unit tests, and daemon, MCP, and CLI acceptance tests
 cargo build --workspace
-cd ui && npm test          # renderer states: header, populated rail, detail, empty, unreachable
-cd ui/src-tauri && cargo check --all-targets
+cd ui && npm test          # renderer states: header, rail, detail, status bar, Start/Stop, logs, empty, unreachable
+cd ui/src-tauri && cargo check --all-targets && cargo test
 ```
 
-Tests drive real processes at the API seam: they boot `agentifyd` against a
-temporary data root, read the discovery file, and speak HTTP, JSON-RPC over
-stdio, or run the CLI. No test asserts on private Rust internals.
+Two seams, as the spec agreed:
+
+1. **Backend contract** — `crates/backends/src/conformance.rs` is one table of
+   cases every adapter must pass: lifecycle idempotence, convergence after
+   removal, exec streaming and exit codes, cancellation, log tailing, port
+   binding, capability reporting, and typed unsupported errors. The fake runs it
+   on every OS today; the WSL adapter will run it on Windows.
+2. **Public API** — acceptance tests boot the real daemon against a temporary
+   data root, read the discovery file, and speak HTTP, SSE, JSON-RPC over stdio,
+   or run the CLI. Both daemons in the restart test are real processes, so a
+   restart really does lose the runtime.
+
+No test asserts on private Rust internals, and the only substitute is the
+scripted fake Backend.

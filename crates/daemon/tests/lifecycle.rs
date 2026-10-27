@@ -586,7 +586,7 @@ fn a_mutation_that_exceeds_its_timeout_returns_an_operation_id() {
     let temp = tempfile::tempdir().expect("temp dir");
     let config = Config::new(temp.path())
         .with_operation_timeout(Duration::from_millis(50))
-        .with_backend_script(r#"{"start_delay_ms": 400}"#);
+        .with_backend_script(r#"{"start_delay_ms": 600}"#);
     let daemon = Daemon::boot_with(config);
     create_fixture(&daemon);
 
@@ -598,6 +598,13 @@ fn a_mutation_that_exceeds_its_timeout_returns_an_operation_id() {
         .as_str()
         .unwrap_or_else(|| panic!("the timeout carries the operation id: {timeout}"))
         .to_string();
+
+    // While it runs, the Environment is honestly reported as starting.
+    let (_, in_flight) = status(&daemon, "hello-pg");
+    assert_eq!(
+        in_flight["environment"]["state"], "starting",
+        "a start in progress is starting, not degraded: {in_flight}"
+    );
 
     // The operation is visible and still running.
     let (status_code, operation) = daemon.get(&format!("/v1/operations/{operation_id}"));
