@@ -53,9 +53,12 @@ fn this_machine_reaches_ready_without_elevating_or_changing_anything() {
         "WSL 2 is the default here: {:?}",
         report.detection
     );
+    // A pre-registered Ubuntu distro is not required: the daemon imports its own
+    // rootfs. What makes a machine Ready is that WSL 2 is the default, so the
+    // pinned rootfs can be imported.
     assert!(
-        report.detection.wsl2_distro().is_some(),
-        "Ubuntu is registered on WSL 2: {:?}",
+        report.detection.can_import(),
+        "WSL 2 is the default, so the pinned rootfs can be imported: {:?}",
         report.detection
     );
     assert!(
