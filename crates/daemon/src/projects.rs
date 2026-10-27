@@ -322,6 +322,42 @@ fn view(record: &ProjectRecord) -> Result<Project> {
     })
 }
 
+/// One `<hostname>.<project>.localhost` route a Project declares.
+///
+/// A route is declared by a Resource port that names a hostname. A database
+/// port is leased and probed but never published: nothing useful is served by
+/// `db.<project>.localhost` over HTTP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredRoute {
+    pub resource: String,
+    /// The guest port this route fronts, which is how the lease is found.
+    pub guest_port: u16,
+    /// The full hostname, e.g. `web.hello-pg.localhost`.
+    pub hostname: String,
+    /// The URL the UI shows, e.g. `https://web.hello-pg.localhost`.
+    pub url: String,
+}
+
+/// The routes a Project declares, in Resource order.
+pub fn declared_routes(record: &ProjectRecord) -> Result<Vec<DeclaredRoute>> {
+    let spec = stored_spec(record)?;
+    let mut routes = Vec::new();
+    for resource in record.resources.iter() {
+        let Some(stored) = spec.resources.get(&resource.name) else {
+            continue;
+        };
+        for port in &stored.ports {
+            routes.push(DeclaredRoute {
+                resource: resource.name.clone(),
+                guest_port: port.port,
+                hostname: format!("{}.{}.localhost", port.hostname, record.name),
+                url: port.url.clone(),
+            });
+        }
+    }
+    Ok(routes)
+}
+
 /// The guest ports this Project declares, as `(resource, guest port)` pairs the
 /// daemon leases host ports for.
 ///

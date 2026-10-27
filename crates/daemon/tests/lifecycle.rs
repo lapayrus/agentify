@@ -699,6 +699,10 @@ impl Process {
             // The fixture imports one secret from the host environment.
             .env("HELLO_API_TOKEN", FIXTURE_API_TOKEN)
             .env("AGENTIFY_SECRET_STORE", "memory")
+            // This test is about restart persistence, not ingress: without the
+            // switch the binary would try to start Caddy and `start` would be a
+            // 503 on a machine that has none.
+            .env("AGENTIFY_INGRESS", "off")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

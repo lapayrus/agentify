@@ -10,8 +10,9 @@ is a daemon with state, a loopback API, an MCP server, a CLI, and a desktop
 shell. Projects can be created from the bundled `hello-pg` fixture or an inline
 Manifest, and their `dev` Environment can be started, stopped, inspected, and
 driven: port leases, health, exec, logs, and stats all run end to end against a
-scripted fake Backend. Nothing touches a real substrate yet — no WSL, no ingress,
-no secrets store, and no Approvals.
+scripted fake Backend. Nothing touches a real substrate yet — no WSL — but local
+ingress (`*.localhost` through Caddy), Approvals with an audit trail, and the
+Project secret store are wired and tested at the API seam.
 
 ## Layout
 
@@ -20,6 +21,7 @@ no secrets store, and no Approvals.
 | `crates/proto` | Wire types, discovery-file format, data-root resolution, and the API client shared by every process |
 | `crates/manifest` | Pure Manifest parse and normalization into a spec: strict, path-accurate errors, no I/O |
 | `crates/backends` | The Backend contract (capabilities, typed errors, an object-safe async trait), the scripted fake, and the conformance suite every adapter runs |
+| `crates/ingress` | Local ingress: the route model, the Caddy admin client, Caddy lifecycle, port probing, and the trust installer seam |
 | `crates/daemon` | `agentifyd`: owns state (SQLite), port leases, health, operations, and the `/v1` API; embeds the bundled fixtures |
 | `crates/mcp` | `agentify-mcp`: MCP stdio shim over the same API |
 | `crates/cli` | `agentify`: `daemon`, `status`, `whoami` |
@@ -62,6 +64,12 @@ pass before the API has to learn about it.
 | `AGENTIFY_HEARTBEAT_MS` | `15000` | SSE heartbeat period |
 | `AGENTIFY_SECRET_STORE` | `keyring` | Where secret values live: `keyring` (the OS credential manager) or `memory` (a test-only store) |
 | `AGENTIFY_SECRET_SERVICE` | `agentify-v0` | Keyring service name the values are filed under |
+| `AGENTIFY_INGRESS` | on | Set to `off` to run without local ingress (no Caddy, no `*.localhost` routes) |
+| `AGENTIFY_CADDY` | search | Path to the `caddy` executable; none is downloaded |
+| `AGENTIFY_HTTP_PORT` | `80` | Plain-HTTP ingress port |
+| `AGENTIFY_HTTPS_PORT` | `443` | TLS ingress port |
+| `AGENTIFY_CADDY_ADMIN` | spawn | Attach to an already-running Caddy admin endpoint (`127.0.0.1:2019`) instead of spawning one |
+| `AGENTIFY_TRUST` | — | Explicit trust action at startup: `install` or `remove`; nothing else touches the certificate store |
 
 ## Run it
 

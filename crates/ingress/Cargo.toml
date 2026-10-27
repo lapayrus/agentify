@@ -1,0 +1,28 @@
+[package]
+name = "agentify-ingress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Caddy-owned local ingress: route config, the admin client, and per-user trust"
+
+[features]
+# Exposes the test doubles (a fake Caddy admin HTTP server and a fake trust
+# installer) so the daemon's API-seam tests can substitute Caddy itself without
+# substituting the daemon's ingress code.
+test-support = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Only the opt-in real-Caddy test needs a TLS client, so it stays out of the
+# production dependency graph.
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+] }

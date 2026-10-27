@@ -1041,13 +1041,25 @@ impl State {
     // ---- delete ------------------------------------------------------------
 
     /// Delete a Project and everything the database hangs off it. Foreign keys
-    /// cascade to its Environments, Resources, and port leases, so one delete
-    /// leaves no rows behind. Operations survive on purpose: a caller may still
-    /// be waiting on one.
-    pub fn delete_project(&self, id: &str) -> Result<()> {
+    /// cascade to its Environments, Resources, and port leases, and the explicit
+    /// deletes keep that guarantee visible even if a caller turns foreign keys
+    /// off. Operations and Approvals survive on purpose: a caller may still be
+    /// waiting on one, and the audit trail is not a thing a delete erases.
+    ///
+    /// Returns whether a Project row was actually removed.
+    pub fn delete_project(&self, project_id: &str) -> Result<bool> {
         self.with_conn(|conn| {
-            conn.execute("DELETE FROM projects WHERE id = ?1", [id])?;
-            Ok(())
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute(
+                "DELETE FROM port_leases WHERE environment_id IN
+                     (SELECT id FROM environments WHERE project_id = ?1)",
+                [project_id],
+            )?;
+            transaction.execute("DELETE FROM resources WHERE project_id = ?1", [project_id])?;
+            transaction.execute("DELETE FROM environments WHERE project_id = ?1", [project_id])?;
+            let removed = transaction.execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
+            transaction.commit()?;
+            Ok(removed > 0)
         })
     }
 
