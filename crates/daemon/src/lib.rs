@@ -5,10 +5,13 @@
 //! that API; none of them has a privileged path.
 
 pub mod acl;
+pub mod approval;
+pub mod audit;
 pub mod auth;
 pub mod backends;
 pub mod clock;
 pub mod config;
+pub mod consent;
 pub mod discovery;
 pub mod fixtures;
 pub mod health;

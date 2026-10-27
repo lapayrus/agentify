@@ -282,6 +282,20 @@ impl Lifecycle {
         Ok(self.view(record, STATE_STOPPED, HEALTH_UNKNOWN, &resources))
     }
 
+    /// Withdraw an Environment's routes for good, without touching its runtime.
+    ///
+    /// Deleting the Environment is the only thing that deletes a route, so a
+    /// path that removes the rows itself (the Approval-driven delete) still has
+    /// to call this: a stop only replaces the route with the 503.
+    pub fn withdraw_routes(&self, environment_id: &str) -> Result<(), LifecycleError> {
+        let Some(ingress) = self.ingress.as_ref() else {
+            return Ok(());
+        };
+        ingress
+            .remove_environment(environment_id)
+            .map_err(LifecycleError::Ingress)
+    }
+
     /// Remove an Environment for good: the runtime, its leases, and its routes.
     ///
     /// Deleting an Environment is the only thing that deletes a route.
@@ -295,11 +309,7 @@ impl Lifecycle {
             .remove(&environment_id, false)
             .await
             .map_err(LifecycleError::Backend)?;
-        if let Some(ingress) = self.ingress.as_ref() {
-            ingress
-                .remove_environment(&environment_id)
-                .map_err(LifecycleError::Ingress)?;
-        }
+        self.withdraw_routes(&environment_id)?;
         self.ports.release_all(state, &environment_id)?;
         state
             .delete_project(&record.id)

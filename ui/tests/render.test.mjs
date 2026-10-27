@@ -15,6 +15,12 @@ import {
   renderActions,
   renderTabs,
   renderLogs,
+  renderSide,
+  renderApprovals,
+  renderApprovalCard,
+  renderActivity,
+  actorLabel,
+  parameterSummary,
   costLabel,
   selectedProject,
 } from "../src/render.js";
@@ -451,4 +457,273 @@ test("renderTabs marks exactly one tab as selected", () => {
   assert.match(renderTabs("logs"), /data-tab="logs" aria-selected="true"/);
   assert.match(renderTabs(undefined), /data-tab="overview" aria-selected="true"/);
   assert.equal((renderTabs("logs").match(/aria-selected="true"/g) ?? []).length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Approvals, the activity feed, and the right column.
+// ---------------------------------------------------------------------------
+
+/** A pending Approval, exactly as `GET /v1/approvals` serves it. */
+const pendingApproval = {
+  id: "ap-1",
+  operation: "delete_project",
+  target: "hello-pg",
+  paramsHash: "a".repeat(64),
+  parameters: [
+    { name: "project", value: "hello-pg" },
+    { name: "projectId", value: "proj-1" },
+  ],
+  requester: { kind: "agent", id: "token-1", tokenId: "token-1" },
+  operationId: "op-1",
+  projectId: "proj-1",
+  state: "pending",
+  createdAt: "2026-01-01T00:00:00Z",
+  expiresAt: "2026-01-01T00:15:00Z",
+};
+
+const approvedApproval = {
+  ...pendingApproval,
+  id: "ap-0",
+  operation: "reset_environment",
+  target: "hello-pg/dev",
+  operationId: "op-0",
+  parameters: [
+    { name: "environment", value: "dev" },
+    { name: "project", value: "hello-pg" },
+  ],
+  state: "approved",
+  decidedAt: "2026-01-01T00:00:30Z",
+  decidedBy: { kind: "human", id: "raosu", tokenId: "token-1" },
+};
+
+const deniedApproval = {
+  ...approvedApproval,
+  id: "ap-2",
+  operation: "delete_project",
+  operationId: "op-2",
+  state: "denied",
+  decidedAt: "2026-01-01T00:01:00Z",
+};
+
+/** The audit chain as `GET /v1/activity` serves it: newest first. */
+const activityPage = {
+  entries: [
+    {
+      seq: 3,
+      at: "2026-01-01T00:01:00Z",
+      actor: { kind: "human", id: "raosu" },
+      projectId: "proj-1",
+      operation: "delete_project",
+      target: "hello-pg",
+      paramsHash: "a".repeat(64),
+      approvalId: "ap-2",
+      result: "denied",
+      requestId: "req-3",
+      prevHash: "b".repeat(64),
+      hash: "c".repeat(64),
+    },
+    {
+      seq: 2,
+      at: "2026-01-01T00:00:20Z",
+      actor: { kind: "agent", id: "token-1", tokenId: "token-1" },
+      projectId: "proj-1",
+      operation: "start_environment",
+      target: "hello-pg/dev",
+      result: "succeeded",
+      errorCode: null,
+      requestId: "req-2",
+      prevHash: "d".repeat(64),
+      hash: "b".repeat(64),
+    },
+    {
+      seq: 1,
+      at: "2026-01-01T00:00:00Z",
+      actor: { kind: "agent", id: "token-1", tokenId: "token-1" },
+      projectId: "proj-1",
+      operation: "create_project",
+      target: "hello-pg",
+      result: "failed",
+      errorCode: "ValidationFailed",
+      requestId: "req-1",
+      prevHash: "e".repeat(64),
+      hash: "d".repeat(64),
+    },
+  ],
+  integrity: { verified: true, entries: 3, checkedAt: "2026-01-01T00:01:01Z" },
+};
+
+/** A settled decision: what the shell holds while Approve or Deny is in flight. */
+const inbox = { approvals: [pendingApproval, approvedApproval], activity: activityPage };
+
+test("an actor is named by kind and id, never as just someone", () => {
+  assert.equal(actorLabel({ kind: "agent", id: "token-1" }), "agent · token-1");
+  assert.equal(actorLabel({ kind: "human", id: "raosu" }), "human · raosu");
+  assert.equal(actorLabel(undefined), "unknown · unknown");
+  assert.equal(parameterSummary([{ name: "project", value: "hello-pg" }]), "project=hello-pg");
+  assert.equal(parameterSummary([]), "no parameters");
+  assert.equal(parameterSummary(undefined), "no parameters");
+});
+
+test("the Approval card shows operation, target, requester, parameters, and expiry", () => {
+  const card = renderApprovalCard(pendingApproval);
+  assert.match(card, /data-approval="ap-1"/);
+  assert.match(card, /data-operation="delete_project"/);
+  assert.match(card, /data-state="pending"/);
+  assert.match(card, /delete_project/, "the operation is named");
+  assert.match(card, /<code>hello-pg<\/code>/, "the target is named");
+  assert.match(card, /dot-actor-agent/, "the requester is marked as an Agent");
+  assert.match(card, /agent · token-1/, "the requester is identified");
+  assert.match(card, /data-summary="project=hello-pg, projectId=proj-1"/, "the parameters are summarised");
+  assert.match(card, /<dt>project<\/dt><dd>hello-pg<\/dd>/);
+  assert.match(card, /expires <time datetime="2026-01-01T00:15:00Z">2026-01-01T00:15:00Z<\/time>/);
+  assert.match(card, /Windows Hello/, "the note says how a yes is given");
+});
+
+test("a pending Approval offers Approve and Deny, and both can be in flight", () => {
+  const card = renderApprovalCard(pendingApproval);
+  assert.match(card, /data-decision="approve" data-approval="ap-1">Approve</);
+  assert.match(card, /data-decision="deny" data-approval="ap-1">Deny</);
+  assert.doesNotMatch(card, /data-decision="approve"[^>]*disabled/);
+  assert.doesNotMatch(card, /data-decision="deny"[^>]*disabled/);
+
+  const approving = renderApprovalCard(pendingApproval, "approve");
+  assert.match(approving, /Approving…/);
+  assert.match(approving, /data-decision="approve"[^>]*disabled/);
+  assert.match(approving, /data-decision="deny"[^>]*disabled/, "neither button can be pressed twice");
+
+  const denying = renderApprovalCard(pendingApproval, "deny");
+  assert.match(denying, /Denying…/);
+  assert.match(denying, /data-decision="deny"[^>]*disabled/);
+  assert.match(denying, /data-decision="approve"[^>]*disabled/);
+});
+
+test("a decided Approval shows the outcome and who decided it, and offers nothing", () => {
+  const approved = renderApprovalCard(approvedApproval);
+  assert.match(approved, /data-state="approved"/);
+  assert.match(approved, /data-decided="approved"/);
+  assert.match(approved, /approved by human · raosu at 2026-01-01T00:00:30Z/);
+  assert.doesNotMatch(approved, /data-decision=/, "a decided Approval cannot be decided again");
+
+  const denied = renderApprovalCard(deniedApproval);
+  assert.match(denied, /data-state="denied"/);
+  assert.match(denied, /denied by human · raosu/);
+  assert.doesNotMatch(denied, /data-decision=/);
+});
+
+test("a pending decision disables that card only, and pending cards come first", () => {
+  const card = renderApprovals([approvedApproval, pendingApproval], { id: "ap-1", action: "approve" });
+  assert.match(card, /Approving…/);
+  assert.match(card, /data-count="1"/, "only pending work is counted");
+  assert.ok(
+    card.indexOf('data-approval="ap-1"') < card.indexOf('data-approval="ap-0"'),
+    "the thing awaiting a human is above the thing already decided",
+  );
+});
+
+test("an empty inbox says so instead of rendering nothing", () => {
+  const empty = renderApprovals([]);
+  assert.match(empty, /data-empty="approvals"/);
+  assert.match(empty, /No Approvals pending/);
+  assert.match(empty, /delete_project/);
+  assert.match(empty, /reset_environment/);
+  assert.doesNotMatch(empty, /data-approval=/);
+  assert.doesNotMatch(empty, /data-decision=/);
+
+  // The same for a payload the shell never got, and for an error beside it.
+  assert.match(renderApprovals(undefined), /No Approvals pending/);
+  const failed = renderApprovals([], null, "the daemon said no");
+  assert.match(failed, /data-error="approvals"/);
+  assert.match(failed, /the daemon said no/);
+});
+
+test("the activity feed lists Agent and human actions with actor identity", () => {
+  const feed = renderActivity(activityPage);
+  assert.match(feed, /data-entries="3"/);
+  assert.match(feed, /data-actor="human"/);
+  assert.match(feed, /data-actor="agent"/);
+  assert.match(feed, /human · raosu/, "the human who denied is identified");
+  assert.match(feed, /agent · token-1/, "the Agent that acted is identified");
+  assert.match(feed, /data-operation="delete_project"/);
+  assert.match(feed, /data-result="denied"/);
+  assert.match(feed, /data-result="succeeded"/);
+  assert.match(feed, /ValidationFailed/, "a failure keeps its code");
+  assert.match(feed, /data-verified="true"/);
+  assert.match(feed, /chain verified · 3 entries/);
+  assert.ok(
+    feed.indexOf("data-seq=\"3\"") < feed.indexOf("data-seq=\"1\""),
+    "newest first, as the daemon serves it",
+  );
+});
+
+test("an empty, unverified, or unreachable feed explains itself", () => {
+  const empty = renderActivity({ entries: [], integrity: { verified: true, entries: 0 } });
+  assert.match(empty, /data-empty="activity"/);
+  assert.match(empty, /Nothing has happened yet/);
+  assert.match(renderActivity(undefined), /Nothing has happened yet/);
+
+  const broken = renderActivity({
+    entries: activityPage.entries,
+    integrity: { verified: false, entries: 3, detail: "entry 2 does not hash to its successor" },
+  });
+  assert.match(broken, /data-verified="false"/);
+  assert.match(broken, /chain does not verify/);
+
+  const failed = renderActivity(null, "activity unavailable");
+  assert.match(failed, /data-error="activity"/);
+  assert.match(failed, /activity unavailable/);
+});
+
+test("the shell puts the Approval card above the activity feed in the right column", () => {
+  const html = render({ ...populated, inbox });
+  const side = html.slice(html.indexOf('<aside class="side"'));
+  assert.ok(side.length > 0, "the right column is part of the shell");
+  assert.ok(html.indexOf('<aside class="side"') > html.indexOf("<main"), "it sits right of the main pane");
+  assert.match(side, /data-section="approvals"/);
+  assert.match(side, /data-section="activity"/);
+  assert.ok(
+    side.indexOf('data-section="approvals"') < side.indexOf('data-section="activity"'),
+    "the card is above the feed",
+  );
+  assert.match(side, /data-decision="approve"/);
+  assert.match(side, /human · raosu/);
+
+  // A malformed inbox payload renders the empty states, not a crash.
+  const sparse = render({ ...populated, inbox: {} });
+  assert.match(sparse, /No Approvals pending/);
+  assert.match(sparse, /Nothing has happened yet/);
+});
+
+test("an unreachable daemon claims no empty inbox", () => {
+  const side = renderSide({ state: "unreachable", inbox });
+  assert.match(side, /data-empty="inbox"/);
+  assert.match(side, /once the daemon answers/);
+  assert.doesNotMatch(side, /No Approvals pending/);
+});
+
+test("Approval and activity text from the daemon is escaped, never injected", () => {
+  const hostile = {
+    ...pendingApproval,
+    target: '<img src=x onerror="alert(1)">',
+    requester: { kind: "agent", id: '<script>alert("pwned")</script>' },
+    parameters: [{ name: "project", value: '<img src=x onerror="alert(1)">' }],
+  };
+  const card = renderApprovalCard(hostile);
+  assert.doesNotMatch(card, /<img/);
+  assert.doesNotMatch(card, /<script>/);
+  assert.match(card, /&lt;img/);
+  assert.match(card, /&lt;script&gt;/);
+
+  const feed = renderActivity({
+    entries: [
+      {
+        ...activityPage.entries[0],
+        actor: { kind: "human", id: '<script>alert("pwned")</script>' },
+        target: '<img src=x onerror="alert(1)">',
+      },
+    ],
+    integrity: { verified: true, entries: 1 },
+  });
+  assert.doesNotMatch(feed, /<script>/);
+  assert.doesNotMatch(feed, /<img/);
+  assert.match(feed, /&lt;script&gt;/);
 });

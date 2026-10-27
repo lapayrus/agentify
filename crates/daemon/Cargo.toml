@@ -33,6 +33,12 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+# Windows Hello, for the interactive gesture an Approval requires.
+windows = { version = "0.61", features = [
+  "Foundation",
+  "Security_Credentials_UI",
+  "Win32_System_WinRT",
+] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",

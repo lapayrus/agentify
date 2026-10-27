@@ -173,9 +173,11 @@ pub struct OperationView {
 }
 
 impl OperationView {
-    /// True when nothing more will happen to this operation.
+    /// True when nothing more will happen to this operation. An operation
+    /// waiting for an Approval is not terminal: a human still has to decide,
+    /// and the caller should keep waiting rather than retry.
     pub fn is_terminal(&self) -> bool {
-        self.state != "running"
+        self.state != "running" && self.state != crate::OPERATION_WAITING_FOR_APPROVAL
     }
 }
 

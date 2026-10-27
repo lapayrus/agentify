@@ -110,7 +110,7 @@ body {
 
 .body {
   display: grid;
-  grid-template-columns: 264px 1fr;
+  grid-template-columns: 264px minmax(0, 1fr) 352px;
   flex: 1;
   min-height: 0;
 }
@@ -636,5 +636,295 @@ table.resources .resource-name {
 .log-line[data-stream="stderr"] .log-text {
   color: var(--warn);
 }
+
+/* ---------- right column: Approvals over the activity feed ---------- */
+
+.side {
+  border-left: 1px solid var(--line);
+  padding: 18px 16px;
+  background: #f3f1ec;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.side-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.side-empty {
+  margin: 0 0 6px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.side-hint {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.dot-actor-agent {
+  background: var(--accent);
+}
+
+.dot-actor-human {
+  background: var(--ink);
+}
+
+.dot-actor-unknown {
+  background: var(--ink-faint);
+}
+
+/* ---------- the Approval card ---------- */
+
+.approval {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 13px;
+  margin-bottom: 10px;
+}
+
+.approval[data-state="pending"] {
+  border-left: 3px solid var(--warn);
+}
+
+.approval-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.approval-operation {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.approval-state {
+  border-radius: 999px;
+  padding: 1px 8px;
+  background: #fdf1e3;
+  color: var(--warn);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.approval-state[data-state="approved"] {
+  background: #e6f0ee;
+  color: var(--accent);
+}
+
+.approval-state[data-state="denied"],
+.approval-state[data-state="expired"],
+.approval-state[data-state="unknown"] {
+  background: #efece5;
+  color: var(--ink-soft);
+}
+
+.approval-target {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin: 0 0 5px;
+}
+
+.approval-target .tag,
+.approval-params dt {
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.approval-requester,
+.approval-expiry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 5px;
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.approval-requester .dot {
+  flex: none;
+}
+
+.approval-params {
+  margin: 8px 0;
+  padding: 7px 9px;
+  background: #fbfaf7;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+}
+
+.approval-params > div {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 8px;
+  padding: 1px 0;
+}
+
+.approval-params dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  word-break: break-all;
+}
+
+.approval-expiry time {
+  color: var(--ink-soft);
+}
+
+.approval-actions {
+  display: flex;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.decision {
+  padding: 6px 13px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.decision-approve {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.decision:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.decision:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.approval-note,
+.approval-decision {
+  margin: 8px 0 0;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.approval-decision[data-decided="denied"],
+.approval-decision[data-decided="expired"] {
+  color: var(--warn);
+}
+
+/* ---------- the activity feed ---------- */
+
+.activity-feed {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 40vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.activity-entry {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1px;
+  padding: 7px 11px;
+  border-bottom: 1px solid var(--line-soft);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.activity-entry:last-child {
+  border-bottom: none;
+}
+
+.activity-at {
+  color: var(--ink-faint);
+  font-size: 10px;
+}
+
+.activity-actor {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-soft);
+}
+
+.activity-what {
+  color: var(--ink);
+  word-break: break-word;
+}
+
+.activity-result {
+  justify-self: start;
+  color: var(--accent);
+}
+
+.activity-result[data-result="failed"],
+.activity-result[data-result="denied"],
+.activity-result[data-result="expired"] {
+  color: var(--warn);
+}
+
+.activity-result[data-result="requested"] {
+  color: var(--ink-soft);
+}
+
+.activity-code {
+  color: var(--warn);
+}
+
+.chain {
+  margin: 7px 0 0;
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.chain[data-verified="true"] {
+  color: var(--accent);
+}
+
+/* A narrow window keeps all three zones but gives the right column less room. */
+@media (max-width: 1180px) {
+  .body {
+    grid-template-columns: 216px minmax(0, 1fr) 300px;
+  }
+
+  .side {
+    padding: 16px 12px;
+  }
+}
+
 
 

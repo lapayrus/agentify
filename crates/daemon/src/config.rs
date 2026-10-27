@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::consent::{self, ConsentMode};
 use crate::ports::PortRange;
 
 /// Environment variable that shortens the events heartbeat (milliseconds).
@@ -45,8 +46,18 @@ pub const INGRESS_ENV: &str = "AGENTIFY_INGRESS";
 /// call).
 pub const TRUST_ENV: &str = "AGENTIFY_TRUST";
 
+/// Environment variable selecting how an Approval's interactive gesture is
+/// answered: `os` (Windows Hello), `granted`, `declined`, or `unavailable`.
+pub const CONSENT_ENV: &str = "AGENTIFY_CONSENT";
+
+/// Environment variable shortening an Approval's lifetime (milliseconds).
+pub const APPROVAL_TTL_ENV: &str = "AGENTIFY_APPROVAL_TTL_MS";
+
 /// Default heartbeat period for `GET /v1/events`.
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// Default lifetime of an Approval: fifteen minutes.
+pub const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Default bound on a mutating HTTP call.
 pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -114,6 +125,11 @@ pub struct Config {
     /// An explicit, one-shot trust action: the manual path a human or the
     /// installer opts into.
     pub trust_action: Option<TrustAction>,
+    /// How long an Approval stays usable. Fifteen minutes by default; a test
+    /// shrinks it instead of waiting for the real thing.
+    pub approval_ttl: Duration,
+    /// How the interactive consent gesture is answered.
+    pub consent: ConsentMode,
 }
 
 impl Config {
@@ -133,6 +149,10 @@ impl Config {
             log_tail: DEFAULT_LOG_TAIL,
             ingress: None,
             trust_action: None,
+            approval_ttl: DEFAULT_APPROVAL_TTL,
+            // A test-config daemon must never open an OS prompt: the gesture is
+            // scripted, and refused unless a test asks for it.
+            consent: ConsentMode::Declined,
         }
     }
 
@@ -170,6 +190,21 @@ impl Config {
                 config.backend_script = Some(raw);
             }
         }
+        if let Ok(raw) = std::env::var(APPROVAL_TTL_ENV) {
+            config.approval_ttl =
+                Duration::from_millis(whole_number(APPROVAL_TTL_ENV, &raw)?.max(1));
+        }
+        // The shipped daemon asks the OS unless told otherwise; a scripted
+        // answer has to be asked for by name.
+        config.consent = match std::env::var(CONSENT_ENV) {
+            Ok(raw) => match ConsentMode::parse(&raw) {
+                Some(mode) => mode,
+                None => anyhow::bail!(
+                    "{CONSENT_ENV}={raw} is not one of os, granted, declined, unavailable"
+                ),
+            },
+            Err(_) => consent::default_mode(),
+        };
         if let Ok(raw) = std::env::var(TRUST_ENV) {
             config.trust_action = match raw.trim() {
                 "" => None,
@@ -207,6 +242,20 @@ impl Config {
     /// Take an explicit trust action at startup.
     pub fn with_trust_action(mut self, action: TrustAction) -> Self {
         self.trust_action = Some(action);
+        self
+    }
+
+    /// Answer the consent gesture with a scripted verifier. Tests use this; it
+    /// is the only way a test can approve anything.
+    pub fn with_consent(mut self, mode: ConsentMode) -> Self {
+        self.consent = mode;
+        self
+    }
+
+    /// Shorten an Approval's lifetime, so expiry can be tested without waiting
+    /// fifteen minutes.
+    pub fn with_approval_ttl(mut self, ttl: Duration) -> Self {
+        self.approval_ttl = ttl;
         self
     }
 
