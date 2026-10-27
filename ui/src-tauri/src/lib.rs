@@ -178,6 +178,45 @@ fn data_root() -> std::path::PathBuf {
     agentify_proto::resolve_data_root()
 }
 
+// ---- first run: does this machine have WSL 2? ------------------------------
+//
+// Three commands, and the important thing is which of them can raise a UAC
+// prompt. `bootstrap_status` and `bootstrap_resume` only read: they probe the
+// machine, and the resume path can remove a `RunOnce` entry the app itself
+// wrote. Only `bootstrap_consent` runs the one elevated step, and the window
+// calls it from a click on the setup card — nothing else in the shell can reach
+// it. That is the whole consent mechanism on this side: a button, not an agent.
+
+/// The first-run state of this machine, read-only.
+pub fn bootstrap_status_for(data_root: &Path, program: &Path) -> agentify_bootstrap::Report {
+    bootstrap(data_root, program).status()
+}
+
+/// The human's agreement to the one administrator step.
+pub fn bootstrap_consent_for(data_root: &Path, program: &Path) -> agentify_bootstrap::Report {
+    bootstrap(data_root, program).consent(agentify_bootstrap::Consent::granted_by_human("ui"))
+}
+
+/// Finish a setup that was interrupted by a restart. Never elevates.
+pub fn bootstrap_resume_for(data_root: &Path, program: &Path) -> agentify_bootstrap::Report {
+    bootstrap(data_root, program).resume()
+}
+
+fn bootstrap(data_root: &Path, program: &Path) -> agentify_bootstrap::Bootstrap {
+    // The resume entry relaunches *this* app with the flag, so Windows finishes
+    // the install at the next sign-in without a second prompt.
+    agentify_bootstrap::Bootstrap::system(
+        data_root,
+        program,
+        &[agentify_bootstrap::RESUME_FLAG],
+    )
+}
+
+/// The shell executable, which is what a `RunOnce` entry has to relaunch.
+fn program() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("Agentify.exe"))
+}
+
 // ---- the Approval inbox and the activity feed ------------------------------
 
 /// The Approvals the daemon holds. `state` is `pending`, `approved`, `denied`,
@@ -291,6 +330,25 @@ fn daemon_status() -> DaemonStatus {
     status_for(&data_root())
 }
 
+/// The first-run state, for the setup card. A read: no elevation.
+#[tauri::command]
+fn bootstrap_status() -> agentify_bootstrap::Report {
+    bootstrap_status_for(&data_root(), &program())
+}
+
+/// The consent action: called from a click on the setup card, and from nowhere
+/// else. It is the one path in the shell that can raise a UAC prompt.
+#[tauri::command]
+fn bootstrap_consent() -> agentify_bootstrap::Report {
+    bootstrap_consent_for(&data_root(), &program())
+}
+
+/// Finish a restart-interrupted setup. Never elevates.
+#[tauri::command]
+fn bootstrap_resume() -> agentify_bootstrap::Report {
+    bootstrap_resume_for(&data_root(), &program())
+}
+
 /// The daemon's version handshake on demand, for a "check again" control.
 #[tauri::command]
 fn handshake() -> Result<serde_json::Value, String> {
@@ -354,9 +412,24 @@ fn environment_action(project: String, action: String) -> ActionResult {
 
 /// Start the shell.
 pub fn run() {
+    // Windows relaunches the app from the per-user `RunOnce` entry after the
+    // restart that enabling WSL requires. That is the resume: it reads the
+    // machine and finishes setup, and it never elevates.
+    if std::env::args().any(|arg| arg == agentify_bootstrap::RESUME_FLAG) {
+        let report = bootstrap_resume_for(&data_root(), &program());
+        eprintln!(
+            "agentify: bootstrap resume: {} — {}",
+            report.state.as_str(),
+            report.message
+        );
+    }
+
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             daemon_status,
+            bootstrap_status,
+            bootstrap_consent,
+            bootstrap_resume,
             handshake,
             environment_status,
             environment_stats,

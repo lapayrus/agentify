@@ -1,11 +1,13 @@
 //! `agentify` — a thin client of the daemon API.
 //!
 //! Deliberately small: the walking skeleton needs a way to start the daemon in
-//! the foreground and a way to ask a running daemon who it thinks it is.
+//! the foreground, a way to ask a running daemon who it thinks it is, and a way
+//! for a human to agree to the one Windows step first run needs.
 //! Token issuing, secret reveal, and diagnostics arrive with later tickets.
 
 use std::process::ExitCode;
 
+use agentify_bootstrap::{Bootstrap, BootstrapState, Consent, RESUME_FLAG};
 use agentify_proto::client::DaemonClient;
 
 fn main() -> ExitCode {
@@ -16,6 +18,7 @@ fn main() -> ExitCode {
         "daemon" => run_daemon(),
         "whoami" => whoami(),
         "status" => status(),
+        "bootstrap" => bootstrap(&args[1..]),
         "login-item" => login_item(&args[1..]),
         "help" | "--help" | "-h" => {
             usage();
@@ -41,9 +44,17 @@ Usage:
   agentify daemon                     run the daemon in the foreground
   agentify status                     report whether the daemon is reachable
   agentify whoami                     print the daemon's whoami payload as JSON
+  agentify bootstrap                  report whether this machine can run Projects
+  agentify bootstrap --consent        agree to the one Windows step (a UAC prompt)
+  agentify bootstrap --resume         finish setup after the restart
   agentify login-item install         start the daemon at logon (per-user task)
   agentify login-item status          is the login item registered?
   agentify login-item remove          take the login item out again
+
+  `agentify bootstrap` on its own only reports: it never installs WSL, enables a
+  Windows feature, or asks for an administrator token. Consenting is a human
+  action — this flag, or the setup card in the desktop app — and an Agent has no
+  way to produce it.
 
   Every login-item subcommand takes --name <task name>; the default is the
   name the installer registers. Nothing asks for elevation: the task runs as
@@ -56,6 +67,55 @@ Environment:
         env!("CARGO_PKG_VERSION"),
         agentify_proto::HOME_ENV
     );
+}
+
+/// `agentify bootstrap [status|--consent|--resume]`.
+///
+/// Exit codes: 0 when the machine is ready, 2 when a human action is still
+/// needed (consent, or the restart), 1 when setup failed. A script can tell
+/// "nothing to do" from "someone has to say yes" without parsing the output.
+fn bootstrap(args: &[String]) -> ExitCode {
+    let action = args.first().map(String::as_str).unwrap_or("status");
+    let program = match std::env::current_exe() {
+        Ok(program) => program,
+        Err(err) => {
+            eprintln!("agentify: locating this executable for the resume entry: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bootstrap = Bootstrap::system(
+        agentify_proto::resolve_data_root(),
+        &program,
+        &["bootstrap", RESUME_FLAG],
+    );
+
+    let report = match action {
+        "status" | "--status" => bootstrap.status(),
+        "consent" | "--consent" => bootstrap.consent(Consent::granted_by_human("cli --consent")),
+        "resume" | "--resume" => bootstrap.resume(),
+        other => {
+            eprintln!(
+                "agentify: unknown bootstrap action {other:?}; use status, --consent, or --resume"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("bootstrap: {}", report.state.as_str());
+    println!("  {}", report.message);
+    if let Some(step) = &report.elevated_step {
+        println!("  elevated step: {step}");
+    }
+    if report.reboot_required {
+        println!("  a restart is required; Agentify resumes at your next sign-in");
+    }
+
+    match report.state {
+        BootstrapState::Ready => ExitCode::SUCCESS,
+        BootstrapState::Failed => ExitCode::FAILURE,
+        // Consent, a restart, or a probe in progress: a human is still needed.
+        _ => ExitCode::from(2),
+    }
 }
 
 /// `agentify login-item install|status|remove`.

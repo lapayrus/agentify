@@ -547,6 +547,66 @@ ${renderActivity(inbox.activity, inbox.activityError)}
 }
 
 /**
+ * The first-run card: what this machine still needs before it can run a
+ * Project, and — when it needs one — the single action a human can take.
+ *
+ * The daemon does not own this state: enabling WSL is a host change that happens
+ * before any Project exists, so the shell asks the bootstrap directly. Nothing
+ * is drawn for a machine that is ready: a working install gets no card at all.
+ */
+export function renderBootstrapBanner(bootstrap) {
+  const state = bootstrap?.state;
+  if (!state || state === "ready" || state === "missing") {
+    return "";
+  }
+  const message =
+    typeof bootstrap.message === "string" && bootstrap.message
+      ? `<p class="banner-detail">${escapeHtml(bootstrap.message)}</p>`
+      : "";
+  const step =
+    typeof bootstrap.elevated_step === "string" && bootstrap.elevated_step
+      ? `<p class="banner-step" data-step="${escapeHtml(bootstrap.elevated_step)}">One administrator prompt runs <code>${escapeHtml(bootstrap.elevated_step)}</code> and waits for it.</p>`
+      : "";
+
+  const consent = `  <button type="button" class="action" data-action="bootstrap">Set up WSL 2</button>
+  <p class="banner-hint">This is the only administrator prompt Agentify asks for: Windows shows it, you answer it, and nothing is installed unless you say yes. An Agent cannot agree to it — only this button, or <code>agentify bootstrap --consent</code>.</p>`;
+
+  switch (state) {
+    case "consent_required":
+      return `<section class="banner banner-setup" data-banner="bootstrap" data-state="consent_required" role="status">
+  <h2>Set up WSL 2</h2>
+  ${message}
+  ${step}
+${consent}
+</section>`;
+    case "installing":
+      return `<section class="banner banner-setup" data-banner="bootstrap" data-state="installing" role="status">
+  <h2>Installing WSL 2</h2>
+  ${message}
+  <p class="banner-hint">The administrator window is open. This card updates when it closes; do not start it twice.</p>
+</section>`;
+    case "reboot_required":
+      return `<section class="banner banner-setup" data-banner="bootstrap" data-state="reboot_required" role="status">
+  <h2>Reboot required</h2>
+  ${message}
+  <p class="banner-hint">Windows has to restart before WSL 2 can run. Agentify resumes by itself when you sign back in: there is nothing else to press, and nothing will be installed again.</p>
+</section>`;
+    case "resuming":
+      return `<section class="banner banner-setup" data-banner="bootstrap" data-state="resuming" role="status">
+  <h2>Finishing setup</h2>
+  ${message}
+  <p class="banner-hint">The restart is done and the remaining checks are running.</p>
+</section>`;
+    default:
+      return `<section class="banner banner-setup" data-banner="bootstrap" data-state="failed" role="status">
+  <h2>Setup failed</h2>
+  ${message}
+${consent}
+</section>`;
+  }
+}
+
+/**
  * The version banner: shown only when the daemon's startup handshake refused a
  * component. The daemon is the one that decides; the shell repeats what it said,
  * because an Agent would otherwise discover a mismatched adapter through a
@@ -653,6 +713,7 @@ export function renderMain(status) {
 export function render(status) {
   return `<div class="shell" data-connection="${escapeHtml(status.state)}">
 ${renderHeader(status)}
+${renderBootstrapBanner(status.bootstrap)}
 ${renderVersionBanner(status)}
 <div class="body">
 ${renderRail(status)}

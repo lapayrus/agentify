@@ -17,6 +17,7 @@ import {
   renderLogs,
   renderSide,
   renderVersionBanner,
+  renderBootstrapBanner,
   renderApprovals,
   renderApprovalCard,
   renderActivity,
@@ -788,6 +789,119 @@ test("a mismatched version string from the daemon is escaped, never injected", (
   });
   assert.doesNotMatch(banner, /<script>/);
   assert.doesNotMatch(banner, /<img/);
+  assert.match(banner, /&lt;script&gt;/);
+});
+
+// ---------------------------------------------------------------------------
+// First run: the setup card, its one consent action, and the reboot message.
+//
+// Enabling WSL is the only thing Agentify asks an administrator for, so the card
+// has to be the only place that offers it — and a machine that is ready has to
+// show nothing at all.
+// ---------------------------------------------------------------------------
+
+/** What `bootstrap_status` returns on a machine that still needs WSL. */
+const consentRequired = {
+  state: "consent_required",
+  message:
+    "Agentify needs one administrator step: wsl.exe --install --no-distribution — WSL is not installed. Nothing has been changed yet: a human has to agree, in the app's setup card or with `agentify bootstrap --consent`.",
+  elevated_step: "wsl.exe --install --no-distribution",
+  reboot_required: true,
+  resume_scheduled: false,
+  detection: { available: false, default_version: null, distros: [] },
+};
+
+const rebooRequired = {
+  state: "reboot_required",
+  message:
+    "Reboot required: WSL 2 is installed but Windows has to restart before it can run. Agentify resumes by itself when you sign back in; nothing else is needed.",
+  elevated_step: null,
+  reboot_required: true,
+  resume_scheduled: true,
+};
+
+test("a machine that needs WSL gets a card with one consent button and the exact step", () => {
+  const banner = renderBootstrapBanner(consentRequired);
+  assert.match(banner, /data-banner="bootstrap"/);
+  assert.match(banner, /data-state="consent_required"/);
+  assert.match(banner, /Set up WSL 2/, "the card names what it will do");
+  assert.match(banner, /data-action="bootstrap"/, "the consent action is a click");
+  assert.match(banner, /wsl\.exe --install --no-distribution/, "the exact step is shown");
+  assert.match(banner, /data-step="wsl\.exe --install --no-distribution"/);
+  assert.match(banner, /administrator prompt/, "it says what is about to happen");
+  assert.match(banner, /An Agent cannot agree to it/, "consent is a human act");
+  assert.match(banner, /agentify bootstrap --consent/, "and the CLI says the same thing");
+});
+
+test("the reboot the install needs is explained rather than repeated as an action", () => {
+  const banner = renderBootstrapBanner(rebooRequired);
+  assert.match(banner, /data-state="reboot_required"/);
+  assert.match(banner, /Reboot required/);
+  assert.match(banner, /Agentify resumes by itself/, "the resume is automatic");
+  assert.match(banner, /nothing else to press/, "there is no button to press");
+  assert.doesNotMatch(banner, /data-action="bootstrap"/, "nobody has to agree twice");
+});
+
+test("an install in flight offers no second button", () => {
+  const banner = renderBootstrapBanner({ state: "installing", message: "Running wsl --install." });
+  assert.match(banner, /data-state="installing"/);
+  assert.match(banner, /Installing WSL 2/);
+  assert.doesNotMatch(banner, /data-action="bootstrap"/);
+  assert.match(banner, /do not start it twice/);
+});
+
+test("a failed setup says what happened and offers the human a retry", () => {
+  const banner = renderBootstrapBanner({
+    state: "failed",
+    message: "ui declined the administrator prompt, so nothing was changed.",
+    elevated_step: "wsl.exe --install --no-distribution",
+  });
+  assert.match(banner, /data-state="failed"/);
+  assert.match(banner, /Setup failed/);
+  assert.match(banner, /declined the administrator prompt/);
+  assert.match(banner, /data-action="bootstrap"/, "a retry is the same consent");
+});
+
+test("a ready or unchecked machine draws no setup card at all", () => {
+  assert.equal(renderBootstrapBanner({ state: "ready", message: "WSL 2 is ready (Ubuntu)." }), "");
+  assert.equal(renderBootstrapBanner({ state: "missing" }), "");
+  assert.equal(renderBootstrapBanner(null), "");
+  assert.equal(renderBootstrapBanner(undefined), "");
+  assert.equal(renderBootstrapBanner({}), "");
+});
+
+test("the setup card sits above the shell body, before the version banner", () => {
+  const html = render({ ...connected, bootstrap: consentRequired });
+  assert.ok(html.indexOf('data-banner="bootstrap"') > 0);
+  assert.ok(
+    html.indexOf('data-banner="bootstrap"') < html.indexOf('<div class="body"'),
+    "the card is above the three zones",
+  );
+
+  const refused = render({
+    ...connected,
+    bootstrap: consentRequired,
+    handshake: refusedHandshake,
+  });
+  assert.ok(
+    refused.indexOf('data-banner="bootstrap"') <
+      refused.indexOf('data-banner="version-mismatch"'),
+    "setup comes before a version refusal",
+  );
+
+  const ready = render({ ...connected, bootstrap: { state: "ready", message: "WSL 2 is ready." } });
+  assert.doesNotMatch(ready, /data-banner="bootstrap"/, "a ready machine sees no card");
+});
+
+test("bootstrap text is escaped, never injected", () => {
+  const banner = renderBootstrapBanner({
+    state: "consent_required",
+    message: '<img src=x onerror="alert(1)">',
+    elevated_step: '<script>alert("pwned")</script>',
+  });
+  assert.doesNotMatch(banner, /<img/);
+  assert.doesNotMatch(banner, /<script>/);
+  assert.match(banner, /&lt;img/);
   assert.match(banner, /&lt;script&gt;/);
 });
 

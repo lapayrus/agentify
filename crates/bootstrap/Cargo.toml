@@ -1,0 +1,17 @@
+[package]
+name = "agentify-bootstrap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "First-run Windows bootstrap: detect WSL, ask a human, elevate once, resume after a restart"
+
+[dependencies]
+agentify-proto = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }

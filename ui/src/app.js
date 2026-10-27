@@ -22,6 +22,8 @@ const app = document.getElementById("app");
 let status = { state: "loading" };
 let selected = null;
 let tab = "overview";
+/** The first-run state: `{ state, message, elevated_step, reboot_required }`. */
+let bootstrap = null;
 /** { status, stats, logs: { lines, nextSince, following, error }, pending, error } */
 let view = { status: null, stats: null, logs: { lines: [], following: false }, pending: null };
 /** The right column: the Approval inbox and the activity feed. */
@@ -191,7 +193,7 @@ async function decide(action, approvalId) {
 
 function paint() {
   app.dataset.connection = status.state;
-  app.innerHTML = render({ ...status, selected, view, inbox });
+  app.innerHTML = render({ ...status, selected, view, inbox, bootstrap });
 
   for (const button of app.querySelectorAll("[data-project]")) {
     button.addEventListener("click", () => {
@@ -210,7 +212,17 @@ function paint() {
       const action = button.dataset.action;
       if (action === "retry") {
         button.disabled = true;
+        // A retry is a fresh look at the machine as well as the daemon: after a
+        // restart the first-run state is what changed.
+        loadBootstrap();
         refresh();
+        return;
+      }
+      if (action === "bootstrap") {
+        // A click is the consent to the one administrator step. It is the only
+        // thing in this window that can reach the elevated command.
+        button.disabled = true;
+        setupWsl();
         return;
       }
       act(action);
@@ -233,6 +245,37 @@ function paint() {
       }
     });
   }
+}
+
+/**
+ * The first-run state. A read: nothing is installed by asking, and a machine
+ * that is already set up answers `ready`, which draws no card at all.
+ */
+async function loadBootstrap() {
+  if (!bridge()) {
+    return;
+  }
+  try {
+    bootstrap = await call("bootstrap_status");
+  } catch (error) {
+    bootstrap = { state: "failed", message: `The shell could not check this machine: ${error}` };
+  }
+}
+
+/**
+ * The consent action. This click is the consent: the shell passes it to the one
+ * command that may raise a UAC prompt, and reports whatever comes back. Nothing
+ * else in the window can reach that command.
+ */
+async function setupWsl() {
+  bootstrap = { ...bootstrap, state: "installing", message: "Waiting for the administrator window…" };
+  paint();
+  try {
+    bootstrap = await call("bootstrap_consent");
+  } catch (error) {
+    bootstrap = { state: "failed", message: String(error) };
+  }
+  paint();
 }
 
 /** Start or Stop. The daemon decides; the shell only reports. */
@@ -277,3 +320,6 @@ function startFollowing() {
 refresh();
 setInterval(refresh, POLL_INTERVAL_MS);
 startFollowing();
+// The first-run state is asked for once and after every consent: it is a probe
+// of the machine, not something that changes on a five-second cadence.
+loadBootstrap().then(paint);

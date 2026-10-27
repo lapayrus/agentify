@@ -302,3 +302,49 @@ fn the_shell_shows_the_approval_inbox_and_decides_through_the_same_api() {
 
     daemon.shutdown().expect("stop daemon");
 }
+
+// ---------------------------------------------------------------------------
+// First run: the shell's setup card is a read, plus one clicked consent.
+// ---------------------------------------------------------------------------
+
+/// This test never elevates and never installs: it only asks the shell where the
+/// machine is. On a machine that already has WSL 2 the answer is `ready` with
+/// nothing to run; on one that does not, it is one named step waiting for a
+/// human.
+#[test]
+fn the_shell_reports_the_first_run_state_without_elevating_anything() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let program = std::path::Path::new("C:\\Program Files\\Agentify\\Agentify.exe");
+    let report = agentify_shell::bootstrap_status_for(temp.path(), program);
+    let json = serde_json::to_value(&report).expect("a report the window can render");
+    let state = json["state"].as_str().unwrap_or_default();
+    let message = json["message"].as_str().unwrap_or_default();
+
+    // A machine has one of exactly three first-run answers before anything is
+    // agreed to, and "installing" is never one of them: nothing is running.
+    assert!(
+        state == "ready" || state == "consent_required" || state == "failed",
+        "unexpected first-run state {state}: {json}"
+    );
+    assert!(!message.is_empty(), "{json}");
+
+    if state == "ready" {
+        assert!(
+            json["elevated_step"].is_null(),
+            "a ready machine is asked for no elevated step: {json}"
+        );
+        assert_eq!(json["reboot_required"], false, "{json}");
+        assert_eq!(json["resume_scheduled"], false, "{json}");
+        assert_eq!(json["versions"]["ok"], true, "the pins were checked: {json}");
+    } else if state == "consent_required" {
+        assert_eq!(
+            json["elevated_step"].as_str().unwrap_or_default(),
+            "wsl.exe --install --no-distribution",
+            "exactly one step is offered, and it installs no distribution: {json}"
+        );
+        assert!(
+            message.contains("agentify bootstrap --consent"),
+            "the card says how a human can agree: {json}"
+        );
+    }
+}

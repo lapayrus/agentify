@@ -12,6 +12,7 @@ name = "agentify"
 path = "src/main.rs"
 
 [dependencies]
+agentify-bootstrap = { workspace = true }
 agentify-daemon = { path = "../daemon" }
 agentify-proto = { workspace = true }
 anyhow = { workspace = true }
