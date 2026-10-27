@@ -517,6 +517,20 @@ impl Ingress {
         result
     }
 
+    /// Reach the desired routes, granularly if possible.
+    ///
+    /// Two kinds of change are one atomic config load rather than a sequence of
+    /// granular writes:
+    ///
+    /// * the repair after a failed write, because the route table can no longer
+    ///   be trusted;
+    /// * **adding** a hostname, because Caddy starts certificate issuance on
+    ///   every reload — two reloads a millisecond apart make two issuance jobs
+    ///   race for the same name, and one of them loses. One load, one issuance,
+    ///   and the browser's first handshake has a certificate to show.
+    ///
+    /// A route that only moves (running → stopped, lease → lease) or disappears
+    /// is a single granular call, which is the frequent case.
     fn apply_locked(
         &self,
         running: &mut Running,
@@ -524,72 +538,58 @@ impl Ingress {
         desired: &[Route],
         mode: HttpMode,
     ) -> Result<(), IngressError> {
-        // 1. Work out the new table and the smallest set of calls that gets
-        //    Caddy there.
-        let mut next: Vec<Entry> = Vec::new();
-        let mut puts: Vec<(usize, Route)> = Vec::new();
-        let mut deletes: Vec<usize> = Vec::new();
-        for (index, entry) in running.routes.iter().enumerate() {
-            if entry.environment != environment {
-                next.push(entry.clone());
-                continue;
-            }
-            match desired.iter().find(|route| route.hostname == entry.route.hostname) {
-                Some(route) => {
-                    if route.target != entry.route.target {
-                        puts.push((index, route.clone()));
-                        next.push(Entry {
-                            environment: entry.environment.clone(),
-                            route: route.clone(),
-                        });
-                    } else {
-                        next.push(entry.clone());
-                    }
-                }
-                None => deletes.push(index),
-            }
-        }
-        let mut appends: Vec<Route> = Vec::new();
-        for route in desired {
-            let known = running
-                .routes
-                .iter()
-                .any(|entry| entry.route.hostname == route.hostname);
-            if !known {
-                appends.push(route.clone());
-                next.push(Entry {
-                    environment: environment.to_string(),
-                    route: route.clone(),
-                });
-            }
-        }
+        let (next, ops) = plan(&running.routes, environment, desired);
 
-        // A full load is cheaper and safer than trusting a table we know is
-        // stale — and it is the only recovery path that cannot drift.
-        if running.needs_load {
+        let adds_hostname = ops.iter().any(|op| matches!(op, Op::Append(_)));
+        if running.needs_load || adds_hostname {
             return self.load_config(running, &next, mode);
         }
 
-        let mut changed = false;
-        for (index, route) in &puts {
-            running.admin.put_route(SERVER_TLS, *index, &route.tls_json())?;
-            running.admin.put_route(SERVER_HTTP, *index, &route.http_json(mode))?;
-            changed = true;
+        match self.execute(running, &ops, mode) {
+            Ok(()) => {
+                running.routes = next;
+                Ok(())
+            }
+            Err(err) => {
+                self.load_config(running, &next, mode).map_err(|reload| {
+                    IngressError::Admin(crate::admin::AdminError::Malformed(format!(
+                        "a granular route write failed ({}), and reloading the config also \
+                         failed: {}",
+                        err.detail(),
+                        reload.detail()
+                    )))
+                })
+            }
         }
-        for route in &appends {
-            running.admin.append_route(SERVER_TLS, &route.tls_json())?;
-            running.admin.append_route(SERVER_HTTP, &route.http_json(mode))?;
-            changed = true;
+    }
+
+    /// Run the planned granular writes. Puts and appends keep every existing
+    /// index; deletes descend so each one sees the array it was planned against.
+    ///
+    /// A write Caddy refuses is repaired by the caller with a full load, so a
+    /// Caddy that rejects one route can never leave the table ahead of reality.
+    fn execute(
+        &self,
+        running: &mut Running,
+        ops: &[Op],
+        mode: HttpMode,
+    ) -> Result<(), IngressError> {
+        for op in ops {
+            match op {
+                Op::Put(index, route) => {
+                    running.admin.put_route(SERVER_TLS, *index, &route.tls_json())?;
+                    running.admin.put_route(SERVER_HTTP, *index, &route.http_json(mode))?;
+                }
+                Op::Append(route) => {
+                    running.admin.append_route(SERVER_TLS, &route.tls_json())?;
+                    running.admin.append_route(SERVER_HTTP, &route.http_json(mode))?;
+                }
+                Op::Delete(index) => {
+                    running.admin.delete_route(SERVER_TLS, *index)?;
+                    running.admin.delete_route(SERVER_HTTP, *index)?;
+                }
+            }
         }
-        // Highest index first, so each delete sees the array it expected.
-        deletes.sort_unstable();
-        for index in deletes.iter().rev() {
-            running.admin.delete_route(SERVER_TLS, *index)?;
-            running.admin.delete_route(SERVER_HTTP, *index)?;
-            changed = true;
-        }
-        let _ = changed;
-        running.routes = next;
         Ok(())
     }
 
@@ -763,6 +763,136 @@ fn free_loopback_port() -> Result<SocketAddr, IngressError> {
     Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port())))
 }
 
+/// One granular admin write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Op {
+    /// Replace the route at this index.
+    Put(usize, Route),
+    /// Add a route at the end.
+    Append(Route),
+    /// Remove the route at this index.
+    Delete(usize),
+}
+
+/// Work out the new route table for one Environment and the smallest set of
+/// calls that gets Caddy there.
+///
+/// Nothing else is touched: another Environment's routes keep their positions,
+/// which is what makes a granular update safe.
+fn plan(current: &[Entry], environment: &str, desired: &[Route]) -> (Vec<Entry>, Vec<Op>) {
+    let mut next: Vec<Entry> = Vec::new();
+    let mut puts: Vec<Op> = Vec::new();
+    let mut deletes: Vec<usize> = Vec::new();
+
+    for (index, entry) in current.iter().enumerate() {
+        if entry.environment != environment {
+            next.push(entry.clone());
+            continue;
+        }
+        match desired.iter().find(|route| route.hostname == entry.route.hostname) {
+            Some(route) if route.target != entry.route.target => {
+                puts.push(Op::Put(index, route.clone()));
+                next.push(Entry {
+                    environment: entry.environment.clone(),
+                    route: route.clone(),
+                });
+            }
+            Some(_) => next.push(entry.clone()),
+            None => deletes.push(index),
+        }
+    }
+
+    let mut appends: Vec<Op> = Vec::new();
+    for route in desired {
+        let known = current
+            .iter()
+            .any(|entry| entry.route.hostname == route.hostname);
+        if !known {
+            appends.push(Op::Append(route.clone()));
+            next.push(Entry {
+                environment: environment.to_string(),
+                route: route.clone(),
+            });
+        }
+    }
+
+    let mut ops = puts;
+    ops.extend(appends);
+    // Highest index first: each delete then sees the array it was planned on.
+    deletes.sort_unstable();
+    ops.extend(deletes.into_iter().rev().map(Op::Delete));
+    (next, ops)
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn entry(environment: &str, hostname: &str, port: u16) -> Entry {
+        Entry {
+            environment: environment.to_string(),
+            route: Route::upstream(hostname, port),
+        }
+    }
+
+    #[test]
+    fn a_new_hostname_is_one_append_and_leaves_the_rest_alone() {
+        let current = vec![entry("env-1", "web.demo.localhost", 40001)];
+        let desired = vec![
+            Route::upstream("web.demo.localhost", 40001),
+            Route::upstream("api.demo.localhost", 40002),
+        ];
+        let (next, ops) = plan(&current, "env-1", &desired);
+        assert_eq!(next.len(), 2);
+        assert_eq!(
+            ops,
+            vec![Op::Append(Route::upstream("api.demo.localhost", 40002))],
+            "one call, and the existing route is untouched"
+        );
+    }
+
+    #[test]
+    fn a_moved_lease_is_one_put_at_its_own_index() {
+        let current = vec![
+            entry("env-1", "web.demo.localhost", 40001),
+            entry("env-2", "api.other.localhost", 40009),
+        ];
+        let desired = vec![Route::upstream("web.demo.localhost", 40005)];
+        let (next, ops) = plan(&current, "env-1", &desired);
+        assert_eq!(
+            ops,
+            vec![Op::Put(0, Route::upstream("web.demo.localhost", 40005))]
+        );
+        assert_eq!(next[1], current[1], "the other Environment keeps its route");
+    }
+
+    #[test]
+    fn removal_deletes_high_index_first_so_the_others_do_not_shift_under_it() {
+        let current = vec![
+            entry("env-1", "web.demo.localhost", 40001),
+            entry("env-2", "api.other.localhost", 40009),
+            entry("env-1", "admin.demo.localhost", 40002),
+        ];
+        let desired = vec![Route::upstream("web.demo.localhost", 40001)];
+        let (next, ops) = plan(&current, "env-1", &desired);
+        assert_eq!(ops, vec![Op::Delete(2)]);
+        assert_eq!(next.len(), 2);
+
+        let (next, ops) = plan(&current, "env-1", &[]);
+        assert_eq!(ops, vec![Op::Delete(2), Op::Delete(0)], "{ops:?}");
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].environment, "env-2");
+    }
+
+    #[test]
+    fn an_unchanged_environment_produces_no_calls_at_all() {
+        let current = vec![entry("env-1", "web.demo.localhost", 40001)];
+        let desired = vec![Route::upstream("web.demo.localhost", 40001)];
+        let (_, ops) = plan(&current, "env-1", &desired);
+        assert!(ops.is_empty(), "a start that changes nothing writes nothing");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,6 +965,11 @@ mod tests {
             .sync_environment("env-1", &[Route::upstream(WEB, 40017)])
             .expect("sync");
 
+        assert_eq!(
+            h.admin.loads(),
+            2,
+            "a new hostname is one atomic config load, so Caddy issues one certificate"
+        );
         let routes = h.admin.routes(SERVER_TLS);
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0]["@id"], "agentify:https:web.hello-pg.localhost");
@@ -854,6 +989,7 @@ mod tests {
         h.ingress
             .sync_environment("env-1", &[Route::upstream(WEB, 40017)])
             .expect("sync first");
+        let loads = h.admin.loads();
         h.ingress
             .sync_environment(
                 "env-1",
@@ -874,7 +1010,12 @@ mod tests {
             .expect("body")
             .contains("stopped"));
 
-        assert_eq!(h.admin.loads(), 1, "a stop is a granular update, not a reload");
+        assert_eq!(
+            h.admin.loads(),
+            loads,
+            "a stop is a granular update, not a reload: {:#?}",
+            h.admin.requests()
+        );
         assert_eq!(h.ingress.routes()[0].state, "stopped");
         assert_eq!(h.ingress.routes()[0].upstream, None);
     }
@@ -885,12 +1026,18 @@ mod tests {
         h.ingress
             .sync_environment("env-1", &[Route::upstream(WEB, 40017)])
             .expect("sync");
+        let loads = h.admin.loads();
         h.ingress.remove_environment("env-1").expect("remove");
 
         assert!(h.admin.routes(SERVER_TLS).is_empty());
         assert!(h.admin.routes(SERVER_HTTP).is_empty());
         assert!(h.ingress.routes().is_empty());
-        assert_eq!(h.admin.loads(), 1, "deleting one route is granular too");
+        assert_eq!(
+            h.admin.loads(),
+            loads,
+            "deleting one route is granular too: {:#?}",
+            h.admin.requests()
+        );
     }
 
     #[test]

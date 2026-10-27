@@ -160,7 +160,9 @@ pub fn base_config(
     json!({
         "admin": {
             "listen": admin.to_string(),
-            "persist": false,
+            // No autosave: a persisted config could resurrect routes the daemon
+            // no longer knows about after a restart.
+            "config": { "persist": false },
         },
         "storage": {
             "module": "file_system",
@@ -171,7 +173,7 @@ pub fn base_config(
                 "certificate_authorities": {
                     "local": {
                         "name": "Agentify Local Authority",
-                        "root_cn": crate::trust::CA_COMMON_NAME,
+                        "root_common_name": crate::trust::CA_COMMON_NAME,
                         "install_trust": false,
                     }
                 }
@@ -201,9 +203,46 @@ pub struct CaddyInstance {
     admin: SocketAddr,
     binary: PathBuf,
     config_path: PathBuf,
+    log_path: PathBuf,
 }
 
 impl CaddyInstance {
+    /// Ask Caddy whether it would accept this config, so a bad route is a
+    /// readable error instead of a process that exits without saying why.
+    pub fn validate(binary: &Path, config_path: &Path) -> Result<(), CaddyError> {
+        let mut command = Command::new(binary);
+        command
+            .arg("validate")
+            .arg("--config")
+            .arg(config_path)
+            // The adapter is inferred from the `.json` extension; naming it
+            // explicitly is refused by some builds.
+            .stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = command.output().map_err(|err| CaddyError::Failed {
+            path: binary.to_path_buf(),
+            detail: err.to_string(),
+        })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if detail.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            detail
+        };
+        Err(CaddyError::Failed {
+            path: binary.to_path_buf(),
+            detail: format!("the generated config was refused: {detail}"),
+        })
+    }
+
     /// Start Caddy on `config_path` and wait until its admin endpoint answers.
     pub fn spawn(
         binary: &Path,
@@ -211,6 +250,7 @@ impl CaddyInstance {
         log_path: &Path,
         admin: SocketAddr,
     ) -> Result<Self, CaddyError> {
+        Self::validate(binary, config_path)?;
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -232,8 +272,6 @@ impl CaddyInstance {
             .arg("run")
             .arg("--config")
             .arg(config_path)
-            .arg("--adapter")
-            .arg("json")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
@@ -250,11 +288,12 @@ impl CaddyInstance {
             detail: err.to_string(),
         })?;
 
-        let instance = Self {
+        let mut instance = Self {
             child: Some(child),
             admin,
             binary: binary.to_path_buf(),
             config_path: config_path.to_path_buf(),
+            log_path: log_path.to_path_buf(),
         };
         instance.await_ready()?;
         Ok(instance)
@@ -288,11 +327,20 @@ impl CaddyInstance {
         }
     }
 
-    fn await_ready(&self) -> Result<(), CaddyError> {
+    fn await_ready(&mut self) -> Result<(), CaddyError> {
         let client = crate::http::Http::new(self.admin);
         let deadline = Instant::now() + READY_TIMEOUT;
         let mut last = String::from("no response yet");
         while Instant::now() < deadline {
+            if !self.running() {
+                // Give the fatal line a moment to reach the log before reading.
+                std::thread::sleep(Duration::from_millis(250));
+                let tail = self.log_tail().unwrap_or_else(|| "no output".to_string());
+                return Err(CaddyError::NotReady {
+                    admin: self.admin,
+                    detail: format!("the process exited: {tail}"),
+                });
+            }
             match client.get("/config/") {
                 Ok(response) if response.is_success() => return Ok(()),
                 Ok(response) => last = format!("status {}", response.status),
@@ -302,8 +350,29 @@ impl CaddyInstance {
         }
         Err(CaddyError::NotReady {
             admin: self.admin,
-            detail: last,
+            detail: match self.log_tail() {
+                Some(tail) => format!("{last}; caddy said: {tail}"),
+                None => last,
+            },
         })
+    }
+
+    /// The end of Caddy's own log: a startup failure has to be readable.
+    fn log_tail(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(&self.log_path).ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let tail: String = trimmed
+            .chars()
+            .rev()
+            .take(1200)
+            .collect::<Vec<char>>()
+            .into_iter()
+            .rev()
+            .collect();
+        Some(tail)
     }
 }
 
@@ -324,7 +393,7 @@ mod tests {
 
         assert_eq!(config["admin"]["listen"], "127.0.0.1:41234");
         assert_eq!(
-            config["admin"]["persist"], false,
+            config["admin"]["config"]["persist"], false,
             "an autosaved config would resurrect routes the daemon does not know about"
         );
 
@@ -351,7 +420,7 @@ mod tests {
             Path::new("/data/ingress/caddy"),
         );
         let ca = &config["apps"]["pki"]["certificate_authorities"]["local"];
-        assert_eq!(ca["root_cn"], crate::trust::CA_COMMON_NAME);
+        assert_eq!(ca["root_common_name"], crate::trust::CA_COMMON_NAME);
         assert_eq!(
             ca["install_trust"], false,
             "Caddy must never write to a certificate store on its own"
