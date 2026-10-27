@@ -740,6 +740,97 @@ async fn logs_serve_tail_since_and_follow_without_blocking_the_workload() {
     harness.finish();
 }
 
+/// Statistics at the API seam: measured where the substrate can measure, and a
+/// state — never a guess — where it cannot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_reports_measured_figures_and_never_invents_one() {
+    if !enabled() {
+        return;
+    }
+    let harness = Harness::new("stats");
+    let environment = "stats".to_string();
+    let spec = spec(&environment);
+
+    // Nothing provisioned yet: a snapshot with no figures, not an error.
+    let absent = harness.backend.stats(&environment).await.expect("stats");
+    assert_eq!(absent.state, STATE_ABSENT);
+    assert_eq!(absent.cpu_percent, 0.0);
+    assert_eq!(absent.memory_bytes, 0, "a runtime that does not exist uses nothing");
+    assert_eq!(absent.disk_bytes, 0);
+    assert!(absent.resources.is_empty());
+
+    harness.backend.start(&spec).await.expect("start");
+    let running = harness.backend.stats(&environment).await.expect("stats");
+    assert_eq!(running.state, STATE_RUNNING);
+    assert_eq!(running.environment, environment, "figures are labelled with what was asked");
+    assert!(
+        running.memory_bytes > 0,
+        "a running distro proves memory from /proc/meminfo: {running:?}"
+    );
+    assert!(
+        running.disk_bytes > 0,
+        "a running distro has a rootfs with bytes in it: {running:?}"
+    );
+    assert!(running.cpu_percent >= 0.0, "a CPU rate is a rate, never negative");
+    // Per-Resource figures exist only when the engine is installed and has
+    // containers; when they do, each one names a real container.
+    for resource in &running.resources {
+        assert!(
+            !resource.name.is_empty(),
+            "a per-Resource figure names its Resource: {resource:?}"
+        );
+    }
+    eprintln!(
+        "stats seam: cpu {:.2}%, memory {} B, disk {} B, {} per-Resource figure(s)",
+        running.cpu_percent,
+        running.memory_bytes,
+        running.disk_bytes,
+        running.resources.len()
+    );
+
+    // Stopped keeps the answer, loses the figures, and stays readable.
+    harness.backend.stop(&environment).await.expect("stop");
+    let stopped = harness.backend.stats(&environment).await.expect("stats");
+    assert_eq!(stopped.state, STATE_STOPPED);
+    assert_eq!(stopped.memory_bytes, 0);
+    assert_eq!(stopped.cpu_percent, 0.0);
+
+    harness.backend.remove(&environment, false).await.expect("remove");
+    let gone = harness.backend.stats(&environment).await.expect("stats");
+    assert_eq!(gone.state, STATE_ABSENT);
+    assert!(gone.resources.is_empty());
+    harness.finish();
+}
+
+/// A payload no text pipeline can survive: text, a NUL, 0xFF, a sequence that
+/// is not valid UTF-8, the bytes of U+FFFD itself, and CR LF.
+const PAYLOAD: &[u8] = b"agentify copy: NUL \x00, 0xFF \xff, high \x80\xc3\x28, U+FFFD \xef\xbf\xbd, CR LF \r\n";
+
+/// The hex `od -An -tx1` prints, back as bytes' worth of characters, so a
+/// binary file can be compared through a stream that carries text.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+async fn guest_bytes(backend: &WslBackend, environment: &str, path: &str) -> Vec<u8> {
+    // `od` renders the file as ASCII hex, so the assertion never depends on a
+    // text decoder being lossless — which is exactly the bug this test hunts.
+    let (stdout, stderr, code) = run(
+        backend,
+        environment,
+        "web",
+        &["od", "-An", "-tx1", "-v", path],
+    )
+    .await;
+    assert_eq!(code, 0, "od cannot read {path}: {stderr}");
+    let digits: String = stdout.split_whitespace().collect();
+    assert_eq!(digits.len() % 2, 0, "od printed complete byte pairs");
+    (0..digits.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&digits[at..at + 2], 16).expect("a hex pair"))
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copy_moves_bytes_both_ways_through_the_distro() {
     if !enabled() {
@@ -752,33 +843,51 @@ async fn copy_moves_bytes_both_ways_through_the_distro() {
 
     let dir = scratch_dir("copy");
     let source = dir.join("in.txt");
-    let payload: &[u8] = b"agentify copy: text, a NUL \x00 and a high byte \xff\n";
-    std::fs::write(&source, payload).expect("write the source");
+    std::fs::write(&source, PAYLOAD).expect("write the source");
 
+    let guest = "/tmp/agentify-copy/in.txt";
     harness
         .backend
-        .copy_in(&environment, Some("web"), &source, "/tmp/agentify-copy/in.txt")
+        .copy_in(&environment, Some("web"), &source, guest)
         .await
         .expect("copy in");
-    let (stdout, _, code) = run(&harness.backend, &environment, "web", &["cat", "/tmp/agentify-copy/in.txt"]).await;
-    assert_eq!(code, 0, "the copied file is readable in the distro");
     assert_eq!(
-        stdout.as_bytes(),
-        payload,
-        "the bytes arrived unchanged, including the NUL"
+        hex(&guest_bytes(&harness.backend, &environment, guest).await),
+        hex(PAYLOAD),
+        "the bytes arrived unchanged, including the NUL, 0xFF, and the CR LF"
     );
 
     let target = dir.join("out.txt");
     harness
         .backend
-        .copy_out(&environment, Some("web"), "/tmp/agentify-copy/in.txt", &target)
+        .copy_out(&environment, Some("web"), guest, &target)
         .await
         .expect("copy out");
     assert_eq!(
         std::fs::read(&target).expect("read the copy"),
-        payload,
+        PAYLOAD,
         "the round trip is byte for byte"
     );
+
+    // A second copy of an empty file is a file, not a special case: nothing on
+    // the wire, and a zero-length result on both sides.
+    let empty = dir.join("empty.bin");
+    std::fs::write(&empty, b"").expect("write an empty file");
+    harness
+        .backend
+        .copy_in(&environment, Some("web"), &empty, "/tmp/agentify-copy/empty.bin")
+        .await
+        .expect("copy an empty file in");
+    assert!(guest_bytes(&harness.backend, &environment, "/tmp/agentify-copy/empty.bin")
+        .await
+        .is_empty());
+    let empty_target = dir.join("empty-out.bin");
+    harness
+        .backend
+        .copy_out(&environment, Some("web"), "/tmp/agentify-copy/empty.bin", &empty_target)
+        .await
+        .expect("copy an empty file out");
+    assert!(std::fs::read(&empty_target).expect("read").is_empty());
 
     // A guest path that climbs is refused at the boundary, before any runtime
     // work happens.
@@ -846,6 +955,14 @@ async fn a_transfer_outside_the_daemon_root_is_refused() {
 
     // Inside the root the path is accepted as far as the runtime, and only the
     // absence of a runtime stops it.
+    //
+    // `data_root` is read from the config as the daemon configured it, and the
+    // harness spells it through `CARGO_MANIFEST_DIR/../../target/wsl-test`: the
+    // adapter resolves a *configured* root lexically, so what comes back — and
+    // the path built from it here — carries no `..`. The traversal rule is not
+    // weakened: a `..` in the transfer path itself is still a refusal (asserted
+    // above, and in the copy test), it is only the configuration that is read as
+    // written.
     let inside = data_root.join("wsl").join("payload.txt");
     std::fs::create_dir_all(inside.parent().unwrap()).expect("data root");
     std::fs::write(&inside, b"the daemon's").expect("write");
@@ -854,6 +971,19 @@ async fn a_transfer_outside_the_daemon_root_is_refused() {
         .await
         .expect_err("there is no runtime to copy into");
     assert_eq!(err.code(), "NotProvisioned", "{err}");
+
+    // The same path with a `..` in it is a traversal, not a daemon-owned path,
+    // however far inside the root it would have landed.
+    let climbing = data_root.join("wsl").join("..").join("payload.txt");
+    let err = strict
+        .copy_in("env-never-started", Some("web"), &climbing, "/tmp/x")
+        .await
+        .expect_err("a climbing host path is refused");
+    assert_eq!(err.code(), "ExecutionFailed", "{err}");
+    assert!(
+        err.to_string().contains("climbs upward"),
+        "the refusal names the rule: {err}"
+    );
 
     let _ = std::fs::remove_file(&outside);
     let _ = std::fs::remove_file(&inside);

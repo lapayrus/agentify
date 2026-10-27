@@ -19,7 +19,9 @@
 //!   `/proc` and `df`, per-Resource figures from `docker stats` when the engine
 //!   is there;
 //! * [`transfer`] moves single files in and out through the launcher's pipes,
-//!   after [`paths`] refuses a traversal or a host path the daemon does not own.
+//!   base64 in both directions so the channel carries text and never a binary
+//!   that some layer between two operating systems could transcode, after
+//!   [`paths`] refuses a traversal or a host path the daemon does not own.
 //!
 //! What it deliberately does not do:
 //!
@@ -140,8 +142,15 @@ pub struct WslConfig {
 
 impl WslConfig {
     /// Production defaults for one data root.
+    ///
+    /// The root is read as it was written: `..` and `.` are resolved lexically
+    /// ([`paths::tidy`]), so a data root spelled with a `..` still means the
+    /// directory it names — every path this adapter derives (`wsl_dir`,
+    /// `env_dir`, `log_path`) and every clean path the daemon hands to a copy is
+    /// then spelled without a `..`, and the transfer path rule is not tripped by
+    /// configuration. The rule that a *transfer* path may not climb is untouched.
     pub fn new(data_root: impl Into<PathBuf>) -> Self {
-        let data_root = data_root.into();
+        let data_root = paths::tidy(&data_root.into());
         Self {
             host_transfer_root: Some(data_root.clone()),
             data_root,
@@ -201,9 +210,10 @@ impl WslConfig {
     }
 
     /// Where a transfer's host path is allowed to live. `None` lifts the
-    /// daemon-owned root, which is only ever right in a test.
+    /// daemon-owned root, which is only ever right in a test. A root is
+    /// configuration, so it is read as written ([`paths::tidy`]).
     pub fn with_host_transfer_root(mut self, root: Option<PathBuf>) -> Self {
-        self.host_transfer_root = root;
+        self.host_transfer_root = root.map(|root| paths::tidy(&root));
         self
     }
 
@@ -1232,6 +1242,50 @@ mod tests {
         assert_eq!(config.host_transfer_root, Some(PathBuf::from("C:/data")));
         let relaxed = config.clone().with_host_transfer_root(None);
         assert_eq!(relaxed.host_transfer_root, None);
+    }
+
+    #[test]
+    fn a_data_root_is_read_as_written_so_every_derived_path_is_clean() {
+        // A data root spelled with a `..` — `agentify-proto` reads the value of
+        // an environment variable verbatim, and a test builds its root from
+        // `CARGO_MANIFEST_DIR` — names one directory, and every path this adapter
+        // derives from it must still pass the transfer path rule.
+        let base = if cfg!(windows) {
+            PathBuf::from("C:/checkout")
+        } else {
+            PathBuf::from("/checkout")
+        };
+        let spelled = base
+            .join("crates")
+            .join("backends")
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("wsl-test");
+        let config = WslConfig::new(&spelled);
+        let clean = base.join("target").join("wsl-test");
+        assert_eq!(config.data_root, clean);
+        assert_eq!(config.host_transfer_root, Some(clean.clone()));
+        for derived in [
+            config.wsl_dir(),
+            config.env_dir("env-1"),
+            config.log_path("env-1"),
+            config.env_record_path("env-1"),
+        ] {
+            assert!(
+                !derived.components().any(|part| part == std::path::Component::ParentDir),
+                "a derived path is spelled without `..`: {}",
+                derived.display()
+            );
+        }
+        let payload = clean.join("wsl").join("payload.txt");
+        assert!(
+            paths::host_path(&payload, config.host_transfer_root.as_deref()).is_ok(),
+            "a clean daemon-owned path under the root is accepted"
+        );
+        // And the root itself, configured the same way, still refuses a climb.
+        let climbing = clean.join("..").join("payload.txt");
+        assert!(paths::host_path(&climbing, config.host_transfer_root.as_deref()).is_err());
     }
 
     #[test]

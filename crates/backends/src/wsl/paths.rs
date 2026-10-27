@@ -12,6 +12,13 @@
 //!   daemon-owned root when one is configured — the daemon is the only caller,
 //!   and this is the adapter's side of that promise.
 //!
+//! The root itself is treated differently from a path handed in: it is
+//! configuration, so it is read *as written* ([`tidy`] resolves `.` and `..`
+//! lexically, the way a shell would). A data root spelled
+//! `<checkout>/../../target/wsl-test` names exactly the directory it names, and
+//! every clean path derived from it must still be accepted. A `..` in a
+//! *transfer path* is refused outright, whatever it would have normalised to.
+//!
 //! Nothing here touches the filesystem beyond `Path` inspection, so both rules
 //! are unit-tested everywhere, WSL or not.
 
@@ -98,6 +105,7 @@ pub fn host_path(path: &Path, root: Option<&Path>) -> crate::error::Result<PathB
         )));
     }
     if let Some(root) = root {
+        let root = tidy(root);
         if !root.is_absolute() {
             return Err(BackendError::BackendUnavailable {
                 detail: format!(
@@ -106,7 +114,7 @@ pub fn host_path(path: &Path, root: Option<&Path>) -> crate::error::Result<PathB
                 ),
             });
         }
-        if !path.starts_with(root) {
+        if !path.starts_with(&root) {
             return Err(rejected(format!(
                 "{} is outside the daemon-owned root {}",
                 path.display(),
@@ -115,6 +123,41 @@ pub fn host_path(path: &Path, root: Option<&Path>) -> crate::error::Result<PathB
         }
     }
     Ok(path.to_path_buf())
+}
+
+/// Read a path the daemon *configured* the way it was written: `.` dropped and
+/// each `..` resolved against the component in front of it.
+///
+/// This is for configuration ([`super::WslConfig`]'s data root, and so the
+/// transfer root), never for a path a call hands in. A root written
+/// `C:/checkout/crates/backends/../../target/wsl-test` names one directory, and
+/// refusing every path under it because of how it was spelled would break a
+/// daemon whose data root happens to be written that way. A `..` in the
+/// *transfer* path stays a refusal (see [`host_path`]): the distinction is that
+/// the root is trusted and the path is not.
+///
+/// Nothing is resolved on disk — no symlink is followed — so the result is a
+/// purely lexical reading of the same path. A `..` that would climb above the
+/// path's own root is dropped there, because it cannot mean anything else.
+pub fn tidy(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = matches!(out.components().next_back(), Some(Component::Normal(_)));
+                if can_pop {
+                    out.pop();
+                } else if !out.has_root() {
+                    // A relative path that climbs: keep it, since dropping it
+                    // would silently claim a different directory.
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Quote one string for `/bin/sh`, so a guest path with a space or a quote is
@@ -227,5 +270,42 @@ mod tests {
             "'/tmp/it'\\''s here.txt'"
         );
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn a_configured_root_is_read_as_written() {
+        let base = if cfg!(windows) {
+            PathBuf::from("C:/checkout")
+        } else {
+            PathBuf::from("/checkout")
+        };
+        let spelled = base.join("crates").join("backends").join("..").join("..").join("target").join("wsl-test");
+        let clean = base.join("target").join("wsl-test");
+        assert_eq!(tidy(&spelled), clean, "`..` in configuration is resolved");
+        assert_eq!(tidy(&clean), clean, "an already clean root is unchanged");
+        assert_eq!(tidy(&base.join(".").join("target")), base.join("target"));
+
+        // The point of tidying: a clean path under a root spelled with `..` is
+        // daemon-owned and must be accepted.
+        let inside = clean.join("wsl").join("payload.txt");
+        assert_eq!(host_path(&inside, Some(&spelled)).unwrap(), inside);
+
+        // And a path that climbs is still refused, whatever the root looks like.
+        let climbing = clean.join("..").join("payload.txt");
+        let err = host_path(&climbing, Some(&clean)).expect_err("still a traversal");
+        assert!(err.to_string().contains("climbs upward"), "{err}");
+        let err = host_path(&clean.join("elsewhere.txt"), Some(&base.join("other"))).expect_err("outside");
+        assert!(err.to_string().contains("daemon-owned root"), "{err}");
+
+        // A root that cannot climb reduces to the root it cannot leave, never
+        // above it.
+        let over_reaching = base.join("..").join("..");
+        assert_eq!(
+            tidy(&over_reaching),
+            base.parent().expect("the filesystem root").to_path_buf(),
+            "an absolute path cannot climb past its own root"
+        );
+        let inside_base = base.join("payload.txt");
+        assert!(host_path(&inside_base, Some(&over_reaching)).is_ok());
     }
 }

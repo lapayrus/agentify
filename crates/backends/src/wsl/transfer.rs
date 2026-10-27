@@ -3,10 +3,19 @@
 //! There is no shared directory in v0 — a Project's files are on ext4 inside its
 //! distro and the manifest cannot ask for a mount (`mount` stays false) — so a
 //! transfer rides the one channel that already exists: the launcher's own pipes.
-//! `copyIn` writes the body to `wsl.exe`'s stdin and the command `cat > path`
-//! puts it on the guest's disk; `copyOut` runs `cat path` and reads the bytes
-//! back from stdout. Nothing is buffered on a host-visible path in between, and
-//! no `\\wsl$\...` share is opened.
+//! Nothing is buffered on a host-visible path in between, and no `\\wsl$\...`
+//! share is opened.
+//!
+//! **The pipes carry text, never binary.** A launcher between two operating
+//! systems is a text channel by default — anything that decides a byte is not
+//! UTF-8 may replace it (0xFF becomes U+FFFD), and a body copied that way is
+//! silently corrupted rather than refused. So the body is base64 on the wire in
+//! both directions: `copyIn` sends base64 on `wsl.exe`'s stdin and the guest runs
+//! `base64 -d > path`; `copyOut` runs `base64 < path` and the bytes are decoded
+//! here. Every byte value survives, including NUL, 0xFF, and sequences that are
+//! not valid UTF-8 at all. The cost is a `base64` on both sides: the host's own
+//! encoder/decoder is below in this file, and the guest's is coreutils, which
+//! the Ubuntu base rootfs always has.
 //!
 //! Before a byte moves, both paths are checked by [`super::paths`]: a guest path
 //! is absolute, POSIX, and never climbs; a host path is absolute, never climbs,
@@ -24,19 +33,24 @@ use crate::error::{BackendError, Result};
 use super::cli::Wsl;
 use super::paths;
 
-/// `mkdir -p <parent> && cat > <guest> && chmod 0644 <guest>`
+/// `mkdir -p <parent> && base64 -d > <guest> && chmod 0644 <guest>`
 pub fn copy_in_script(guest: &str) -> String {
     let quoted = paths::shell_quote(guest);
     let parent = parent_of(guest);
     format!(
-        "mkdir -p {parent} && cat > {quoted} && chmod 0644 {quoted}",
+        "mkdir -p {parent} && base64 -d > {quoted} && chmod 0644 {quoted}",
         parent = paths::shell_quote(&parent)
     )
 }
 
-/// `cat <guest>`, with the guest path quoted so nothing in it is a command.
+/// `base64 < <guest>`, with the guest path quoted so nothing in it is a command.
+///
+/// The redirect, not `base64 <path>`: a missing file then fails the redirect
+/// (a non-zero exit and a diagnostic), which is the typed `NotProvisioned` a
+/// caller wants, and the encoded text — ASCII, so no launcher can transcode it —
+/// is what comes back on stdout.
 pub fn copy_out_script(guest: &str) -> String {
-    format!("cat {}", paths::shell_quote(guest))
+    format!("base64 < {}", paths::shell_quote(guest))
 }
 
 fn parent_of(guest: &str) -> String {
@@ -84,8 +98,13 @@ pub fn copy_in(
         detail: format!("cannot read {}: {err}", host.display()),
     })?;
 
+    // The wire format is ASCII: one trailing newline so `base64 -d` sees a
+    // complete body, and not one byte of the file itself on the pipe.
+    let mut body = encode_base64(&bytes).into_bytes();
+    body.push(b'\n');
+
     let script = copy_in_script(&guest);
-    let output = wsl.run_with_stdin(distro, &["sh", "-c", &script], &bytes)?;
+    let output = wsl.run_with_stdin(distro, &["sh", "-c", &script], &body)?;
     if output.code != 0 {
         return Err(BackendError::ExecutionFailed {
             code: output.code,
@@ -139,10 +158,94 @@ pub fn copy_out(
             ),
         });
     }
-    std::fs::write(&host, &output.stdout).map_err(|err| BackendError::ExecutionFailed {
+    // A body that is not base64 means the pipe did not carry what this module
+    // asked it to; refusing is the only honest answer, and it can never write a
+    // truncated file over a good one.
+    let bytes = decode_base64(&output.stdout).map_err(|detail| BackendError::ExecutionFailed {
+        code: 3,
+        detail: format!("the body read from {guest} in {distro} is not base64: {detail}"),
+    })?;
+    std::fs::write(&host, &bytes).map_err(|err| BackendError::ExecutionFailed {
         code: 1,
         detail: format!("cannot write {}: {err}", host.display()),
     })
+}
+
+// -- base64, so the launcher only ever sees ASCII ------------------------------
+
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard padded base64 (RFC 4648 §4): the same alphabet and padding as
+/// coreutils `base64 -d` on the other side.
+pub fn encode_base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        let group = ((chunk[0] as u32) << 16) | ((second as u32) << 8) | third as u32;
+        out.push(ALPHABET[(group >> 18) as usize & 0x3f] as char);
+        out.push(ALPHABET[(group >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(group >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[group as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decode standard base64, tolerating what a shell tool emits: newlines (a
+/// coreutils `base64` wraps at 76 columns) and any other ASCII whitespace.
+///
+/// `Err` carries a short explanation, never a partially decoded body.
+pub fn decode_base64(encoded: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(encoded.len() / 4 * 3 + 3);
+    let mut accumulator: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut padding = 0usize;
+    for &byte in encoded {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
+            padding += 1;
+            if padding > 2 {
+                return Err("more than two padding bytes".to_string());
+            }
+            continue;
+        }
+        if padding > 0 {
+            return Err("a sextet after padding".to_string());
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => {
+                return Err(format!(
+                    "byte 0x{byte:02x} is not in the base64 alphabet"
+                ))
+            }
+        };
+        accumulator = (accumulator << 6) | value as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+            accumulator &= (1 << bits) - 1;
+        }
+    }
+    if bits >= 6 {
+        return Err("a truncated final group".to_string());
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -165,14 +268,79 @@ mod tests {
     fn the_copy_scripts_quote_the_guest_path() {
         assert_eq!(
             copy_in_script("/tmp/a.txt"),
-            "mkdir -p '/tmp' && cat > '/tmp/a.txt' && chmod 0644 '/tmp/a.txt'"
+            "mkdir -p '/tmp' && base64 -d > '/tmp/a.txt' && chmod 0644 '/tmp/a.txt'"
         );
-        assert_eq!(copy_in_script("/a.txt"), "mkdir -p '/' && cat > '/a.txt' && chmod 0644 '/a.txt'");
-        assert_eq!(copy_out_script("/tmp/a.txt"), "cat '/tmp/a.txt'");
+        assert_eq!(
+            copy_in_script("/a.txt"),
+            "mkdir -p '/' && base64 -d > '/a.txt' && chmod 0644 '/a.txt'"
+        );
+        assert_eq!(copy_out_script("/tmp/a.txt"), "base64 < '/tmp/a.txt'");
         assert_eq!(
             copy_out_script("/tmp/it's.txt"),
-            "cat '/tmp/it'\\''s.txt'"
+            "base64 < '/tmp/it'\\''s.txt'"
         );
+    }
+
+    /// The payload the real-distro test uses: text, a NUL, 0xFF, a byte
+    /// sequence that is not valid UTF-8, the bytes of U+FFFD itself, and CR LF —
+    /// so a pipeline that replaces, translates, or line-end-rewrites anything is
+    /// caught rather than papered over.
+    const BINARY: &[u8] = b"agentify copy: NUL \x00, 0xFF \xff, high \x80\xc3\x28, U+FFFD \xef\xbf\xbd, CR LF \r\n";
+
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        // RFC 4648 vectors, plus the byte values this ticket is about.
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(encode_base64(&[0x00]), "AA==");
+        assert_eq!(encode_base64(&[0xff]), "/w==");
+        assert_eq!(encode_base64(&[0x00, 0xff, 0x80]), "AP+A");
+        assert_eq!(encode_base64(&[0xef, 0xbf, 0xbd]), "77+9");
+    }
+
+    #[test]
+    fn a_body_round_trips_byte_for_byte_through_the_wire_format() {
+        for payload in [
+            BINARY,
+            b"".as_slice(),
+            &[0x00],
+            &[0xff, 0xff, 0xff, 0xff],
+            &[0x80, 0xc3, 0x28, 0x0a, 0x0d],
+        ] {
+            let wire = encode_base64(payload);
+            assert!(
+                wire.bytes().all(|byte| byte.is_ascii()),
+                "the wire format is ASCII, so no launcher can transcode it"
+            );
+            assert_eq!(decode_base64(wire.as_bytes()).expect("decodes"), payload);
+        }
+        // Every byte value, three times over, so no offset is untested.
+        let every: Vec<u8> = (0..=255u8).cycle().take(768).collect();
+        assert_eq!(decode_base64(encode_base64(&every).as_bytes()).unwrap(), every);
+    }
+
+    #[test]
+    fn the_decoder_tolerates_what_coreutils_emits_and_refuses_the_rest() {
+        // A coreutils `base64` wraps at 76 columns: newlines are not data.
+        let wrapped = "Zm9vYmFy\nZm9vYmFy\n";
+        assert_eq!(decode_base64(wrapped.as_bytes()).unwrap(), b"foobarfoobar");
+        assert!(decode_base64(b" Zm9v \r\n").is_ok(), "whitespace is skipped");
+
+        for bad in ["!!!!", "Zm9v=Zm9v", "Z", "Zm9v=", "Zm9v==="] {
+            let decoded = decode_base64(bad.as_bytes());
+            if bad == "Zm9v=" {
+                // One trailing pad on an exact group is harmless padding.
+                assert_eq!(decoded.unwrap(), b"foo", "{bad}");
+                continue;
+            }
+            assert!(decoded.is_err(), "{bad:?} is not base64");
+        }
+        // A non-ASCII byte is a decode failure, which is what a transcoding
+        // launcher would hand us: refusing beats writing a corrupt file.
+        assert!(decode_base64(&[0xff]).is_err());
     }
 
     #[test]
