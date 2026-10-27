@@ -73,13 +73,13 @@
   ; Question 1, default yes: what belongs to this installation rather than to
   ; its Projects.
   StrCpy $2 "1"
-  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON1 /SD IDYES "Remove Agentify's daemon registrations, PATH entry, certificate trust, and caches?$\n$\nChoose No to keep them." IDYES machine_done
+  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON1 "Remove Agentify's daemon registrations, PATH entry, certificate trust, and caches?$\n$\nChoose No to keep them." /SD IDYES IDYES machine_done
   StrCpy $2 "0"
   machine_done:
 
   ; Question 2, default no: Projects and their runtimes.
   StrCpy $3 "0"
-  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 /SD IDNO "Delete your Projects and their runtimes?$\n$\nThis removes the state database, Project workspaces, WSL runtimes, and Checkpoints. Choose No to keep them." IDYES projects_yes
+  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "Delete your Projects and their runtimes?$\n$\nThis removes the state database, Project workspaces, WSL runtimes, and Checkpoints. Choose No to keep them." /SD IDNO IDYES projects_yes
   Goto projects_done
   projects_yes:
     StrCpy $3 "1"
