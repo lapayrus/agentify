@@ -700,6 +700,7 @@ impl Process {
         std::fs::create_dir_all(home).expect("data root");
         let child = Command::new(env!("CARGO_BIN_EXE_agentifyd"))
             .env("AGENTIFY_HOME", home)
+            .env("AGENTIFY_BACKEND", "fake")
             // The fixture imports one secret from the host environment.
             .env("HELLO_API_TOKEN", FIXTURE_API_TOKEN)
             .env("AGENTIFY_SECRET_STORE", "memory")

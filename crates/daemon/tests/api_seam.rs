@@ -29,6 +29,7 @@ impl Daemon {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agentifyd"));
         command
             .env("AGENTIFY_HOME", home)
+            .env("AGENTIFY_BACKEND", "fake")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());

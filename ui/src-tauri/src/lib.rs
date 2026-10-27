@@ -514,8 +514,32 @@ async fn update_install(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+/// Start the daemon beside this shell when it is not already running.
+///
+/// The login item starts it at logon, so a shell that opens later finds it
+/// already there. This covers the first launch right after install, before the
+/// next logon, and any launch where the daemon has been stopped.
+fn ensure_daemon() {
+    let discovery = agentify_proto::discovery_path(&data_root());
+    if discovery.exists() {
+        return;
+    }
+    let _ = std::process::Command::new(daemon_binary()).spawn();
+    // Give the daemon a moment to publish its discovery file before the UI's
+    // first status read, so a first launch does not flash the unreachable card.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if discovery.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// Start the shell.
 pub fn run() {
+    ensure_daemon();
+
     // Windows relaunches the app from the per-user `RunOnce` entry after the
     // restart that enabling WSL requires. That is the resume: it reads the
     // machine and finishes setup, and it never elevates.

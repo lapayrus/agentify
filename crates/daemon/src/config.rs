@@ -191,6 +191,10 @@ impl Config {
 
     pub fn from_env() -> Result<Self> {
         let mut config = Self::new(agentify_proto::resolve_data_root());
+        // The shipped daemon drives the real WSL adapter. `Config::new` keeps the
+        // scripted fake for tests, and a process can still opt back into it with
+        // `AGENTIFY_BACKEND=fake`.
+        config.backend = BACKEND_WSL.to_string();
         if let Ok(raw) = std::env::var(HEARTBEAT_ENV) {
             config.heartbeat = Duration::from_millis(whole_number(HEARTBEAT_ENV, &raw)?.max(10));
         }

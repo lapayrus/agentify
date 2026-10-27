@@ -34,27 +34,28 @@ shim are clients of the same API; none of them has a privileged path.
 
 ## Backends
 
-A **Backend** is the runtime substrate that hosts an Environment. v0 ships one:
-`fake`, a scripted implementation selected with `AGENTIFY_BACKEND=fake` (the
-default). It binds a TCP listener on every leased host port so the daemon's own
-health probe succeeds or fails for a real reason, moves
+A **Backend** is the runtime substrate that hosts an Environment. v0 ships two:
+`wsl` (the default), one WSL 2 distro per Project, and `fake`, a scripted
+implementation for development and tests, selected with
+`AGENTIFY_BACKEND=fake`. The fake binds a TCP listener on every leased host port
+so the daemon's own health probe succeeds or fails for a real reason, moves
 `absent → starting → running → stopped`, and can be scripted to fail or degrade:
 
 ```sh
 AGENTIFY_FAKE_SCRIPT='{"start_delay_ms": 250, "unbound_resources": ["web"]}' agentifyd
 ```
 
-The daemon — never the Backend — allocates ports and decides health. The WSL
-adapter arrives in a later ticket; `crates/backends` holds the contract and a
-[conformance suite](crates/backends/src/conformance.rs) that every adapter must
-pass before the API has to learn about it.
+The daemon — never the Backend — allocates ports and decides health. Every
+adapter passes the
+[conformance suite](crates/backends/src/conformance.rs) before the API has to
+learn about it.
 
 ### Daemon knobs
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `AGENTIFY_HOME` | OS data dir | Data root |
-| `AGENTIFY_BACKEND` | `fake` | Which Backend to drive |
+| `AGENTIFY_BACKEND` | `wsl` | Which Backend to drive: `wsl` or `fake` |
 | `AGENTIFY_FAKE_SCRIPT` | — | JSON script for the fake |
 | `AGENTIFY_OPERATION_TIMEOUT_MS` | `30000` | How long a mutating call blocks before answering `504` with an operation id |
 | `AGENTIFY_LEASE_RANGE` | `40000-40999` | Host ports the daemon may lease (`40000-40099`, or a single `40000`) |

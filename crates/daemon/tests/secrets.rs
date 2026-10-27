@@ -39,6 +39,7 @@ impl Daemon {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agentifyd"));
         command
             .env("AGENTIFY_HOME", home)
+            .env("AGENTIFY_BACKEND", "fake")
             // Never the developer's real credential manager.
             .env("AGENTIFY_SECRET_STORE", "memory")
             // These tests are about secrets, not ingress: without the switch the

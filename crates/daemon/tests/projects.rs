@@ -25,6 +25,7 @@ impl Daemon {
         std::fs::create_dir_all(home).expect("create data root");
         let child = Command::new(env!("CARGO_BIN_EXE_agentifyd"))
             .env("AGENTIFY_HOME", home)
+            .env("AGENTIFY_BACKEND", "fake")
             // The fixture imports one secret from the host environment, and no
             // test may touch this machine's credential manager.
             .env("HELLO_API_TOKEN", "fixture-api-token-from-the-host")
