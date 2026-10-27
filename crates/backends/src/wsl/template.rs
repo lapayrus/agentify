@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::cli::{Distro, Wsl};
 use super::rootfs::Rootfs;
-use super::{WslConfig, SUPERVISE_PATH, SUPERVISE_SCRIPT};
+use super::{unix_script, WslConfig, SUPERVISE_PATH, SUPERVISE_SCRIPT};
 use crate::error::{BackendError, Result};
 
 /// Bump when [`PREPARE_SCRIPT`] changes in a way that must invalidate caches.
@@ -170,7 +170,11 @@ fn build_inner(
         if config.systemd { 1 } else { 0 }
     );
     let started = Instant::now();
-    let output = wsl.run_with_stdin(name, &["sh", "-c", &script], PREPARE_SCRIPT.as_bytes())?;
+    let output = wsl.run_with_stdin(
+        name,
+        &["sh", "-c", &script],
+        unix_script(PREPARE_SCRIPT).as_bytes(),
+    )?;
     if output.code != 0 {
         return Err(BackendError::BackendUnavailable {
             detail: format!(
@@ -184,7 +188,12 @@ fn build_inner(
 
     // The supervisor lives in the template *and* is rewritten on every start, so
     // a rebuilt daemon never runs an old copy against a new protocol.
-    wsl.write_file(name, SUPERVISE_PATH, SUPERVISE_SCRIPT.as_bytes(), "0755")?;
+    wsl.write_file(
+        name,
+        SUPERVISE_PATH,
+        unix_script(SUPERVISE_SCRIPT).as_bytes(),
+        "0755",
+    )?;
 
     let engine = wsl
         .read_file(name, "/etc/agentify/engine")

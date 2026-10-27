@@ -309,6 +309,30 @@ fn the_wsl_backend_serves_the_lifecycle_over_the_api() {
         removed
     };
 
+    /// Even a panicking test must leave no runtime behind.
+    struct Cleanup {
+        prefix: String,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let wsl = agentify_backends::wsl::cli::Wsl::new(&self.prefix);
+            let _ = agentify_backends::wsl::template::unregister_all(&wsl);
+        }
+    }
+    let _guard = Cleanup {
+        prefix: prefix.clone(),
+    };
+
+    let owned = || -> Vec<String> {
+        agentify_backends::wsl::cli::Wsl::new(&prefix)
+            .list()
+            .expect("list distros")
+            .into_iter()
+            .map(|distro| distro.name)
+            .filter(|name| name.starts_with(&prefix))
+            .collect()
+    };
+
     let daemon = Daemon::boot_with(
         &home,
         &[
@@ -363,15 +387,20 @@ fn the_wsl_backend_serves_the_lifecycle_over_the_api() {
     assert!(!leased.is_empty(), "the fixture leases a port");
 
     // The distro really exists while the Environment is running.
-    let distros = agentify_backends::wsl::cli::Wsl::new(&prefix)
+    let distros = owned();
+    assert_eq!(distros.len(), 1, "one distro per Project: {distros:?}");
+    assert!(
+        distros[0].contains("agentify"),
+        "the distro is ours: {distros:?}"
+    );
+    let listing = agentify_backends::wsl::cli::Wsl::new(&prefix)
         .list()
         .expect("list distros");
-    assert_eq!(
-        distros.len(),
-        1,
-        "one distro per Project: {distros:?}"
-    );
-    assert_eq!(distros[0].version, "2", "imported as WSL 2");
+    let ours = listing
+        .iter()
+        .find(|distro| distro.name == distros[0])
+        .expect("our distro is in the listing");
+    assert_eq!(ours.version, "2", "imported as WSL 2");
 
     let (status, body) = http_post(
         &daemon.url("/v1/projects/hello-pg/environments/dev/stop"),
@@ -401,10 +430,7 @@ fn the_wsl_backend_serves_the_lifecycle_over_the_api() {
     let removed = cleanup();
     assert_eq!(removed.len(), 1, "teardown unregisters the Project's distro");
     assert!(
-        agentify_backends::wsl::cli::Wsl::new(&prefix)
-            .list()
-            .expect("list")
-            .is_empty(),
+        owned().is_empty(),
         "no distro from this run is left registered"
     );
 }

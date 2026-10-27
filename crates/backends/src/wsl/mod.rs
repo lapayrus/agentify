@@ -58,7 +58,15 @@ pub const PLATFORM: &str = "windows-wsl2";
 /// Where the supervisor lives inside a distro.
 pub const SUPERVISE_PATH: &str = "/usr/local/bin/agentify-supervise";
 /// The supervisor, compiled into the daemon: no shared mount, no host path.
+///
+/// Read through [unix_script]: a Windows checkout can hand the file back with
+/// CRLF, and /bin/sh on Linux does not tolerate that.
 pub const SUPERVISE_SCRIPT: &str = include_str!("scripts/supervise.sh");
+
+/// Text a shell on Linux will accept: LF endings, whatever the checkout did.
+pub fn unix_script(source: &str) -> String {
+    source.replace("\r\n", "\n")
+}
 
 /// Environment variable pointing at a local rootfs tar instead of the pinned
 /// download. Tests use it; a machine on a slow link may too.
@@ -520,7 +528,7 @@ fn start_environment(inner: &Inner, spec: &EnvironmentSpec) -> Result<()> {
     // start, so a daemon upgrade cannot leave an old supervisor behind.
     inner
         .wsl
-        .write_file(&distro, SUPERVISE_PATH, SUPERVISE_SCRIPT.as_bytes(), "0755")?;
+        .write_file(&distro, SUPERVISE_PATH, unix_script(SUPERVISE_SCRIPT).as_bytes(), "0755")?;
 
     let argv: Vec<String> = std::iter::once(SUPERVISE_PATH.to_string())
         .chain(ports.iter().map(u16::to_string))
@@ -903,6 +911,9 @@ mod tests {
             "stats arrive with the exec and logs ticket"
         );
         assert!(!info.capabilities.mount);
+        assert_eq!(unix_script("a
+b\r\nc"), "a
+b\nc");
     }
 
     #[tokio::test]
