@@ -2,6 +2,7 @@ name: Test
 
 on:
   push:
+    branches: ["**"]
     # A release tag runs its own build; it does not need the test suite twice.
     tags-ignore: ["v*"]
   pull_request:
